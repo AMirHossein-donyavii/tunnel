@@ -4,6 +4,52 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-07-08
+
+Next-generation **multiplexed TCP reverse tunnel** (`engine = "mux"`) — a
+clean-room stream multiplexer that targets lowest latency and highest stability
+for reverse-proxy workloads, plus a full TCP tuning pass. Inspired by the
+pengutunnel/Backhaul approaches, redesigned rather than copied.
+
+### Added
+- **`mux` engine** — many user connections carried as lightweight streams over a
+  small pool of long-lived, authenticated links:
+  - **Custom binary framing** (10-byte header; `DATA/SYN/WINDOW_UPDATE/FIN/RST/
+    PING/GOAWAY`).
+  - **Per-stream flow control** (256 KiB windows) → one heavy/slow stream can't
+    stall others; bounded memory.
+  - **Two-class priority write scheduler with adaptive batching** → low latency
+    under light load, few syscalls under heavy load.
+  - **PING-based heartbeat + RTT measurement** with automatic session recovery.
+  - New connection = one SYN frame (no extra TCP/crypto handshake): measured
+    **2.3× lower setup latency on a 20 ms link** and **8× fewer allocations**
+    than a per-connection handshake (`internal/muxeng` benchmarks).
+- **Full TCP tuning** (`internal/nettune`): `TCP_QUICKACK`, `TCP_USER_TIMEOUT`,
+  keepalive idle/interval/count, alongside the existing `TCP_NODELAY`,
+  `SO_SNDBUF/RCVBUF`, and BBR.
+- **Benchmarks** comparing mux vs per-connection handshake (setup latency,
+  allocations) and single-stream throughput (~1.7 GB/s in-memory).
+- `-race` unit tests for the multiplexer (echo, 64 concurrent streams, 4 MiB
+  flow-controlled transfer, ping RTT, close semantics).
+- Example config `configs/example-mux.toml`; `docs/PROTOCOL.md` architecture doc.
+
+### Changed
+- Core version → 1.2.0. `core.Run` now selects among `mux` / `l4` / `l3`; the
+  panel create-wizard offers `mux` as the recommended default.
+- The `/stats` endpoint reports live sessions, stream counts, and best RTT for
+  mux tunnels.
+
+### Compatibility
+- **Fully backward compatible**: `l4` and `l3` are unchanged; `mux` is opt-in.
+  The handshake, PSK, and AEAD framing are unchanged, so existing keys stay valid.
+- Both ends of a tunnel must use the **same** engine. To upgrade an `l4` tunnel
+  to `mux`, set `engine = "mux"` on both sides and restart (you can also lower
+  `pool` to 2–4 since each session carries many streams).
+
+### Verified
+- Cross-compiles for linux amd64 / arm64 / armv7; `go vet` clean; test suite
+  green including `-race`.
+
 ## [1.1.0] — 2026-07-08
 
 Major protocol upgrade: a second, higher-performance data plane inspired by the
@@ -63,5 +109,6 @@ Initial release.
   per-tunnel systemd template units, structured rotating logs, health endpoint.
 - Release tooling (`build-release.sh`) and hosting guide.
 
+[1.2.0]: https://github.com/AMirHossein-donyavii/tunnel/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AMirHossein-donyavii/tunnel/releases/tag/v1.1.0
 [1.0.0]: https://github.com/AMirHossein-donyavii/tunnel/releases/tag/v1.0.0

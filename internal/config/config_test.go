@@ -47,6 +47,28 @@ func TestValidateHeartbeatOrdering(t *testing.T) {
 	}
 }
 
+func TestValidateMuxEngine(t *testing.T) {
+	c := Defaults()
+	c.Name = "m"
+	c.Role = RoleIran
+	c.Mode = ModeReverse
+	c.Engine = EngineMux
+	c.PSK = testPSK
+	c.ListenPort = 443
+	c.Forwards = []string{"8443", "2052-2058"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid mux config rejected: %v", err)
+	}
+}
+
+func TestValidateRejectsUnknownEngine(t *testing.T) {
+	c := baseL3()
+	c.Engine = "nope"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for unknown engine")
+	}
+}
+
 func TestValidateL4ForwardCollision(t *testing.T) {
 	c := Defaults()
 	c.Name = "t"

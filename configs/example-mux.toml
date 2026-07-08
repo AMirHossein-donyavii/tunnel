@@ -1,0 +1,39 @@
+# Emergency Tunnel — example MUX (multiplexed TCP reverse) configuration
+#
+# The mux engine carries many user connections as lightweight streams over a
+# small pool of long-lived, encrypted links. A new user connection costs one
+# SYN frame — no extra TCP or crypto handshake — so it has the lowest latency of
+# the forwarding engines and scales to thousands of concurrent connections.
+#
+# This is the IRAN (entry) side of a reverse tunnel. The Kharej side uses
+# role="kharej", peer="<iran-ip>", the SAME psk, and the same engine/forwards.
+
+name = "iran-mux"
+role = "iran"              # iran = entry (users connect here); kharej = exit
+engine = "mux"             # <-- multiplexed forwarder
+transport = "tcp"
+mode = "reverse"           # reverse = Kharej dials Iran (recommended)
+
+# peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
+
+listen_port = 443          # tunnel link port
+mtu = 1380
+pool = 4                   # number of MUX SESSIONS (links). With mux, keep this
+                           # small — 2-4 is plenty; each carries many streams.
+workers = 0                # 0 = auto (cgroup-aware)
+cipher = "chacha20-poly1305"
+psk = "REPLACE_WITH_GENERATED_KEY"   # et-core genpsk — identical on both sides
+
+health_port = 1234
+profile = "fast"           # fast | balance | resource (tunes buffers + TCP opts)
+log_level = "info"
+
+# Per-session keepalive / RTT probe (also drives fast failover):
+heartbeat_interval = 10
+heartbeat_timeout = 25
+
+proxy_protocol = false     # default; override per forward with @pp / @nopp
+
+# Forwarded ports (entry side). In reverse mode Iran binds the tunnel on
+# listen_port (443), so forwards must differ from 443.
+forwards = ["8443=8443", "2052-2058"]

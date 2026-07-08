@@ -103,8 +103,9 @@ func Defaults() Config {
 
 // Engine identifiers.
 const (
-	EngineL4 = "l4" // TCP port-forwarder (pooled links)
-	EngineL3 = "l3" // TUN tunnel (raw IP, multi-queue, batched)
+	EngineL4  = "l4"  // TCP port-forwarder, one pooled link per connection
+	EngineL3  = "l3"  // TUN tunnel (raw IP, multi-queue, batched)
+	EngineMux = "mux" // TCP port-forwarder, multiplexed streams over few links
 )
 
 // GeneratePSK returns a fresh 32-byte pre-shared key, base64 encoded.
@@ -157,8 +158,8 @@ func (c *Config) Validate() error {
 	if _, err := c.KeyBytes(); err != nil {
 		return err
 	}
-	if c.Engine != EngineL3 && c.Engine != EngineL4 {
-		return fmt.Errorf("engine must be %q or %q, got %q", EngineL4, EngineL3, c.Engine)
+	if c.Engine != EngineL3 && c.Engine != EngineL4 && c.Engine != EngineMux {
+		return fmt.Errorf("engine must be %q, %q or %q, got %q", EngineL4, EngineMux, EngineL3, c.Engine)
 	}
 	// The dialer side needs to know where to connect.
 	if c.dialerSide() && strings.TrimSpace(c.Peer) == "" {

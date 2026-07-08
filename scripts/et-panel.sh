@@ -126,10 +126,12 @@ create_tunnel() {
     fi
 
     echo; echo -e "  Engine (data plane):"
-    echo -e "    ${C_G}1)${C_RESET} l4 — TCP port-forwarder (forward specific ports; default)"
-    echo -e "    ${C_G}2)${C_RESET} l3 — TUN IP tunnel (route all traffic; multi-queue, batched)"
+    echo -e "    ${C_G}1)${C_RESET} mux — multiplexed TCP forwarder (many streams / few links; lowest latency) ${C_Y}[recommended]${C_RESET}"
+    echo -e "    ${C_G}2)${C_RESET} l4  — simple TCP forwarder (one link per connection)"
+    echo -e "    ${C_G}3)${C_RESET} l3  — TUN IP tunnel (route all traffic; multi-queue, batched)"
     local esel; esel="$(ask "Select" "1")"
-    local engine; [ "$esel" = "2" ] && engine="l3" || engine="l4"
+    local engine
+    case "$esel" in 2) engine="l4";; 3) engine="l3";; *) engine="mux";; esac
 
     # Dialer side needs the peer address.
     local is_dialer="no" peer=""
@@ -168,9 +170,10 @@ create_tunnel() {
     fi
     [ -z "$psk" ] && { echo -e "  ${C_R}PSK required.${C_RESET}"; pause; return; }
 
-    # Forwards apply to the L4 entry (Iran) side only. L3 routes all IP traffic.
+    # Forwards apply to the forwarding engines (l4/mux) on the entry (Iran) side.
+    # L3 routes all IP traffic and has no port list.
     local forwards_toml="[]" proxy="false"
-    if [ "$engine" = "l4" ] && [ "$role" = "iran" ]; then
+    if [ "$engine" != "l3" ] && [ "$role" = "iran" ]; then
         echo; echo -e "  Port forwarding (comma-separated). Examples:"
         echo -e "    ${C_C}2096${C_RESET}  ${C_C}2096,2097${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
         echo -e "  ${C_Y}Note:${C_RESET} in reverse mode Iran binds the tunnel on port ${listen_port}; forwards must differ."
@@ -242,6 +245,11 @@ write_config() {
         else
             echo "proxy_protocol = $proxy"
             echo "forwards = $forwards"
+            if [ "$engine" = "mux" ]; then
+                # mux uses heartbeat for per-session keepalive / RTT.
+                echo "heartbeat_interval = 10"
+                echo "heartbeat_timeout = 25"
+            fi
         fi
     } > "${CONF_DIR}/${name}.toml"
     chmod 0600 "${CONF_DIR}/${name}.toml"

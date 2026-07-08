@@ -13,14 +13,19 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
 
 ## Highlights
 
-- **Two data-plane engines** (choose per tunnel):
-  - **`l4`** — TCP **port-forwarder**: pooled links, reverse **and** direct
-    modes, AEAD encryption, mutual-auth handshake, PROXY protocol v2. Forward
-    specific ports (single/list/range/mapping). *(default)*
+- **Three data-plane engines** (choose per tunnel — see [docs/PROTOCOL.md](docs/PROTOCOL.md)):
+  - **`mux`** — **multiplexed TCP reverse tunnel**: many user connections become
+    lightweight **streams over a few long-lived links**. A new connection costs
+    one SYN frame (no extra handshake) → **lowest latency**, scales to thousands
+    of connections. Per-stream **flow control**, priority scheduling, adaptive
+    batching, PING/RTT health. *(recommended)*
+  - **`l4`** — simple TCP **port-forwarder**: one pooled link per connection,
+    reverse **and** direct modes, PROXY protocol v2. *(simplest)*
   - **`l3`** — **TUN IP tunnel** (WireGuard-style): a multi-queue TUN device with
-    **N encrypted links = N queues**, **packet batching**, **heartbeat-based
-    auto-recovery**, and **BBR / socket tuning**. Routes arbitrary IP traffic and
-    scales across cores. *(pengutunnel-inspired)*
+    **N encrypted links = N queues**, **packet batching**, **heartbeat
+    auto-recovery**, **BBR / socket tuning**. Routes arbitrary IP traffic.
+  - All engines share the same AEAD encryption, mutual-auth handshake, and TCP
+    tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a
   static binary, wires up systemd, and launches the panel.
 - **Interactive panel (`et`)** — banner, live IP/geo/ASN, create wizard, and full
@@ -45,9 +50,11 @@ internal/transport     transport interface + registry
         /tcp           production TCP transport (tuned sockets)
         /dns /ssh /hysteria /ipx   experimental extension points
 internal/forward       L4 data path: pool, control frame, entry/exit, PROXY v2, splice
+internal/mux           stream multiplexer: binary framing, per-stream flow control, PING/RTT
+internal/muxeng        MUX reverse engine: session pool, stream routing, PROXY v2
 internal/l3            L3 data path: multi-queue TUN pump, datagram framing, batching, heartbeat
 internal/tun           multi-queue TUN device (linux impl + non-linux stub)
-internal/nettune       socket/kernel tuning (SO_SNDBUF/RCVBUF, TCP_NODELAY, BBR)
+internal/nettune       socket/kernel tuning (NODELAY/QUICKACK/USER_TIMEOUT, SO_*BUF, BBR)
 internal/proxyproto    PROXY protocol v2 header builder
 internal/sysinfo       CPU cores (cgroup v1/v2 aware), memory limits
 internal/logx          leveled logging + size-based rotation

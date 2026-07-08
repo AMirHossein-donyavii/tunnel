@@ -19,13 +19,14 @@ import (
 	"github.com/emergency-tunnel/et/internal/forward"
 	"github.com/emergency-tunnel/et/internal/l3"
 	"github.com/emergency-tunnel/et/internal/logx"
+	"github.com/emergency-tunnel/et/internal/muxeng"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
 )
 
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.1.0"
+var CoreVersion = "1.2.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -55,6 +56,8 @@ func Run(path string) error {
 	switch cfg.Engine {
 	case config.EngineL3:
 		eng, err = l3.New(cfg, log)
+	case config.EngineMux:
+		eng, err = muxeng.New(cfg, log)
 	default:
 		eng, err = forward.New(cfg, log)
 	}
