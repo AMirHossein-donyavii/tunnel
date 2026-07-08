@@ -345,6 +345,9 @@ func appendFrame(dst []byte, f outFrame) []byte {
 
 func (s *Session) recvLoop() {
 	var h header
+	// A single reusable read buffer for DATA payloads: deliver() copies the
+	// bytes into the stream's buffer, so we never allocate per frame.
+	readBuf := make([]byte, maxFrame)
 	for {
 		if _, err := io.ReadFull(s.conn, h[:]); err != nil {
 			s.closeWithErr(err)
@@ -360,13 +363,13 @@ func (s *Session) recvLoop() {
 				s.closeWithErr(errors.New("mux: oversized data frame"))
 				return
 			}
-			data := make([]byte, length)
+			data := readBuf[:length]
 			if _, err := io.ReadFull(s.conn, data); err != nil {
 				s.closeWithErr(err)
 				return
 			}
 			if st := s.getStream(id); st != nil {
-				st.deliver(data)
+				st.deliver(data) // copies into the stream buffer
 			}
 		case frameSYN:
 			var dest []byte

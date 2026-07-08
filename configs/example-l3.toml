@@ -6,7 +6,7 @@
 # forward specific TCP ports.
 #
 # This is the IRAN (server) side of a reverse tunnel. The Kharej side uses
-# role="kharej", peer="<iran-ip>", tun_ip="10.20.0.2/24", and the SAME psk.
+# role="kharej", peer="<iran-ip>", tun_ip="10.10.10.2/24", and the SAME psk.
 
 name = "iran-l3"
 role = "iran"              # iran = server (listens); kharej = client (dials)
@@ -16,9 +16,9 @@ mode = "reverse"           # reverse = Kharej dials Iran (recommended)
 
 # peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
 
-listen_port = 443          # tunnel link port
-tun_ip = "10.20.0.1/24"    # this host's tunnel address (Kharej: 10.20.0.2/24)
-tun_iface = "pengutun"
+listen_port = 1234         # TUNNEL port: server <-> server link
+tun_ip = "10.10.10.1/24"    # this host's tunnel address (Kharej: 10.10.10.2/24)
+tun_iface = "emergency-tun"
 mtu = 1380
 
 pool = 8                   # links == TUN queues; keep ≈ CPU cores on small VPS
@@ -26,7 +26,7 @@ workers = 0                # 0 = auto (cgroup-aware)
 cipher = "chacha20-poly1305"
 psk = "REPLACE_WITH_GENERATED_KEY"   # et-core genpsk — identical on both sides
 
-health_port = 1234
+health_port = 9090
 profile = "fast"           # fast | balance | resource (tunes buffers + GC + batching)
 log_level = "info"
 
@@ -41,5 +41,5 @@ heartbeat_timeout = 25
 # so_rcvbuf = 4194304      # socket recv buffer (bytes)
 
 # After the tunnel is up, route traffic through it as needed, e.g. on Iran:
-#   ip route add <target> via 10.20.0.2
-# or run your services bound to the 10.20.0.0/24 tunnel network.
+#   ip route add <target> via 10.10.10.2
+# or run your services bound to the 10.10.10.0/24 tunnel network.

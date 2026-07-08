@@ -16,7 +16,7 @@ mode = "reverse"           # reverse = Kharej dials Iran (recommended)
 
 # peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
 
-listen_port = 443          # tunnel link port
+listen_port = 1234         # TUNNEL port: server <-> server link (open this in firewall)
 mtu = 1380
 pool = 4                   # number of MUX SESSIONS (links). With mux, keep this
                            # small — 2-4 is plenty; each carries many streams.
@@ -24,7 +24,7 @@ workers = 0                # 0 = auto (cgroup-aware)
 cipher = "chacha20-poly1305"
 psk = "REPLACE_WITH_GENERATED_KEY"   # et-core genpsk — identical on both sides
 
-health_port = 1234
+health_port = 9090
 profile = "fast"           # fast | balance | resource (tunes buffers + TCP opts)
 log_level = "info"
 
@@ -34,6 +34,6 @@ heartbeat_timeout = 25
 
 proxy_protocol = false     # default; override per forward with @pp / @nopp
 
-# Forwarded ports (entry side). In reverse mode Iran binds the tunnel on
-# listen_port (443), so forwards must differ from 443.
-forwards = ["8443=8443", "2052-2058"]
+# VPN configuration / data port(s) — users connect here. Must differ from the
+# tunnel port (1234). 443 is the common VPN/data port.
+forwards = ["443", "8443=8443"]

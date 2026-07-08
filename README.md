@@ -84,7 +84,7 @@ its lifetime — the pool size stays exact and there are no goroutine/conn leaks
 ### How packets flow (L3 TUN engine)
 
 ```
-app ─▶ pengutun (TUN, 10.20.0.1/24)
+app ─▶ emergency-tun (TUN, 10.10.10.1/24)
           │  kernel hashes the flow to queue i (ordering preserved)
           ▼
     reader i ─▶ [batch N packets] ─▶ AEAD link i ═══▶ peer link i ─▶ TUN queue i ─▶ peer stack
@@ -130,7 +130,7 @@ et-core genpsk                                   # secure pre-shared key
 et-core validate --config /etc/emergency-tunnel/iran1234.toml
 systemctl {start,stop,restart,status} emergency-tunnel@iran1234
 journalctl -u emergency-tunnel@iran1234 -f       # or /var/log/emergency-tunnel/iran1234.log
-curl -s http://127.0.0.1:1234/stats              # live counters
+curl -s http://127.0.0.1:9090/stats              # live counters
 ```
 
 ## Port forwarding syntax

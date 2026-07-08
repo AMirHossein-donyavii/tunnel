@@ -3,6 +3,7 @@ package mux
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,8 +30,20 @@ type Stream struct {
 	wFIN    bool // we sent FIN
 
 	// shared
-	err  error
-	emu  sync.Mutex
+	err error
+	emu sync.Mutex
+
+	// lifecycle: once both directions are closed the stream is reaped from the
+	// session map so long-lived sessions with many short streams don't leak.
+	localClosed  atomic.Bool
+	remoteClosed atomic.Bool
+}
+
+// maybeReap removes the stream from the session once both sides are closed.
+func (st *Stream) maybeReap() {
+	if st.localClosed.Load() && st.remoteClosed.Load() {
+		st.s.removeStream(st.id)
+	}
 }
 
 func newStream(id uint32, s *Session, hi bool) *Stream {
@@ -61,6 +74,8 @@ func (st *Stream) remoteFIN() {
 	st.rFIN = true
 	st.rcond.Broadcast()
 	st.rmu.Unlock()
+	st.remoteClosed.Store(true)
+	st.maybeReap()
 }
 
 // Read implements io.Reader.
@@ -165,8 +180,10 @@ func (st *Stream) Close() error {
 	st.wmu.Unlock()
 
 	_ = st.s.queue(outFrame{typ: frameFIN, id: st.id}, st.hi)
-	// The session keeps the stream until the peer FINs/RSTs or the session
-	// closes; reads may still drain buffered data.
+	st.localClosed.Store(true)
+	// Reaps from the session map once the peer has also FIN'd; buffered read
+	// data remains readable via the Stream handle after removal.
+	st.maybeReap()
 	return nil
 }
 

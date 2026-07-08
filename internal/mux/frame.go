@@ -29,10 +29,14 @@ const (
 )
 
 const (
-	headerLen     = 10
-	maxFrame      = 16 * 1024  // max DATA payload per frame
-	defaultWindow = 256 * 1024 // initial per-stream receive window
-	winUpdateGrip = defaultWindow / 2
+	headerLen = 10
+	maxFrame  = 16 * 1024 // max DATA payload per frame
+	// defaultWindow is the initial per-stream receive window. It caps the
+	// bandwidth-delay product a single stream can fill: 512 KiB keeps a stream
+	// from being throttled on long-distance links (e.g. ~40 Mbps at 100 ms RTT)
+	// while only costing RAM for bytes actually in flight (idle streams use ~0).
+	defaultWindow = 512 * 1024
+	winUpdateGrip = defaultWindow / 2 // send a WINDOW_UPDATE once half is consumed
 )
 
 // header is the fixed 10-byte frame header.

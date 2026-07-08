@@ -10,8 +10,8 @@ import "os"
 
 // Config describes the interface to create.
 type Config struct {
-	Name    string // desired interface name, e.g. "pengutun"
-	Address string // CIDR address to assign, e.g. "10.20.0.1/24"
+	Name    string // desired interface name, e.g. "emergency-tun"
+	Address string // CIDR address to assign, e.g. "10.10.10.1/24"
 	MTU     int
 	Queues  int // number of parallel queues (>=1)
 }

@@ -84,18 +84,19 @@ func Defaults() Config {
 	return Config{
 		Transport:     "tcp",
 		Mode:          ModeReverse,
-		ListenPort:    443,
-		TunIface:      "pengutun",
+		ListenPort:    1234, // tunnel port: server<->server control/data link
+		TunIface:      "emergency-tun",
 		MTU:           1380,
 		Workers:       0,
 		Pool:          8,
 		Cipher:        "chacha20-poly1305",
-		HealthPort:    1234,
+		HealthPort:    9090, // local stats endpoint (kept off the tunnel port)
 		Profile:       ProfileBalance,
 		LogLevel:      "info",
 		ProxyProtocol: false,
 
-		Engine:            EngineL4,
+		// TCP Reverse Tunnel (multiplexed) is the primary, recommended engine.
+		Engine:            EngineMux,
 		HeartbeatInterval: 10,
 		HeartbeatTimeout:  25,
 	}
@@ -157,6 +158,9 @@ func (c *Config) Validate() error {
 	}
 	if _, err := c.KeyBytes(); err != nil {
 		return err
+	}
+	if c.HealthPort != 0 && c.HealthPort == c.ListenPort {
+		return fmt.Errorf("health_port (%d) must differ from the tunnel listen_port", c.HealthPort)
 	}
 	if c.Engine != EngineL3 && c.Engine != EngineL4 && c.Engine != EngineMux {
 		return fmt.Errorf("engine must be %q, %q or %q, got %q", EngineL4, EngineMux, EngineL3, c.Engine)

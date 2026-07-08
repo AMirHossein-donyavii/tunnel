@@ -61,6 +61,39 @@ func TestValidateMuxEngine(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsHealthPortCollision(t *testing.T) {
+	c := Defaults()
+	c.Name = "t"
+	c.Role = RoleKharej
+	c.Engine = EngineMux
+	c.Peer = "1.2.3.4"
+	c.PSK = testPSK
+	c.ListenPort = 1234
+	c.HealthPort = 1234 // same as tunnel port -> must be rejected
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when health_port == listen_port")
+	}
+}
+
+func TestDefaultsAreSane(t *testing.T) {
+	d := Defaults()
+	if d.Engine != EngineMux {
+		t.Errorf("default engine should be mux (TCP Reverse), got %q", d.Engine)
+	}
+	if d.ListenPort != 1234 {
+		t.Errorf("default tunnel port should be 1234, got %d", d.ListenPort)
+	}
+	if d.HealthPort == d.ListenPort {
+		t.Errorf("default health port %d collides with tunnel port", d.HealthPort)
+	}
+	if d.TunIface != "emergency-tun" {
+		t.Errorf("default interface should be emergency-tun, got %q", d.TunIface)
+	}
+	if len(d.TunIface) > 15 {
+		t.Errorf("interface name %q exceeds the 15-char kernel limit", d.TunIface)
+	}
+}
+
 func TestValidateRejectsUnknownEngine(t *testing.T) {
 	c := baseL3()
 	c.Engine = "nope"

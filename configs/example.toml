@@ -4,38 +4,40 @@
 # Managed by the `et` panel, but hand-editable. Run:
 #   et-core validate --config /etc/emergency-tunnel/<name>.toml
 #
-# This example is the IRAN (entry) side of a recommended reverse TCP tunnel.
+# This example is the IRAN (entry) side of the recommended TCP Reverse Tunnel.
 # The Kharej side uses role="kharej", peer="<iran-ip>", and the SAME psk.
 
 name = "iran1234"          # unique tunnel name
 role = "iran"              # "iran" (entry, users connect here) or "kharej" (exit)
+engine = "mux"             # TCP Reverse Tunnel (multiplexed) — primary/default
 transport = "tcp"          # tcp (production) | dns | ssh | hysteria | ipx (experimental)
 mode = "reverse"           # "reverse" (Kharej dials Iran, recommended) or "direct"
 
 # peer = "203.0.113.10"    # required only on the DIALING side (Kharej in reverse)
 
-listen_port = 443          # tunnel link port
-tun_ip = "10.20.0.1/24"    # used by L3 (ipx) transports; Kharej would be 10.20.0.2/24
-tun_iface = "pengutun"
+listen_port = 1234         # TUNNEL port: server <-> server link (open this in firewall)
 mtu = 1380
 
 workers = 0                # 0 = auto (honours cgroup CPU quota)
-pool = 8                   # warm pooled links kept ready
+pool = 4                   # tunnel links/sessions kept ready (mux carries many streams each)
 cipher = "chacha20-poly1305"   # or "aes-256-gcm"
 psk = "REPLACE_WITH_GENERATED_KEY"   # generate with: et-core genpsk  (identical on both sides)
 
-health_port = 1234         # localhost health/stats endpoint (0 to disable)
+health_port = 9090         # localhost health/stats endpoint (0 to disable; must != tunnel port)
 profile = "balance"        # fast | balance | resource
 log_level = "info"         # debug | info | warn | error
 
+# mux keepalive / RTT probe:
+heartbeat_interval = 10
+heartbeat_timeout = 25
+
 proxy_protocol = false     # default; override per forward with @pp / @nopp
 
-# Port forwarding (entry side only):
-#   "2096"        listen 2096 -> remote 2096
-#   "2096,2097"   two ports (write as separate array items)
+# VPN configuration / data port(s) — users connect here (entry side only):
+#   "443"         listen 443  -> remote 443    (the common VPN/data port)
+#   "443,8443"    two ports (comma separated)
 #   "200-300"     port range
 #   "8000=9000"   listen 8000 -> remote 9000
-#   "2096@pp"     enable PROXY protocol v2 for this entry
-# Note: in reverse mode Iran binds the tunnel on listen_port (443 here), so the
-# forwarded user ports below must be different from 443.
-forwards = ["8443=8443", "2052-2058"]
+#   "443@pp"      enable PROXY protocol v2 for this entry
+# Note: forwarded ports must differ from the tunnel port (1234).
+forwards = ["443", "8443=8443"]

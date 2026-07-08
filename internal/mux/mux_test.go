@@ -151,6 +151,33 @@ func TestPingRTT(t *testing.T) {
 	}
 }
 
+// TestStreamReaping verifies that fully-closed streams are removed from the
+// session map (no leak for long-lived sessions with many short streams).
+func TestStreamReaping(t *testing.T) {
+	cs, ss := pair()
+	defer cs.Close()
+	defer ss.Close()
+	go echoServer(ss)
+
+	for i := 0; i < 50; i++ {
+		st, err := cs.OpenStream(nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { _, _ = st.Write([]byte("ping")); _ = st.Close() }()
+		_, _ = io.ReadAll(st)
+	}
+	// Both sessions should drain back to ~0 open streams.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cs.NumStreams() == 0 && ss.NumStreams() == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("streams leaked: client=%d server=%d", cs.NumStreams(), ss.NumStreams())
+}
+
 func TestSessionCloseUnblocksReaders(t *testing.T) {
 	cs, ss := pair()
 	defer ss.Close()

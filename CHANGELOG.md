@@ -4,6 +4,45 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-07-08
+
+Production review: corrected defaults, clearer naming/UX, and networking
+fixes/optimizations. No wire-protocol change; existing configs keep working.
+
+### Changed (defaults)
+- Default interface name `pengutun` → **`emergency-tun`** (project-based; ≤15-char
+  kernel limit). Replaced everywhere (config, panel, examples, docs).
+- Default TUN subnet `10.20.0.x` → **`10.10.10.1/24`** (Iran) / **`10.10.10.2/24`**
+  (Kharej), same subnet both sides.
+- **Tunnel port** (server↔server link) default `443` → **`1234`**.
+- Health/stats port default `1234` → **`9090`** (so it can't collide with the
+  tunnel port); added a validation guard rejecting `health_port == listen_port`.
+- Default engine → **`mux` (TCP Reverse Tunnel)**; it is now presented as method
+  **#1** in the panel, and `et-core transports` lists the production `tcp`
+  transport first.
+
+### UX
+- Panel: the VPN/data-port prompt now explains "This is your VPN
+  configuration/data port. Users connect through this port. Common choices are
+  ports like 443," and defaults to `443`.
+- Interface/subnet prompts now appear only for the L3 engine (forwarders don't
+  use them), removing confusion.
+
+### Fixed / optimized (networking)
+- **mux stream leak**: fully-closed streams are now reaped from the session map
+  (long-lived sessions with many short connections no longer grow unboundedly).
+- **mux read path**: removed a per-frame heap allocation (reuse one read buffer;
+  `deliver` copies) — less GC pressure at high packet rates.
+- **mux flow-control window** 256 KiB → **512 KiB**: lifts the single-stream
+  throughput cap on long-distance / high-BDP links; costs RAM only for bytes
+  actually in flight.
+- Full TCP tuning already applied on links (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`,
+  `SO_SNDBUF/RCVBUF`, keepalive, BBR).
+
+### Verified
+- linux amd64/arm64/armv7 build; `go vet` clean; tests green including `-race`
+  and a new stream-reaping test.
+
 ## [1.2.0] — 2026-07-08
 
 Next-generation **multiplexed TCP reverse tunnel** (`engine = "mux"`) — a

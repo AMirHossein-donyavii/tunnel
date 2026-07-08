@@ -104,12 +104,13 @@ create_tunnel() {
     local rsel; rsel="$(ask "Select" "1")"
     local role; [ "$rsel" = "2" ] && role="kharej" || role="iran"
 
-    echo; echo -e "  Available transports:"; "$CORE" transports | sed 's/^/    /'
-    local transport; transport="$(ask "Transport" "tcp")"
-    if "$CORE" transports | awk -v t="$transport" '$1==t && /experimental/{f=1} END{exit !f}'; then
-        echo -e "  ${C_Y}Warning:${C_RESET} '$transport' is experimental. TCP is recommended for production."
-        yesno "Continue anyway?" "n" || return
-    fi
+    echo; echo -e "  Tunnel method (protocol):"
+    echo -e "    ${C_G}1)${C_RESET} TCP Reverse Tunnel   — multiplexed, lowest latency ${C_Y}[recommended, default]${C_RESET}"
+    echo -e "    ${C_G}2)${C_RESET} TCP Simple forwarder — one link per connection (l4)"
+    echo -e "    ${C_G}3)${C_RESET} TUN IP tunnel        — route all IP traffic (l3)"
+    local esel; esel="$(ask "Select" "1")"
+    local engine transport="tcp"
+    case "$esel" in 2) engine="l4";; 3) engine="l3";; *) engine="mux";; esac
 
     echo; echo -e "  Direction:"
     echo -e "    ${C_G}1)${C_RESET} Reverse (recommended) — Kharej connects to Iran"
@@ -125,14 +126,6 @@ create_tunnel() {
         echo -e "  ${C_R}A tunnel named '$name' already exists.${C_RESET}"; pause; return
     fi
 
-    echo; echo -e "  Engine (data plane):"
-    echo -e "    ${C_G}1)${C_RESET} mux — multiplexed TCP forwarder (many streams / few links; lowest latency) ${C_Y}[recommended]${C_RESET}"
-    echo -e "    ${C_G}2)${C_RESET} l4  — simple TCP forwarder (one link per connection)"
-    echo -e "    ${C_G}3)${C_RESET} l3  — TUN IP tunnel (route all traffic; multi-queue, batched)"
-    local esel; esel="$(ask "Select" "1")"
-    local engine
-    case "$esel" in 2) engine="l4";; 3) engine="l3";; *) engine="mux";; esac
-
     # Dialer side needs the peer address.
     local is_dialer="no" peer=""
     { [ "$mode" = "reverse" ] && [ "$role" = "kharej" ]; } && is_dialer="yes"
@@ -142,17 +135,20 @@ create_tunnel() {
         [ -z "$peer" ] && { echo -e "  ${C_R}Peer is required on this side.${C_RESET}"; pause; return; }
     fi
 
-    local iface mtu profile workers pool cipher listen_port health tun_ip
-    iface="$(ask "Tunnel interface" "pengutun")"
+    local iface="emergency-tun" mtu profile workers pool cipher listen_port health tun_ip=""
+    listen_port="$(ask "Tunnel port (server <-> server link)" "1234")"
     mtu="$(ask "MTU" "1380")"
-    echo -e "  Performance profile: ${C_C}fast${C_RESET} | ${C_C}balance${C_RESET} | ${C_C}resource${C_RESET}"
+    echo -e "  Performance profile: ${C_C}fast${C_RESET} (max throughput) | ${C_C}balance${C_RESET} | ${C_C}resource${C_RESET} (low RAM)"
     profile="$(ask "Profile" "balance")"
     workers="$(ask "CPU workers (0 = auto-detect)" "0")"
-    listen_port="$(ask "TCP listener port" "443")"
-    pool="$(ask "Connection pool" "8")"
-    health="$(ask "Health check port" "1234")"
-    if [ "$role" = "iran" ]; then tun_ip="$(ask "Tunnel IP" "10.20.0.1/24")"
-    else tun_ip="$(ask "Tunnel IP" "10.20.0.2/24")"; fi
+    pool="$(ask "Tunnel links / sessions" "4")"
+    health="$(ask "Health/stats port (local only)" "9090")"
+    # Only the L3 (TUN) engine uses an interface + tunnel subnet; forwarders do not.
+    if [ "$engine" = "l3" ]; then
+        iface="$(ask "Tunnel interface" "emergency-tun")"
+        if [ "$role" = "iran" ]; then tun_ip="$(ask "Tunnel IP (this host)" "10.10.10.1/24")"
+        else tun_ip="$(ask "Tunnel IP (this host)" "10.10.10.2/24")"; fi
+    fi
 
     echo -e "  Encryption: ${C_G}1)${C_RESET} chacha20-poly1305   ${C_G}2)${C_RESET} aes-256-gcm"
     local csel; csel="$(ask "Select" "1")"
@@ -174,10 +170,12 @@ create_tunnel() {
     # L3 routes all IP traffic and has no port list.
     local forwards_toml="[]" proxy="false"
     if [ "$engine" != "l3" ] && [ "$role" = "iran" ]; then
-        echo; echo -e "  Port forwarding (comma-separated). Examples:"
-        echo -e "    ${C_C}2096${C_RESET}  ${C_C}2096,2097${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
-        echo -e "  ${C_Y}Note:${C_RESET} in reverse mode Iran binds the tunnel on port ${listen_port}; forwards must differ."
-        local flist; flist="$(ask "Forwards" "8443")"
+        echo; echo -e "  ${C_BOLD}VPN configuration / data port(s)${C_RESET}"
+        echo -e "  ${C_C}This is your VPN configuration/data port. Users will connect through this port.${C_RESET}"
+        echo -e "  ${C_C}Common choices are ports like 443.${C_RESET}"
+        echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
+        echo -e "  ${C_Y}Note:${C_RESET} must differ from the tunnel port (${listen_port})."
+        local flist; flist="$(ask "VPN data port(s)" "443")"
         forwards_toml="$(csv_to_toml_array "$flist")"
         yesno "Enable PROXY protocol v2 by default?" "n" && proxy="true"
     elif [ "$engine" = "l3" ]; then

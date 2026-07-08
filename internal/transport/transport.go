@@ -73,11 +73,20 @@ func Names() []string {
 	return out
 }
 
-// All returns every registered transport, sorted by name.
+// All returns every registered transport, production (non-experimental) ones
+// first — so the primary TCP transport leads the list — then experimental,
+// each group alphabetical.
 func All() []Transport {
 	out := make([]Transport, 0, len(registry))
-	for _, n := range Names() {
-		out = append(out, registry[n])
+	for _, n := range Names() { // production first
+		if !registry[n].Experimental() {
+			out = append(out, registry[n])
+		}
+	}
+	for _, n := range Names() { // experimental after
+		if registry[n].Experimental() {
+			out = append(out, registry[n])
+		}
 	}
 	return out
 }
