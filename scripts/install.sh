@@ -2,17 +2,23 @@
 #
 # Emergency Tunnel installer.
 #
-#   curl -fsSL https://example.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/AMirHossein-donyavii/tunnel/main/scripts/install.sh | bash
 #
-# Pin a version or channel (note the `-s --` to pass args through a pipe):
-#   curl -fsSL https://example.com/install.sh | bash -s -- --version 1.2.0
-#   curl -fsSL https://example.com/install.sh | bash -s -- --channel beta
+# Pin a version (note the `-s --` to pass args through a pipe):
+#   curl -fsSL <install-url> | bash -s -- --version 1.2.0
+#
+# Sources (ET_SOURCE):
+#   github  (default) — download signed binaries from this repo's GitHub Releases
+#   host              — download from your own web server (ET_BASE_URL layout)
+#   (ET_FROM_SOURCE=1 builds from Go source instead of downloading)
 #
 # Environment overrides:
-#   ET_BASE_URL       release host root (default below) — set this to YOUR domain
-#   ET_CHANNEL        stable | beta            (default: stable)
-#   ET_VERSION        pin an exact version, e.g. 1.2.0 (overrides channel)
-#   ET_PUBKEY         minisign public key line for signature verification
+#   ET_SOURCE         github | host            (default: github)
+#   ET_REPO_SLUG      owner/repo for github source (default below)
+#   ET_BASE_URL       release host root (host source) — set to YOUR domain
+#   ET_CHANNEL        stable | beta            (host source; default: stable)
+#   ET_VERSION        pin an exact version, e.g. 1.2.0
+#   ET_PUBKEY         minisign public key line for signature verification (host)
 #   ET_FROM_SOURCE=1  build from Go source instead of downloading a binary
 #   ET_ALLOW_INSECURE=1  permit non-HTTPS base URL / skip signature (discouraged)
 #   ET_FORCE=1        reinstall even if the target version is already installed
@@ -20,6 +26,8 @@
 set -euo pipefail
 
 # ============================ configuration =================================
+ET_SOURCE="${ET_SOURCE:-github}"
+ET_REPO_SLUG="${ET_REPO_SLUG:-AMirHossein-donyavii/tunnel}"
 ET_BASE_URL="${ET_BASE_URL:-https://example.com}"
 ET_CHANNEL="${ET_CHANNEL:-stable}"
 ET_VERSION="${ET_VERSION:-}"
@@ -30,7 +38,7 @@ ET_FROM_SOURCE="${ET_FROM_SOURCE:-0}"
 ET_ALLOW_INSECURE="${ET_ALLOW_INSECURE:-0}"
 ET_FORCE="${ET_FORCE:-0}"
 # Source-build fallback settings:
-ET_REPO="${ET_REPO:-https://github.com/emergency-tunnel/et.git}"
+ET_REPO="${ET_REPO:-https://github.com/${ET_REPO_SLUG}.git}"
 ET_GO_VERSION="${ET_GO_VERSION:-1.22.5}"
 
 PREFIX="/usr/local/bin"
@@ -137,17 +145,29 @@ install_deps() {
 # ---- version resolution ----------------------------------------------------
 resolve_version() {
     step "Resolving version"
-    if [ -n "$ET_VERSION" ]; then
-        VERSION="$ET_VERSION"; info "pinned version: ${VERSION}"
+    if [ "$ET_SOURCE" = "github" ]; then
+        if [ -n "$ET_VERSION" ]; then
+            VERSION="$ET_VERSION"; info "pinned version: ${VERSION}"
+        else
+            info "fetching latest release from github.com/${ET_REPO_SLUG}"
+            VERSION="$(dl_str "https://api.github.com/repos/${ET_REPO_SLUG}/releases/latest" \
+                | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/')" \
+                || die "cannot query GitHub releases"
+        fi
+        REL_URL="https://github.com/${ET_REPO_SLUG}/releases/download/v${VERSION}"
     else
-        info "fetching channel '${ET_CHANNEL}' from ${ET_BASE_URL}"
-        VERSION="$(dl_str "${ET_BASE_URL}/${ET_CHANNEL}" | tr -d '[:space:]')" \
-            || die "cannot resolve channel '${ET_CHANNEL}'"
+        if [ -n "$ET_VERSION" ]; then
+            VERSION="$ET_VERSION"; info "pinned version: ${VERSION}"
+        else
+            info "fetching channel '${ET_CHANNEL}' from ${ET_BASE_URL}"
+            VERSION="$(dl_str "${ET_BASE_URL}/${ET_CHANNEL}" | tr -d '[:space:]')" \
+                || die "cannot resolve channel '${ET_CHANNEL}'"
+        fi
+        REL_URL="${ET_BASE_URL}/releases/v${VERSION}"
     fi
     echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$' \
         || die "resolved version looks invalid: '${VERSION}'"
-    REL_URL="${ET_BASE_URL}/releases/v${VERSION}"
-    ok "Target version: v${VERSION}"
+    ok "Target version: v${VERSION}  (source: ${ET_SOURCE})"
 }
 
 installed_version() { [ -f "${LIB_DIR}/VERSION" ] && cat "${LIB_DIR}/VERSION" || echo ""; }
@@ -169,8 +189,8 @@ download_release() {
     TMP="$(mktemp -d)"
     dl "${REL_URL}/SHA256SUMS" "${TMP}/SHA256SUMS"
 
-    # Signature verification (strongly recommended for a public URL).
-    if [ -n "$ET_PUBKEY" ] && [ "$ET_ALLOW_INSECURE" != "1" ]; then
+    # Signature verification (host source only; GitHub relies on TLS + SHA-256).
+    if [ "$ET_SOURCE" = "host" ] && [ -n "$ET_PUBKEY" ] && [ "$ET_ALLOW_INSECURE" != "1" ]; then
         have minisign || pkg_install minisign || true
         if have minisign; then
             dl "${REL_URL}/SHA256SUMS.minisig" "${TMP}/SHA256SUMS.minisig"
@@ -181,7 +201,7 @@ download_release() {
             warn "minisign unavailable; relying on TLS + SHA-256 only"
         fi
     else
-        warn "no ET_PUBKEY set; relying on TLS + SHA-256 only (set ET_PUBKEY for offline integrity)"
+        info "integrity: TLS + SHA-256 checksums"
     fi
 
     local asset="et-core-linux-${ARCH}"
@@ -242,7 +262,12 @@ install_files() {
     install -m 0755 "${TMP}/uninstall.sh"       "${LIB_DIR}/uninstall.sh"
     install -m 0644 "${TMP}/emergency-tunnel@.service" "${UNIT_DIR}/emergency-tunnel@.service"
     echo "$VERSION" > "${LIB_DIR}/VERSION"
-    echo "$ET_BASE_URL" > "${LIB_DIR}/BASE_URL"
+    # Record how to update later (used by the panel's "Update core").
+    if [ "$ET_SOURCE" = "github" ]; then
+        echo "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/scripts/install.sh" > "${LIB_DIR}/UPDATE_URL"
+    else
+        echo "${ET_BASE_URL}/install.sh" > "${LIB_DIR}/UPDATE_URL"
+    fi
 
     if have systemctl; then systemctl daemon-reload; fi
     ok "installed to ${PREFIX}/et-core and ${PREFIX}/et"
@@ -310,7 +335,8 @@ main() {
     ok "Installation complete — Emergency Tunnel v${VERSION}"
     echo -e "   Panel:   ${C_Y}et${C_RESET}"
     echo -e "   Configs: ${C_C}${CONF_DIR}${C_RESET}    Logs: ${C_C}${LOG_DIR}${C_RESET}"
-    echo -e "   Update later:  ${C_C}curl -fsSL ${ET_BASE_URL}/install.sh | bash${C_RESET}"
+    local upd; upd="$(cat "${LIB_DIR}/UPDATE_URL" 2>/dev/null || echo "")"
+    [ -n "$upd" ] && echo -e "   Update later:  ${C_C}curl -fsSL ${upd} | bash${C_RESET}"
     echo
     if [ -t 0 ] && have et; then
         read -r -p "Launch the panel now? [Y/n] " ans

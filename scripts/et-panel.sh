@@ -318,15 +318,15 @@ delete_tunnel() {
 update_core() {
     banner
     echo -e "  ${C_BOLD}Update Core${C_RESET}\n"
-    local base="https://example.com"
-    [ -f /usr/local/lib/emergency-tunnel/BASE_URL ] && base="$(cat /usr/local/lib/emergency-tunnel/BASE_URL)"
+    local url="https://raw.githubusercontent.com/AMirHossein-donyavii/tunnel/main/scripts/install.sh"
+    [ -f /usr/local/lib/emergency-tunnel/UPDATE_URL ] && url="$(cat /usr/local/lib/emergency-tunnel/UPDATE_URL)"
     local cur; cur="$(core_version)"
     echo -e "  Installed core: ${C_G}v${cur}${C_RESET}"
-    echo -e "  Update source:  ${C_C}${base}/install.sh${C_RESET}"
+    echo -e "  Update source:  ${C_C}${url}${C_RESET}"
     echo -e "  (the installer verifies checksums and restarts active tunnels)"
     yesno "Proceed with update?" "n" || { pause; return; }
     if have curl; then
-        curl -fsSL "${base}/install.sh" | bash || echo -e "  ${C_R}Update failed.${C_RESET}"
+        curl -fsSL "${url}" | bash || echo -e "  ${C_R}Update failed.${C_RESET}"
     else
         echo -e "  ${C_R}curl not available.${C_RESET}"
     fi
