@@ -1,5 +1,5 @@
-// Package muxeng is the multiplexed L4 reverse-tunnel engine. Instead of one
-// TCP link per user connection (the l4 engine), it carries many logical streams
+// Package muxeng is the TCP Reverse Tunnel engine. Instead of one
+// TCP link per user connection (a naive model), it carries many logical streams
 // over a small pool of long-lived, authenticated, tuned links using
 // internal/mux. A new user connection costs one SYN frame — no extra TCP or
 // crypto handshake — which is the decisive latency win on long-distance links.

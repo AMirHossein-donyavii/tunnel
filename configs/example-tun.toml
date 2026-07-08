@@ -1,0 +1,42 @@
+# Emergency Tunnel — example TUN configuration
+#
+# TUN mode creates a virtual network interface between the Iran and Foreign
+# servers. All IP traffic (TCP, UDP, ICMP, and IPv6 ICMP) passes through a
+# private tunnel network. The default subnet is 10.10.10.0/24, where Iran uses
+# 10.10.10.1 and Foreign uses 10.10.10.2.
+#
+# This is the IRAN side. The Foreign (Kharej) side uses role="kharej",
+# peer="<iran-ip>", tun_ip="10.10.10.2/24", peer_tun_ip="10.10.10.1".
+# Encryption is automatic (ephemeral X25519) — no key to share.
+
+name = "iran-tun"
+role = "iran"              # iran = 10.10.10.1 side; kharej = 10.10.10.2 side
+engine = "tun"             # virtual network interface (all IP protocols)
+transport = "tcp"          # carrier for the encrypted links
+mode = "reverse"           # reverse = Kharej dials Iran (recommended)
+
+# peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
+
+tunnel_port = 1234         # server <-> server link (SAME on both sides; open in firewall)
+tun_ip = "10.10.10.1/24"   # this host's tunnel address (Foreign: 10.10.10.2/24)
+peer_tun_ip = "10.10.10.2" # the other server's tunnel address
+# tun_ip6 = "fd00::1/64"   # optional IPv6 tunnel address (Foreign: fd00::2/64)
+tun_iface = "emergency-tun"
+mtu = 1380
+
+pool = 4                   # links == TUN queues; keep ≈ CPU cores
+workers = 0                # 0 = auto (cgroup-aware)
+cipher = "chacha20-poly1305"   # AEAD; keys auto-negotiated (ephemeral X25519)
+
+health_port = 9090
+profile = "fast"           # fast | balance | resource
+log_level = "info"
+
+# Liveness: heartbeat every interval; cycle a link if silent past timeout.
+heartbeat_interval = 10
+heartbeat_timeout = 25
+
+# After the tunnel is up, reach the peer directly on its tunnel IP, e.g.:
+#   ping 10.10.10.2            # ICMP over the tunnel
+#   ssh user@10.10.10.2        # TCP over the tunnel
+# or route selected traffic through it:  ip route add <target> via 10.10.10.2

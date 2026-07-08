@@ -93,6 +93,76 @@ ask() { # ask "Prompt" "default" -> echoes value
 }
 yesno() { local p="$1" d="${2:-n}" a; a="$(ask "$p (y/n)" "$d")"; case "$a" in [Yy]*) return 0;; *) return 1;; esac; }
 
+# --- Validating input helpers (re-prompt until valid; never abort) ----------
+ask_req() { # prompt [default] — non-empty
+    local v
+    while true; do
+        v="$(ask "$1" "${2:-}")"
+        [ -n "$v" ] && { echo "$v"; return; }
+        echo -e "  ${C_R}A value is required. Please try again.${C_RESET}" >&2
+    done
+}
+ask_port() { # prompt [default] — 1..65535
+    local v
+    while true; do
+        v="$(ask "$1" "${2:-}")"
+        if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 65535 ]; then echo "$v"; return; fi
+        echo -e "  ${C_R}Invalid port. Enter a number between 1 and 65535.${C_RESET}" >&2
+    done
+}
+valid_ipv4() { # ip -> returns 0 if a valid dotted-quad
+    local ip="$1" o
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        [ "$o" -le 255 ] || return 1
+    done
+    return 0
+}
+ask_ipcidr() { # prompt [default] — IPv4/prefix, e.g. 10.10.10.1/24
+    local v ip prefix
+    while true; do
+        v="$(ask "$1" "${2:-}")"
+        ip="${v%/*}"; prefix="${v#*/}"
+        if [ "$v" != "$ip" ] && valid_ipv4 "$ip" && [[ "$prefix" =~ ^[0-9]+$ ]] && [ "$prefix" -ge 8 ] && [ "$prefix" -le 32 ]; then
+            echo "$v"; return
+        fi
+        echo -e "  ${C_R}Invalid address. Use IP/prefix, e.g. 10.10.10.1/24.${C_RESET}" >&2
+    done
+}
+ask_name() { # prompt [default] — alnum/_/- only, non-empty
+    local raw v
+    while true; do
+        raw="$(ask "$1" "${2:-}")"
+        v="$(printf '%s' "$raw" | tr -cd '[:alnum:]_-')"
+        [ -n "$v" ] && { echo "$v"; return; }
+        echo -e "  ${C_R}Invalid name — use letters, numbers, _ or -.${C_RESET}" >&2
+    done
+}
+ask_choice() { # prompt default max — integer 1..max
+    local v max="$3"
+    while true; do
+        v="$(ask "$1" "$2")"
+        if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le "$max" ]; then echo "$v"; return; fi
+        echo -e "  ${C_R}Please enter a number between 1 and ${max}.${C_RESET}" >&2
+    done
+}
+ask_int() { # prompt default min max
+    local v min="$3" max="$4"
+    while true; do
+        v="$(ask "$1" "$2")"
+        if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge "$min" ] && [ "$v" -le "$max" ]; then echo "$v"; return; fi
+        echo -e "  ${C_R}Enter a number between ${min} and ${max}.${C_RESET}" >&2
+    done
+}
+ask_oneof() { # prompt default "a b c"
+    local v def="$2" opts="$3"
+    while true; do
+        v="$(ask "$1" "$def")"
+        for o in $opts; do [ "$v" = "$o" ] && { echo "$v"; return; }; done
+        echo -e "  ${C_R}Choose one of: ${opts}.${C_RESET}" >&2
+    done
+}
+
 # --- Create tunnel wizard ----------------------------------------------------
 create_tunnel() {
     banner
@@ -101,82 +171,86 @@ create_tunnel() {
     echo -e "  Which server is THIS host?"
     echo -e "    ${C_G}1)${C_RESET} Iran   — origin server, users connect here"
     echo -e "    ${C_G}2)${C_RESET} Kharej — foreign exit server (runs Xray/services)"
-    local rsel; rsel="$(ask "Select" "1")"
-    local role; [ "$rsel" = "2" ] && role="kharej" || role="iran"
+    local role; [ "$(ask_choice "Select" "1" 2)" = "2" ] && role="kharej" || role="iran"
 
-    echo; echo -e "  Tunnel method (protocol):"
-    echo -e "    ${C_G}1)${C_RESET} TCP Reverse Tunnel   — multiplexed, lowest latency ${C_Y}[recommended, default]${C_RESET}"
-    echo -e "    ${C_G}2)${C_RESET} TCP Simple forwarder — one link per connection (l4)"
-    echo -e "    ${C_G}3)${C_RESET} TUN IP tunnel        — route all IP traffic (l3)"
-    local esel; esel="$(ask "Select" "1")"
+    echo; echo -e "  Tunnel protocol:"
+    echo -e "    ${C_G}1)${C_RESET} TCP Reverse Tunnel — multiplexed, lowest latency ${C_Y}[recommended, default]${C_RESET}"
+    echo -e "    ${C_G}2)${C_RESET} TUN                — virtual network interface, routes all IP traffic"
     local engine transport="tcp"
-    case "$esel" in 2) engine="l4";; 3) engine="l3";; *) engine="mux";; esac
+    [ "$(ask_choice "Select" "1" 2)" = "2" ] && engine="tun" || engine="mux"
 
     echo; echo -e "  Direction:"
     echo -e "    ${C_G}1)${C_RESET} Reverse (recommended) — Kharej connects to Iran"
     echo -e "    ${C_G}2)${C_RESET} Direct                — Iran connects to Kharej"
-    local dsel; dsel="$(ask "Select" "1")"
-    local mode; [ "$dsel" = "2" ] && mode="direct" || mode="reverse"
+    local mode; [ "$(ask_choice "Select" "1" 2)" = "2" ] && mode="direct" || mode="reverse"
 
-    local defname="iran$RANDOM"; defname="${defname:0:8}"
-    local name; name="$(ask "Tunnel name" "$defname")"
-    name="$(echo "$name" | tr -cd '[:alnum:]_-')"
-    [ -z "$name" ] && { echo -e "  ${C_R}Invalid name.${C_RESET}"; pause; return; }
-    if [ -f "${CONF_DIR}/${name}.toml" ]; then
-        echo -e "  ${C_R}A tunnel named '$name' already exists.${C_RESET}"; pause; return
-    fi
+    # Name: valid characters + unique. Re-prompts; never aborts.
+    local defname="et$RANDOM"; defname="${defname:0:8}"
+    local name
+    while true; do
+        name="$(ask_name "Tunnel name" "$defname")"
+        [ -f "${CONF_DIR}/${name}.toml" ] || break
+        echo -e "  ${C_R}A tunnel named '$name' already exists — choose another.${C_RESET}"
+    done
 
-    # Dialer side needs the peer address.
+    # Dialer side needs the peer's public address.
     local is_dialer="no" peer=""
     { [ "$mode" = "reverse" ] && [ "$role" = "kharej" ]; } && is_dialer="yes"
     { [ "$mode" = "direct" ]  && [ "$role" = "iran" ]; }   && is_dialer="yes"
-    if [ "$is_dialer" = "yes" ]; then
-        peer="$(ask "Peer address (the OTHER server's public IP)" "")"
-        [ -z "$peer" ] && { echo -e "  ${C_R}Peer is required on this side.${C_RESET}"; pause; return; }
-    fi
+    [ "$is_dialer" = "yes" ] && peer="$(ask_req "Peer address (the OTHER server's public IP or hostname)")"
 
-    local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health tun_ip=""
-    tunnel_port="$(ask "Tunnel port (server <-> server link)" "1234")"
-    mtu="$(ask "MTU" "1380")"
-    echo -e "  Performance profile: ${C_C}fast${C_RESET} (max throughput) | ${C_C}balance${C_RESET} | ${C_C}resource${C_RESET} (low RAM)"
-    profile="$(ask "Profile" "balance")"
-    workers="$(ask "CPU workers (0 = auto-detect)" "0")"
-    pool="$(ask "Tunnel links / sessions" "4")"
-    health="$(ask "Health/stats port (local only)" "9090")"
-    # Only the L3 (TUN) engine uses an interface + tunnel subnet; forwarders do not.
-    if [ "$engine" = "l3" ]; then
-        iface="$(ask "Tunnel interface" "emergency-tun")"
-        if [ "$role" = "iran" ]; then tun_ip="$(ask "Tunnel IP (this host)" "10.10.10.1/24")"
-        else tun_ip="$(ask "Tunnel IP (this host)" "10.10.10.2/24")"; fi
-    fi
+    local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health
+    local tun_ip="" peer_tun_ip="" forwards_toml="[]" proxy="false"
 
-    echo -e "  Encryption: ${C_G}1)${C_RESET} chacha20-poly1305   ${C_G}2)${C_RESET} aes-256-gcm"
-    local csel; csel="$(ask "Select" "1")"
-    [ "$csel" = "2" ] && cipher="aes-256-gcm" || cipher="chacha20-poly1305"
+    tunnel_port="$(ask_port "Tunnel port (server <-> server link — SAME on both servers)" "1234")"
+    mtu="$(ask_int "MTU" "1380" 576 9000)"
+    profile="$(ask_oneof "Performance profile (fast=throughput | balance | resource=low RAM)" "balance" "fast balance resource")"
+    workers="$(ask_int "CPU workers (0 = auto-detect)" "0" 0 256)"
+    pool="$(ask_int "Tunnel links / sessions" "4" 1 1024)"
+    health="$(ask_port "Health/stats port (local only, != tunnel port)" "9090")"
 
-    # Encryption is automatic: keys are negotiated per connection via ephemeral
-    # X25519 (no pre-shared key to copy between servers).
-    echo; echo -e "  ${C_G}Encryption is automatic${C_RESET} (ephemeral X25519 — no key to share)."
+    echo -e "  Encryption: ${C_G}1)${C_RESET} chacha20-poly1305 (fast on ARM/mobile)   ${C_G}2)${C_RESET} aes-256-gcm (fast with AES-NI)"
+    [ "$(ask_choice "Select" "1" 2)" = "2" ] && cipher="aes-256-gcm" || cipher="chacha20-poly1305"
+    echo -e "  ${C_G}Encryption is automatic${C_RESET} (ephemeral X25519 — no key to share)."
     echo -e "  ${C_Y}Security:${C_RESET} restrict the tunnel port (${tunnel_port}) to the peer's IP in your firewall."
 
-    # Forwards apply to the forwarding engines (l4/mux) on the entry (Iran) side.
-    # L3 routes all IP traffic and has no port list.
-    local forwards_toml="[]" proxy="false"
-    if [ "$engine" != "l3" ] && [ "$role" = "iran" ]; then
-        echo; echo -e "  ${C_BOLD}VPN configuration / data port(s)${C_RESET}"
-        echo -e "  ${C_C}This is your VPN configuration/data port. Users will connect through this port.${C_RESET}"
-        echo -e "  ${C_C}Common choices are ports like 443.${C_RESET}"
-        echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
-        echo -e "  ${C_Y}Note:${C_RESET} must differ from the tunnel port (${tunnel_port})."
-        local flist; flist="$(ask "VPN data port(s)" "443")"
-        forwards_toml="$(csv_to_toml_array "$flist")"
-        yesno "Enable PROXY protocol v2 by default?" "n" && proxy="true"
-    elif [ "$engine" = "l3" ]; then
-        echo -e "  ${C_C}L3 engine: all IP traffic to ${tun_ip%/*} peer is tunnelled (no port list).${C_RESET}"
+    if [ "$engine" = "tun" ]; then
+        echo; echo -e "  ${C_BOLD}TUN mode${C_RESET}"
+        echo -e "  ${C_C}TUN mode creates a virtual network interface between the Iran and Foreign"
+        echo -e "  servers. It allows TCP, UDP, ICMP, and IPv6 ICMP traffic to pass through a"
+        echo -e "  private tunnel network. The default subnet is 10.10.10.0/24, where Iran uses"
+        echo -e "  10.10.10.1 and Foreign uses 10.10.10.2.${C_RESET}"
+        iface="$(ask_name "Tunnel interface name" "emergency-tun")"
+        local def_ip def_peer
+        if [ "$role" = "iran" ]; then def_ip="10.10.10.1/24"; def_peer="10.10.10.2"
+        else def_ip="10.10.10.2/24"; def_peer="10.10.10.1"; fi
+        tun_ip="$(ask_ipcidr "This host's tunnel IP (CIDR)" "$def_ip")"
+        # Peer tunnel IP must be inside the same subnet and differ from ours.
+        while true; do
+            peer_tun_ip="$(ask "Peer's tunnel IP" "$def_peer")"
+            if valid_ipv4 "$peer_tun_ip" && [ "$peer_tun_ip" != "${tun_ip%/*}" ]; then break; fi
+            echo -e "  ${C_R}Enter a valid IP in the tunnel subnet, different from ${tun_ip%/*}.${C_RESET}"
+        done
+    else
+        # mux: VPN/listen ports live only on the Iran (entry) side.
+        if [ "$role" = "iran" ]; then
+            echo; echo -e "  ${C_BOLD}VPN configuration / data port(s)${C_RESET}"
+            echo -e "  ${C_C}This is your VPN configuration/data port. Users will connect through this port."
+            echo -e "  Common choices are ports like 443.${C_RESET}"
+            echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
+            local flist
+            while true; do
+                flist="$(ask_req "VPN data port(s)" "443")"
+                forwards_toml="$(csv_to_toml_array "$flist")"
+                [ "$forwards_toml" != "[]" ] && break
+                echo -e "  ${C_R}At least one VPN/listen port is required.${C_RESET}"
+            done
+            yesno "Enable PROXY protocol v2 by default?" "n" && proxy="true"
+        fi
     fi
 
     write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$tunnel_port" \
-        "$tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" \
+        "$tun_ip" "$peer_tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" \
         "$health" "$profile" "$proxy" "$forwards_toml"
 
     echo; echo -e "  ${C_C}Validating configuration...${C_RESET}"
@@ -207,8 +281,8 @@ csv_to_toml_array() { # "a,b,c" -> ["a", "b", "c"]
 
 write_config() {
     local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" tunnel="$7" \
-          tun_ip="$8" iface="$9" mtu="${10}" workers="${11}" pool="${12}" cipher="${13}" \
-          health="${14}" profile="${15}" proxy="${16}" forwards="${17}"
+          tun_ip="$8" peer_tun_ip="$9" iface="${10}" mtu="${11}" workers="${12}" pool="${13}" \
+          cipher="${14}" health="${15}" profile="${16}" proxy="${17}" forwards="${18}"
     install -d -m 0750 "$CONF_DIR"
     umask 077
     {
@@ -220,8 +294,6 @@ write_config() {
         echo "mode = \"$mode\""
         [ -n "$peer" ] && echo "peer = \"$peer\""
         echo "tunnel_port = $tunnel"
-        [ -n "$tun_ip" ] && echo "tun_ip = \"$tun_ip\""
-        echo "tun_iface = \"$iface\""
         echo "mtu = $mtu"
         echo "workers = $workers"
         echo "pool = $pool"
@@ -229,17 +301,15 @@ write_config() {
         echo "health_port = $health"
         echo "profile = \"$profile\""
         echo "log_level = \"info\""
-        if [ "$engine" = "l3" ]; then
-            echo "heartbeat_interval = 10"
-            echo "heartbeat_timeout = 25"
+        echo "heartbeat_interval = 10"
+        echo "heartbeat_timeout = 25"
+        if [ "$engine" = "tun" ]; then
+            echo "tun_iface = \"$iface\""
+            [ -n "$tun_ip" ]      && echo "tun_ip = \"$tun_ip\""
+            [ -n "$peer_tun_ip" ] && echo "peer_tun_ip = \"$peer_tun_ip\""
         else
             echo "proxy_protocol = $proxy"
             echo "forwards = $forwards"
-            if [ "$engine" = "mux" ]; then
-                # mux uses heartbeat for per-session keepalive / RTT.
-                echo "heartbeat_interval = 10"
-                echo "heartbeat_timeout = 25"
-            fi
         fi
     } > "${CONF_DIR}/${name}.toml"
     chmod 0600 "${CONF_DIR}/${name}.toml"

@@ -8,6 +8,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,7 +42,9 @@ type Config struct {
 	Mode       string `toml:"mode"`
 	Peer       string `toml:"peer"`        // remote host the dialer connects to
 	TunnelPort int    `toml:"tunnel_port"` // server<->server link port (same on both sides)
-	TunIP      string `toml:"tun_ip"`      // L3 transports only
+	TunIP      string `toml:"tun_ip"`      // TUN engine: this host's tunnel address (CIDR)
+	TunIP6     string `toml:"tun_ip6"`     // TUN engine: optional IPv6 tunnel address (CIDR)
+	PeerTunIP  string `toml:"peer_tun_ip"` // TUN engine: peer's tunnel address (for routing/logs)
 	TunIface   string `toml:"tun_iface"`
 	MTU        int    `toml:"mtu"`
 	Workers    int    `toml:"workers"` // 0 = auto
@@ -52,12 +55,13 @@ type Config struct {
 	LogLevel   string `toml:"log_level"`
 
 	// Engine selects the data plane:
-	//   "l4" (default) — L4 TCP port-forwarder with a pooled-link model.
-	//   "l3"           — L3 TUN tunnel (raw IP packets, multi-queue, batched,
-	//                    heartbeat-monitored). The pengutunnel-style core.
+	//   "mux" (default) — TCP Reverse Tunnel: many user streams multiplexed over
+	//                     a small pool of encrypted links (lowest latency).
+	//   "tun"           — virtual network interface (L3): a TUN device carrying
+	//                     all IP traffic (TCP/UDP/ICMP/ICMPv6) over the tunnel.
 	Engine string `toml:"engine"`
 
-	// L3 / tuning knobs (ignored by the l4 engine).
+	// TUN / tuning knobs (ignored by the mux engine).
 	HeartbeatInterval int `toml:"heartbeat_interval"` // seconds; 0 = default
 	HeartbeatTimeout  int `toml:"heartbeat_timeout"`  // seconds; 0 = default
 	BatchSize         int `toml:"batch_size"`         // packets per batch; 0 = auto
@@ -101,10 +105,13 @@ func Defaults() Config {
 
 // Engine identifiers.
 const (
-	EngineL4  = "l4"  // TCP port-forwarder, one pooled link per connection
-	EngineL3  = "l3"  // TUN tunnel (raw IP, multi-queue, batched)
-	EngineMux = "mux" // TCP port-forwarder, multiplexed streams over few links
+	EngineMux = "mux" // TCP Reverse Tunnel (multiplexed streams over few links)
+	EngineTUN = "tun" // virtual network interface (L3, all IP protocols)
+	EngineL3  = "l3"  // deprecated alias for EngineTUN (normalised on load)
 )
+
+// IsTUN reports whether the config selects the TUN engine (accepts the "l3" alias).
+func (c *Config) IsTUN() bool { return c.Engine == EngineTUN || c.Engine == EngineL3 }
 
 // Validate checks the config for internal consistency and returns a helpful
 // error describing the first problem found.
@@ -135,29 +142,20 @@ func (c *Config) Validate() error {
 	if c.HealthPort != 0 && c.HealthPort == c.TunnelPort {
 		return fmt.Errorf("health_port (%d) must differ from the tunnel_port", c.HealthPort)
 	}
-	if c.Engine != EngineL3 && c.Engine != EngineL4 && c.Engine != EngineMux {
-		return fmt.Errorf("engine must be %q, %q or %q, got %q", EngineL4, EngineMux, EngineL3, c.Engine)
+	if c.Engine != EngineMux && !c.IsTUN() {
+		return fmt.Errorf("engine must be %q (TCP Reverse) or %q (TUN), got %q", EngineMux, EngineTUN, c.Engine)
 	}
 	// The dialer side needs to know where to connect.
 	if c.dialerSide() && strings.TrimSpace(c.Peer) == "" {
 		return fmt.Errorf("peer is required on the dialing side (role=%s mode=%s)", c.Role, c.Mode)
 	}
 
-	// The L3 engine is a TUN tunnel: it needs an interface address, not forwards.
-	if c.Engine == EngineL3 {
-		if strings.TrimSpace(c.TunIP) == "" {
-			return fmt.Errorf("tun_ip is required for the l3 engine (e.g. 10.20.0.1/24)")
-		}
-		if !strings.Contains(c.TunIP, "/") {
-			return fmt.Errorf("tun_ip must include a prefix length (e.g. 10.20.0.1/24)")
-		}
-		if c.HeartbeatTimeout > 0 && c.HeartbeatInterval > 0 && c.HeartbeatTimeout <= c.HeartbeatInterval {
-			return fmt.Errorf("heartbeat_timeout (%d) must be greater than heartbeat_interval (%d)", c.HeartbeatTimeout, c.HeartbeatInterval)
-		}
-		return nil
+	// The TUN engine is a virtual network interface: it needs a tunnel address.
+	if c.IsTUN() {
+		return c.validateTUN()
 	}
 
-	// --- l4 engine: forwarding rules -------------------------------------
+	// --- mux engine: VPN/listen port forwarding rules --------------------
 	// Only the entry side (Iran) owns forwards.
 	if c.Role == RoleIran && len(c.Forwards) == 0 {
 		return fmt.Errorf("at least one forward is required on the iran (entry) side")
@@ -177,6 +175,40 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// validateTUN validates the TUN-engine addressing (IPv4 required, IPv6 optional)
+// and the peer/heartbeat settings.
+func (c *Config) validateTUN() error {
+	ip, ipnet, err := net.ParseCIDR(strings.TrimSpace(c.TunIP))
+	if err != nil {
+		return fmt.Errorf("tun_ip must be an address with prefix, e.g. 10.10.10.1/24 (got %q)", c.TunIP)
+	}
+	if ip.To4() == nil {
+		return fmt.Errorf("tun_ip must be an IPv4 address (use tun_ip6 for IPv6): %q", c.TunIP)
+	}
+	if c.PeerTunIP != "" {
+		pip := net.ParseIP(strings.TrimSpace(c.PeerTunIP))
+		if pip == nil {
+			return fmt.Errorf("peer_tun_ip is not a valid IP: %q", c.PeerTunIP)
+		}
+		if !ipnet.Contains(pip) {
+			return fmt.Errorf("peer_tun_ip %s is not inside the tunnel subnet %s", c.PeerTunIP, ipnet)
+		}
+		if pip.Equal(ip) {
+			return fmt.Errorf("peer_tun_ip must differ from tun_ip (%s)", ip)
+		}
+	}
+	if c.TunIP6 != "" {
+		ip6, _, err := net.ParseCIDR(strings.TrimSpace(c.TunIP6))
+		if err != nil || ip6.To4() != nil {
+			return fmt.Errorf("tun_ip6 must be an IPv6 address with prefix, e.g. fd00::1/64 (got %q)", c.TunIP6)
+		}
+	}
+	if c.HeartbeatTimeout > 0 && c.HeartbeatInterval > 0 && c.HeartbeatTimeout <= c.HeartbeatInterval {
+		return fmt.Errorf("heartbeat_timeout (%d) must be greater than heartbeat_interval (%d)", c.HeartbeatTimeout, c.HeartbeatInterval)
 	}
 	return nil
 }
@@ -288,6 +320,9 @@ func Load(path string) (*Config, error) {
 	c := Defaults()
 	if err := unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	if c.Engine == EngineL3 { // normalise the deprecated alias
+		c.Engine = EngineTUN
 	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)

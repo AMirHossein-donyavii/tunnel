@@ -13,18 +13,18 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
 
 ## Highlights
 
-- **Three data-plane engines** (choose per tunnel — see [docs/PROTOCOL.md](docs/PROTOCOL.md)):
-  - **`mux`** — **multiplexed TCP reverse tunnel**: many user connections become
-    lightweight **streams over a few long-lived links**. A new connection costs
-    one SYN frame (no extra handshake) → **lowest latency**, scales to thousands
-    of connections. Per-stream **flow control**, priority scheduling, adaptive
-    batching, PING/RTT health. *(recommended)*
-  - **`l4`** — simple TCP **port-forwarder**: one pooled link per connection,
-    reverse **and** direct modes, PROXY protocol v2. *(simplest)*
-  - **`l3`** — **TUN IP tunnel** (WireGuard-style): a multi-queue TUN device with
-    **N encrypted links = N queues**, **packet batching**, **heartbeat
-    auto-recovery**, **BBR / socket tuning**. Routes arbitrary IP traffic.
-  - All engines share the same AEAD encryption, ephemeral X25519 key exchange,
+- **Two tunnel protocols** (choose per tunnel — see [docs/PROTOCOL.md](docs/PROTOCOL.md)):
+  1. **TCP Reverse Tunnel (`mux`)** — many user connections become lightweight
+     **streams over a few long-lived links**. A new connection costs one SYN
+     frame (no extra handshake) → **lowest latency**, scales to thousands of
+     connections. Per-stream **flow control**, priority scheduling, adaptive
+     batching, PING/RTT health. *(recommended, default)*
+  2. **TUN (`tun`)** — a **virtual network interface** between the two servers
+     (multi-queue TUN device). All IP traffic — **TCP, UDP, ICMP, IPv6 ICMP** —
+     flows over the tunnel subnet (default `10.10.10.0/24`; Iran `10.10.10.1`,
+     Foreign `10.10.10.2`). Packet batching, heartbeat auto-recovery, BBR/socket
+     tuning.
+  - Both protocols share the same AEAD encryption, ephemeral X25519 key exchange,
     and TCP tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a
   static binary, wires up systemd, and launches the panel.
@@ -50,10 +50,9 @@ internal/crypto        AEAD framed conn + ephemeral X25519 key exchange (HKDF)
 internal/transport     transport interface + registry
         /tcp           production TCP transport (tuned sockets)
         /dns /ssh /hysteria /ipx   experimental extension points
-internal/forward       L4 data path: pool, control frame, entry/exit, PROXY v2, splice
 internal/mux           stream multiplexer: binary framing, per-stream flow control, PING/RTT
-internal/muxeng        MUX reverse engine: session pool, stream routing, PROXY v2
-internal/l3            L3 data path: multi-queue TUN pump, datagram framing, batching, heartbeat
+internal/muxeng        TCP Reverse engine: session pool, stream routing, PROXY v2
+internal/l3            TUN engine: multi-queue TUN pump, datagram framing, batching, heartbeat
 internal/tun           multi-queue TUN device (linux impl + non-linux stub)
 internal/nettune       socket/kernel tuning (NODELAY/QUICKACK/USER_TIMEOUT, SO_*BUF, BBR)
 internal/proxyproto    PROXY protocol v2 header builder
@@ -82,10 +81,10 @@ the forwarded ports is set by **role** (Iran ⇒ entry). The two are orthogonal,
 all four combinations work. Each pooled link is owned by exactly one worker for
 its lifetime — the pool size stays exact and there are no goroutine/conn leaks.
 
-### How packets flow (L3 TUN engine)
+### How packets flow (TUN engine)
 
 ```
-app ─▶ emergency-tun (TUN, 10.10.10.1/24)
+app ─▶ emergency-tun (TUN, 10.10.10.1/24)   any IP: TCP/UDP/ICMP/ICMPv6
           │  kernel hashes the flow to queue i (ordering preserved)
           ▼
     reader i ─▶ [batch N packets] ─▶ AEAD link i ═══▶ peer link i ─▶ TUN queue i ─▶ peer stack
@@ -95,8 +94,9 @@ app ─▶ emergency-tun (TUN, 10.10.10.1/24)
 ```
 
 `pool` sets the number of queues **and** links (keep it ≈ CPU cores). Both ends
-must use the same `engine`. Pick **l4** to expose specific ports (proxy/CDN use
-cases); pick **l3** to route arbitrary IP traffic between the two hosts.
+must use the same protocol. Pick **TCP Reverse (`mux`)** to expose specific
+ports (proxy/CDN use cases); pick **TUN (`tun`)** to route arbitrary IP traffic
+(TCP/UDP/ICMP/ICMPv6) between the two hosts over `10.10.10.0/24`.
 
 ## Install
 

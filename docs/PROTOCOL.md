@@ -1,17 +1,16 @@
 # Emergency Tunnel — Protocol & Engine Architecture
 
-Emergency Tunnel ships **three data-plane engines** behind one config, one CLI,
-one installer. They share the same authenticated, encrypted link layer and
-differ only in how they move bytes:
+Emergency Tunnel ships **two tunnel protocols** behind one config, one CLI, one
+installer. They share the same encrypted link layer and differ only in how they
+move bytes:
 
-| Engine | What it is | Best for |
-|--------|------------|----------|
-| **`mux`** | Multiplexed TCP forwarder — many streams over a few links | Reverse proxy / CDN / gaming / thousands of connections *(recommended)* |
-| **`l4`**  | Simple TCP forwarder — one link per connection | Small, simple setups; maximum interop |
-| **`l3`**  | TUN IP tunnel — raw packets, multi-queue | Routing arbitrary IP traffic (VPN-style) |
+| Protocol (engine) | What it is | Best for |
+|-------------------|------------|----------|
+| **TCP Reverse Tunnel (`mux`)** | Multiplexed TCP — many user streams over a few links | Reverse proxy / CDN / gaming / thousands of connections *(recommended, default)* |
+| **TUN (`tun`)** | Virtual network interface — all IP traffic over a private subnet | Routing arbitrary IP (TCP/UDP/ICMP/ICMPv6) between two hosts, VPN-style |
 
-All three use the same handshake and AEAD framing (below), so encryption is
-identical across engines.
+Both use the same ephemeral-X25519 handshake and AEAD framing (below), so
+encryption is identical. (`l3` is accepted as a deprecated alias for `tun`.)
 
 ---
 
@@ -34,7 +33,7 @@ Every tunnel link is a TCP connection wrapped with:
 ## The `mux` engine (next-generation reverse tunnel)
 
 The `mux` engine is the headline of v1.2. Instead of opening a fresh TCP + crypto
-handshake for every user connection (the `l4` model), it multiplexes **many
+handshake for every user connection (a naive per-connection model), it multiplexes **many
 logical streams over a small pool of long-lived links**.
 
 ### Why it's faster
@@ -43,7 +42,7 @@ A new user connection is a single **SYN frame** on an already-open, already-
 authenticated link — **zero extra round-trips**. On a long-distance link the
 handshake you avoid is worth 1–2 RTT *per connection*:
 
-| Connection setup | `mux` | per-conn handshake (`l4` cold) |
+| Connection setup | `mux` | per-conn handshake (naive model) |
 |---|---|---|
 | local link | 19.9 µs · 16 allocs | 32.1 µs · 133 allocs |
 | 20 ms link | **32.8 ms** | **76.5 ms** |
@@ -103,23 +102,48 @@ single in-memory stream).
 
 ---
 
-## Choosing an engine
+## The TUN protocol (`tun`)
 
-- **Reverse proxy / Xray / many short connections / gaming** → `mux`.
-- **A couple of long-lived TCP tunnels, simplest possible** → `l4`.
-- **Route all IP traffic between two hosts (VPN-style)** → `l3`.
+TUN mode creates a **virtual network interface** (`emergency-tun`) on each
+server and carries **raw IP packets** between them over the encrypted links. The
+two hosts get private addresses on a shared subnet (default `10.10.10.0/24`:
+Iran `10.10.10.1`, Foreign `10.10.10.2`) and can then reach each other on those
+IPs with **any** IP protocol — TCP, UDP, ICMP (ping), and IPv6 ICMP.
 
-Both ends of a tunnel **must use the same engine** and cipher. Engines do
-not interoperate with each other.
+- **Multi-queue** TUN: `pool` queues, each paired 1:1 with an encrypted link.
+  The kernel hashes each flow to a fixed queue, so per-flow ordering is preserved
+  while load spreads across CPU cores.
+- **Batching:** the TX path coalesces packets into ≤16 KiB AEAD frames to cut
+  syscalls and CPU; a 2 ms flush bounds latency at low rates.
+- **Zero-copy-ish:** one persistent reader per queue with a `sync.Pool` of packet
+  buffers; steady-state allocation is minimal.
+- **Heartbeat + auto-reconnect** per link; a clear "Tunnel connected
+  successfully: Iran 10.10.10.1 <-> Foreign 10.10.10.2" line is logged once the
+  first link is up.
+- **Validation:** `tun_ip` must be a valid IPv4 CIDR; `peer_tun_ip` must be a
+  valid IP inside the same subnet and different from `tun_ip`; optional `tun_ip6`
+  must be a valid IPv6 CIDR.
+
+Requires `CAP_NET_ADMIN` (granted by the systemd unit) to create the device.
+
+---
+
+## Choosing a protocol
+
+- **Reverse proxy / Xray / many short connections / gaming** → **TCP Reverse (`mux`)**.
+- **Route arbitrary IP traffic (ping, UDP apps, IPv6) between two hosts** → **TUN (`tun`)**.
+
+Both ends of a tunnel **must use the same protocol** and cipher; they do not
+interoperate with each other.
 
 ---
 
 ## Migration
 
-- **New tunnels**: pick `mux` in the panel (option 1) or set `engine = "mux"`.
-- **Existing `l4` tunnels**: they keep working unchanged (`l4` is still fully
-  supported). To upgrade one to `mux`, set `engine = "mux"` on **both** ends and
-  restart both services. Configs are otherwise identical; you can lower `pool`
-  to 2–4 since each session now carries many streams.
+- **New tunnels**: the panel offers TCP Reverse (option 1, default) and TUN
+  (option 2). Or set `engine = "mux"` / `engine = "tun"` in the config.
+- **Upgrading from an older version**: the removed `l4` (simple forwarder)
+  engine no longer exists — re-create those tunnels as `mux` (same `forwards`).
+  The `l3` engine value is still accepted as an alias for `tun`.
 - No key management is needed — encryption keys are ephemeral (auto-negotiated
   per connection). There is no pre-shared key to configure or rotate.

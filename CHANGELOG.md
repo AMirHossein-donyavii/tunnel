@@ -4,6 +4,43 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-07-09
+
+Streamlines the project to **two tunnel protocols** and makes **TUN** a
+first-class, production-quality protocol.
+
+### Removed
+- **The `l4` (simple TCP forwarder) engine — completely.** Package
+  `internal/forward`, the `EngineL4` value, its core wiring, panel option, and
+  docs are gone. Re-create any old `l4` tunnels as `mux` (same `forwards`).
+
+### Changed
+- **Protocol list is now exactly two:** **1) TCP Reverse Tunnel (`mux`)** and
+  **2) TUN (`tun`)**. TCP Reverse remains the default/primary.
+- **TUN promoted to first-class** (engine value `tun`; the old `l3` value is
+  accepted as a deprecated alias and normalised on load). Defaults: Iran
+  `10.10.10.1`, Foreign `10.10.10.2` on `10.10.10.0/24`. Carries all IP traffic
+  (TCP/UDP/ICMP/IPv6-ICMP). Optional `tun_ip6` for an IPv6 tunnel address.
+
+### Added
+- **TUN validation** using `net.ParseCIDR`: `tun_ip` must be a valid IPv4 CIDR;
+  `peer_tun_ip` must be a valid IP inside the same subnet and differ from
+  `tun_ip`; `tun_ip6` (if set) must be a valid IPv6 CIDR.
+- **Connection logging:** a clear "Tunnel connected successfully:
+  Iran <ip> <-> Foreign <ip>" line on the first live link, plus disconnect/
+  reconnect events — all per-link (no per-packet log spam).
+- **Robust wizard input:** every field (ports, IPs, name, protocol, numbers)
+  now **re-prompts until valid** and never aborts on empty/invalid input.
+  New helpers: `ask_port`, `ask_ipcidr`, `ask_int`, `ask_name`, `ask_oneof`,
+  `ask_choice`, `ask_req`. Duplicate tunnel names re-prompt too.
+- Panel TUN section explains the virtual-interface model and auto-fills
+  `tun_ip` / `peer_tun_ip` per role.
+
+### Verified
+- linux amd64/arm64/armv7 build; `go vet` clean; tests green including `-race`;
+  TUN + TCP-Reverse example configs validate; end-to-end mux loopback forwards
+  data; TUN subnet/peer validation rejects bad configs.
+
 ## [1.3.0] — 2026-07-08
 
 Removes the pre-shared key entirely and clarifies the port model. **Breaking**

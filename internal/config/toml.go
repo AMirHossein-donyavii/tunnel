@@ -46,6 +46,10 @@ func assign(c *Config, key, val string) error {
 		c.Peer = unquote(val)
 	case "tun_ip":
 		c.TunIP = unquote(val)
+	case "tun_ip6":
+		c.TunIP6 = unquote(val)
+	case "peer_tun_ip":
+		c.PeerTunIP = unquote(val)
 	case "tun_iface":
 		c.TunIface = unquote(val)
 	case "cipher":
@@ -202,6 +206,12 @@ func (c *Config) Marshal() string {
 	if c.TunIP != "" {
 		kv("tun_ip", c.TunIP)
 	}
+	if c.TunIP6 != "" {
+		kv("tun_ip6", c.TunIP6)
+	}
+	if c.PeerTunIP != "" {
+		kv("peer_tun_ip", c.PeerTunIP)
+	}
 	kv("tun_iface", c.TunIface)
 	ki("mtu", c.MTU)
 	ki("workers", c.Workers)
@@ -212,7 +222,7 @@ func (c *Config) Marshal() string {
 	kv("log_level", c.LogLevel)
 	kb("proxy_protocol", c.ProxyProtocol)
 
-	if c.Engine == EngineL3 {
+	if c.IsTUN() {
 		ki("heartbeat_interval", c.HeartbeatInterval)
 		ki("heartbeat_timeout", c.HeartbeatTimeout)
 		if c.BatchSize > 0 {

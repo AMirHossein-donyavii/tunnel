@@ -69,7 +69,7 @@ func benchMuxSetup(b *testing.B, rtt time.Duration) {
 }
 
 // --- baseline: new connection = a full crypto handshake per connection -------
-// (models the l4 engine's cost when a warm pooled link is not available).
+// (models a naive per-connection handshake when no warm link is available).
 
 func benchHandshakeSetup(b *testing.B, rtt time.Duration) {
 	req := make([]byte, 64)

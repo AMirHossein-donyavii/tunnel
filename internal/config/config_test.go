@@ -2,37 +2,81 @@ package config
 
 import "testing"
 
-
-func baseL3() Config {
+func baseTUN() Config {
 	c := Defaults()
 	c.Name = "t"
 	c.Role = RoleKharej
-	c.Engine = EngineL3
+	c.Engine = EngineTUN
 	c.Peer = "1.2.3.4"
-	c.TunIP = "10.20.0.2/24"
+	c.TunIP = "10.10.10.2/24"
+	c.PeerTunIP = "10.10.10.1"
 	return c
 }
 
-func TestValidateL3(t *testing.T) {
-	c := baseL3()
+// keep an alias so existing tests below can call baseL3()
+func baseL3() Config { return baseTUN() }
+
+func TestValidateTUN(t *testing.T) {
+	c := baseTUN()
 	if err := c.Validate(); err != nil {
-		t.Fatalf("valid l3 config rejected: %v", err)
+		t.Fatalf("valid tun config rejected: %v", err)
 	}
 }
 
-func TestValidateL3RequiresPrefix(t *testing.T) {
-	c := baseL3()
-	c.TunIP = "10.20.0.2"
+func TestValidateTUNRequiresPrefix(t *testing.T) {
+	c := baseTUN()
+	c.TunIP = "10.10.10.2"
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for tun_ip without prefix length")
 	}
 }
 
-func TestValidateL3RequiresTunIP(t *testing.T) {
-	c := baseL3()
+func TestValidateTUNRequiresTunIP(t *testing.T) {
+	c := baseTUN()
 	c.TunIP = ""
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for missing tun_ip")
+	}
+}
+
+func TestValidateTUNPeerSubnet(t *testing.T) {
+	c := baseTUN()
+	c.PeerTunIP = "192.168.9.9" // outside 10.10.10.0/24
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: peer_tun_ip outside tunnel subnet")
+	}
+	c = baseTUN()
+	c.PeerTunIP = "10.10.10.2" // equal to tun_ip
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: peer_tun_ip equal to tun_ip")
+	}
+	c = baseTUN()
+	c.PeerTunIP = "not-an-ip"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: peer_tun_ip invalid")
+	}
+}
+
+func TestValidateTUNIPv6(t *testing.T) {
+	c := baseTUN()
+	c.TunIP6 = "fd00::2/64"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid tun_ip6 rejected: %v", err)
+	}
+	c.TunIP6 = "10.0.0.1/24" // not IPv6
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: tun_ip6 must be IPv6")
+	}
+}
+
+func TestEngineL3IsTUNAlias(t *testing.T) {
+	c := baseTUN()
+	c.Engine = EngineL3
+	if !c.IsTUN() {
+		t.Fatal("l3 should be recognised as the TUN engine")
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("l3 alias rejected: %v", err)
 	}
 }
 
@@ -143,8 +187,9 @@ func TestTOMLRoundTrip(t *testing.T) {
 	if err := unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Engine != EngineL3 || got.TunIP != c.TunIP || got.SoSndbuf != c.SoSndbuf ||
-		got.HeartbeatTimeout != c.HeartbeatTimeout || got.Peer != c.Peer {
+	if got.Engine != EngineTUN || got.TunIP != c.TunIP || got.SoSndbuf != c.SoSndbuf ||
+		got.HeartbeatTimeout != c.HeartbeatTimeout || got.Peer != c.Peer ||
+		got.PeerTunIP != c.PeerTunIP {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 }

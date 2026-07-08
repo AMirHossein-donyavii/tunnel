@@ -43,7 +43,7 @@ func Open(cfg Config) (*Device, error) {
 		d.queues = append(d.queues, f)
 	}
 
-	if err := configure(d.name, cfg.Address, cfg.MTU); err != nil {
+	if err := configure(d.name, cfg.Address, cfg.Address6, cfg.MTU); err != nil {
 		_ = d.Close()
 		return nil, err
 	}
@@ -76,21 +76,34 @@ func createQueue(name string, flags uint16) (*os.File, string, error) {
 // configure assigns the address/MTU and brings the link up using iproute2.
 // (Shelling out to `ip` avoids a netlink dependency and matches how the
 // reference tools configure their interfaces.)
-func configure(name, address string, mtu int) error {
+func configure(name, address, address6 string, mtu int) error {
 	steps := [][]string{
 		{"ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu)},
 		{"ip", "addr", "add", address, "dev", name},
-		{"ip", "link", "set", "dev", name, "up"},
 	}
+	if address6 != "" {
+		steps = append(steps, []string{"ip", "-6", "addr", "add", address6, "dev", name})
+	}
+	steps = append(steps, []string{"ip", "link", "set", "dev", name, "up"})
 	for _, s := range steps {
 		cmd := exec.Command(s[0], s[1:]...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			// "add address" is non-fatal if it already exists (idempotent restarts).
-			if s[1] == "addr" && bytes.Contains(out, []byte("File exists")) {
+			// "addr add" is non-fatal if the address already exists (idempotent
+			// restarts).
+			if isAddrAdd(s) && bytes.Contains(out, []byte("File exists")) {
 				continue
 			}
 			return fmt.Errorf("tun: %v: %w: %s", s, err, bytes.TrimSpace(out))
 		}
 	}
 	return nil
+}
+
+func isAddrAdd(s []string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] == "addr" && s[i+1] == "add" {
+			return true
+		}
+	}
+	return false
 }

@@ -6,7 +6,7 @@ tunnels concurrently without noticeable CPU or memory pressure.
 ## Memory
 
 - **Pooled splice buffers.** All data copying uses a `sync.Pool` of 32 KiB
-  buffers (`internal/forward`), so steady-state forwarding allocates ~nothing on
+  buffers (`internal/muxeng`), so steady-state forwarding allocates ~nothing on
   the hot path and keeps GC pressure low.
 - **Bounded frame buffers.** AEAD framing caps plaintext at 16 KiB; each
   `SecureConn` keeps a single reusable read buffer and a single write scratch

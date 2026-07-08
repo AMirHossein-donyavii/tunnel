@@ -15,6 +15,7 @@ package l3
 import (
 	"bufio"
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,10 +101,11 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 // is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
 	dev, err := tun.Open(tun.Config{
-		Name:    e.cfg.TunIface,
-		Address: e.cfg.TunIP,
-		MTU:     e.cfg.MTU,
-		Queues:  e.queues,
+		Name:     e.cfg.TunIface,
+		Address:  e.cfg.TunIP,
+		Address6: e.cfg.TunIP6,
+		MTU:      e.cfg.MTU,
+		Queues:   e.queues,
 	})
 	if err != nil {
 		return err
@@ -114,9 +116,10 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.log.Warn("pool=%d queues but only %d usable cores — extra queues share cores; consider pool≈%d on both ends",
 			e.queues, cores, cores)
 	}
-	e.log.Info("l3 tunnel up: iface=%s addr=%s mtu=%d queues=%d transport=%s cipher=%s dialer=%v batch=%d hb=%s/%s",
-		dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, e.cfg.Transport, e.cfg.Cipher, e.isDialer,
-		e.batchSize, e.hbInterval, e.hbTimeout)
+	e.log.Info("TUN tunnel starting: iface=%s addr=%s mtu=%d queues=%d cipher=%s role=%s dialer=%v",
+		dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, e.cfg.Cipher, e.cfg.Role, e.isDialer)
+	e.log.Debug("tuning: batch=%d channel=%d hb=%s/%s sndbuf=%d rcvbuf=%d",
+		e.batchSize, e.channelSize, e.hbInterval, e.hbTimeout, e.sndbuf, e.rcvbuf)
 
 	// One persistent reader per queue feeds a bounded channel. This survives
 	// link reconnects without leaking a blocked TUN read.
@@ -151,6 +154,37 @@ func (e *Engine) Run(ctx context.Context) error {
 	pumps.Wait()
 	readers.Wait()
 	return nil
+}
+
+// logConnected emits the single, clear "connected" line when the first link of
+// the tunnel comes up (called on the 0->1 live-link transition).
+func (e *Engine) logConnected(id int) {
+	local := ipOnly(e.cfg.TunIP)
+	peer := e.cfg.PeerTunIP
+	if peer == "" {
+		peer = "peer"
+	}
+	e.log.Info("Tunnel connected successfully: %s %s <-> %s %s",
+		e.roleName(true), local, e.roleName(false), peer)
+}
+
+// roleName returns a friendly name for this host (self=true) or the peer.
+func (e *Engine) roleName(self bool) string {
+	iran := e.cfg.Role == config.RoleIran
+	if !self {
+		iran = !iran
+	}
+	if iran {
+		return "Iran Server"
+	}
+	return "Foreign Server"
+}
+
+func ipOnly(cidr string) string {
+	if i := strings.IndexByte(cidr, '/'); i >= 0 {
+		return cidr[:i]
+	}
+	return cidr
 }
 
 // queueReader is the single goroutine allowed to block on a TUN queue's Read.
@@ -255,8 +289,14 @@ func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, link *cryp
 
 	var lastRecv atomic.Int64
 	lastRecv.Store(e.nowSec())
-	atomic.AddInt64(&e.stats.liveLinks, 1)
-	defer atomic.AddInt64(&e.stats.liveLinks, -1)
+	if atomic.AddInt64(&e.stats.liveLinks, 1) == 1 {
+		e.logConnected(id)
+	}
+	defer func() {
+		if atomic.AddInt64(&e.stats.liveLinks, -1) == 0 && ctx.Err() == nil {
+			e.log.Warn("TUN tunnel disconnected — all links down, reconnecting…")
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)

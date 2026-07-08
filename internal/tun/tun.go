@@ -10,10 +10,11 @@ import "os"
 
 // Config describes the interface to create.
 type Config struct {
-	Name    string // desired interface name, e.g. "emergency-tun"
-	Address string // CIDR address to assign, e.g. "10.10.10.1/24"
-	MTU     int
-	Queues  int // number of parallel queues (>=1)
+	Name     string // desired interface name, e.g. "emergency-tun"
+	Address  string // IPv4 CIDR to assign, e.g. "10.10.10.1/24"
+	Address6 string // optional IPv6 CIDR to assign, e.g. "fd00::1/64"
+	MTU      int
+	Queues   int // number of parallel queues (>=1)
 }
 
 // Device is an opened multi-queue TUN interface.

@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/emergency-tunnel/et/internal/config"
-	"github.com/emergency-tunnel/et/internal/forward"
 	"github.com/emergency-tunnel/et/internal/l3"
 	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/muxeng"
@@ -26,7 +25,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.3.0"
+var CoreVersion = "1.4.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -51,15 +50,15 @@ func Run(path string) error {
 	log.Info("resources: workers=%d gomaxprocs=%d effective_cpus=%d profile=%s",
 		workers, runtime.GOMAXPROCS(0), sysinfo.EffectiveCPUs(), cfg.Profile)
 
-	// Select the data plane. L3 is the TUN tunnel; L4 is the port-forwarder.
+	// Select the data plane: mux = TCP Reverse Tunnel; tun = virtual interface.
 	var eng engine
-	switch cfg.Engine {
-	case config.EngineL3:
+	switch {
+	case cfg.IsTUN():
 		eng, err = l3.New(cfg, log)
-	case config.EngineMux:
+	case cfg.Engine == config.EngineMux:
 		eng, err = muxeng.New(cfg, log)
 	default:
-		eng, err = forward.New(cfg, log)
+		return fmt.Errorf("unknown engine %q", cfg.Engine)
 	}
 	if err != nil {
 		return err
@@ -77,7 +76,7 @@ func Run(path string) error {
 	return err
 }
 
-// engine is the common interface implemented by both the l3 and l4 engines.
+// engine is the common interface implemented by the mux and tun engines.
 type engine interface {
 	Run(context.Context) error
 	Snapshot() any
