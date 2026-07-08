@@ -10,8 +10,8 @@ differ only in how they move bytes:
 | **`l4`**  | Simple TCP forwarder — one link per connection | Small, simple setups; maximum interop |
 | **`l3`**  | TUN IP tunnel — raw packets, multi-queue | Routing arbitrary IP traffic (VPN-style) |
 
-All three use the same handshake and AEAD framing (below), so encryption, auth,
-and replay protection are identical across engines.
+All three use the same handshake and AEAD framing (below), so encryption is
+identical across engines.
 
 ---
 
@@ -19,9 +19,10 @@ and replay protection are identical across engines.
 
 Every tunnel link is a TCP connection wrapped with:
 
-1. **Mutual-auth handshake** (`internal/crypto`): HMAC-SHA256 challenge–response
-   derived from the PSK, with a fresh server nonce per connection (replay-proof).
-   Session keys are HKDF-derived per direction.
+1. **Ephemeral key exchange** (`internal/crypto`): an X25519 ECDH handshake
+   (fresh keys per connection → forward secrecy; **no pre-shared key**). Session
+   keys are HKDF-derived per direction from the ECDH shared secret. The exchange
+   is unauthenticated — firewall the tunnel port to the peer's IP.
 2. **AEAD framing**: ChaCha20-Poly1305 or AES-256-GCM, ≤16 KiB frames, monotonic
    nonces, per-direction keys.
 3. **Socket tuning** (`internal/nettune`): `TCP_NODELAY`, `TCP_QUICKACK`,
@@ -108,7 +109,7 @@ single in-memory stream).
 - **A couple of long-lived TCP tunnels, simplest possible** → `l4`.
 - **Route all IP traffic between two hosts (VPN-style)** → `l3`.
 
-Both ends of a tunnel **must use the same engine**, PSK, and cipher. Engines do
+Both ends of a tunnel **must use the same engine** and cipher. Engines do
 not interoperate with each other.
 
 ---
@@ -120,5 +121,5 @@ not interoperate with each other.
   supported). To upgrade one to `mux`, set `engine = "mux"` on **both** ends and
   restart both services. Configs are otherwise identical; you can lower `pool`
   to 2–4 since each session now carries many streams.
-- No PSK/cipher changes are needed. Nothing about the handshake or encryption
-  changed, so your keys stay valid.
+- No key management is needed — encryption keys are ephemeral (auto-negotiated
+  per connection). There is no pre-shared key to configure or rotate.

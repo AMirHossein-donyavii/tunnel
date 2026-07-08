@@ -50,8 +50,6 @@ func assign(c *Config, key, val string) error {
 		c.TunIface = unquote(val)
 	case "cipher":
 		c.Cipher = unquote(val)
-	case "psk":
-		c.PSK = unquote(val)
 	case "profile":
 		c.Profile = unquote(val)
 	case "log_level":
@@ -70,8 +68,10 @@ func assign(c *Config, key, val string) error {
 		return intField(val, &c.SoSndbuf)
 	case "so_rcvbuf":
 		return intField(val, &c.SoRcvbuf)
-	case "listen_port":
-		return intField(val, &c.ListenPort)
+	case "tunnel_port":
+		return intField(val, &c.TunnelPort)
+	case "listen_port": // deprecated alias for tunnel_port (backward compat)
+		return intField(val, &c.TunnelPort)
 	case "mtu":
 		return intField(val, &c.MTU)
 	case "workers":
@@ -198,7 +198,7 @@ func (c *Config) Marshal() string {
 	if c.Peer != "" {
 		kv("peer", c.Peer)
 	}
-	ki("listen_port", c.ListenPort)
+	ki("tunnel_port", c.TunnelPort)
 	if c.TunIP != "" {
 		kv("tun_ip", c.TunIP)
 	}
@@ -207,7 +207,6 @@ func (c *Config) Marshal() string {
 	ki("workers", c.Workers)
 	ki("pool", c.Pool)
 	kv("cipher", c.Cipher)
-	kv("psk", c.PSK)
 	ki("health_port", c.HealthPort)
 	kv("profile", c.Profile)
 	kv("log_level", c.LogLevel)

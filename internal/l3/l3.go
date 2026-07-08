@@ -32,7 +32,6 @@ import (
 type Engine struct {
 	cfg      *config.Config
 	log      *logx.Logger
-	psk      []byte
 	cipher   string
 	queues   int
 	isDialer bool
@@ -66,14 +65,9 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := cfg.KeyBytes()
-	if err != nil {
-		return nil, err
-	}
 	e := &Engine{
 		cfg:         cfg,
 		log:         log,
-		psk:         key,
 		cipher:      cfg.Cipher,
 		queues:      cfg.Pool,
 		isDialer:    cfg.IsDialer(),
@@ -197,7 +191,7 @@ func (e *Engine) clientQueue(ctx context.Context, q queue, ch <-chan []byte, id 
 			continue
 		}
 		nettune.TuneConn(raw, e.sndbuf, e.rcvbuf)
-		link, err := crypto.ClientHandshake(raw, e.cipher, e.psk, e.nowSec())
+		link, err := crypto.ClientHandshake(raw, e.cipher)
 		if err != nil {
 			_ = raw.Close()
 			e.log.Warn("queue %d handshake: %v", id, err)
@@ -240,7 +234,7 @@ func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txChans []ch
 		go func(slot int) {
 			defer wg.Done()
 			defer func() { free <- slot }()
-			link, err := crypto.ServerHandshake(raw, e.cipher, e.psk, e.nowSec())
+			link, err := crypto.ServerHandshake(raw, e.cipher)
 			if err != nil {
 				_ = raw.Close()
 				e.log.Warn("handshake from %s: %v", raw.RemoteAddr(), err)

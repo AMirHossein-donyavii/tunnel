@@ -135,8 +135,8 @@ create_tunnel() {
         [ -z "$peer" ] && { echo -e "  ${C_R}Peer is required on this side.${C_RESET}"; pause; return; }
     fi
 
-    local iface="emergency-tun" mtu profile workers pool cipher listen_port health tun_ip=""
-    listen_port="$(ask "Tunnel port (server <-> server link)" "1234")"
+    local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health tun_ip=""
+    tunnel_port="$(ask "Tunnel port (server <-> server link)" "1234")"
     mtu="$(ask "MTU" "1380")"
     echo -e "  Performance profile: ${C_C}fast${C_RESET} (max throughput) | ${C_C}balance${C_RESET} | ${C_C}resource${C_RESET} (low RAM)"
     profile="$(ask "Profile" "balance")"
@@ -154,17 +154,10 @@ create_tunnel() {
     local csel; csel="$(ask "Select" "1")"
     [ "$csel" = "2" ] && cipher="aes-256-gcm" || cipher="chacha20-poly1305"
 
-    # Pre-shared key: must match on both sides.
-    local psk
-    echo; echo -e "  Pre-shared key (must be identical on both servers)."
-    if yesno "Paste an existing PSK?" "n"; then
-        psk="$(ask "PSK" "")"
-    else
-        psk="$("$CORE" genpsk)"
-        echo -e "  ${C_G}Generated PSK:${C_RESET} ${C_BOLD}${psk}${C_RESET}"
-        echo -e "  ${C_Y}Copy this now — use the SAME key on the other server.${C_RESET}"
-    fi
-    [ -z "$psk" ] && { echo -e "  ${C_R}PSK required.${C_RESET}"; pause; return; }
+    # Encryption is automatic: keys are negotiated per connection via ephemeral
+    # X25519 (no pre-shared key to copy between servers).
+    echo; echo -e "  ${C_G}Encryption is automatic${C_RESET} (ephemeral X25519 — no key to share)."
+    echo -e "  ${C_Y}Security:${C_RESET} restrict the tunnel port (${tunnel_port}) to the peer's IP in your firewall."
 
     # Forwards apply to the forwarding engines (l4/mux) on the entry (Iran) side.
     # L3 routes all IP traffic and has no port list.
@@ -174,7 +167,7 @@ create_tunnel() {
         echo -e "  ${C_C}This is your VPN configuration/data port. Users will connect through this port.${C_RESET}"
         echo -e "  ${C_C}Common choices are ports like 443.${C_RESET}"
         echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
-        echo -e "  ${C_Y}Note:${C_RESET} must differ from the tunnel port (${listen_port})."
+        echo -e "  ${C_Y}Note:${C_RESET} must differ from the tunnel port (${tunnel_port})."
         local flist; flist="$(ask "VPN data port(s)" "443")"
         forwards_toml="$(csv_to_toml_array "$flist")"
         yesno "Enable PROXY protocol v2 by default?" "n" && proxy="true"
@@ -182,8 +175,8 @@ create_tunnel() {
         echo -e "  ${C_C}L3 engine: all IP traffic to ${tun_ip%/*} peer is tunnelled (no port list).${C_RESET}"
     fi
 
-    write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$listen_port" \
-        "$tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" "$psk" \
+    write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$tunnel_port" \
+        "$tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" \
         "$health" "$profile" "$proxy" "$forwards_toml"
 
     echo; echo -e "  ${C_C}Validating configuration...${C_RESET}"
@@ -213,9 +206,9 @@ csv_to_toml_array() { # "a,b,c" -> ["a", "b", "c"]
 }
 
 write_config() {
-    local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" listen="$7" \
+    local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" tunnel="$7" \
           tun_ip="$8" iface="$9" mtu="${10}" workers="${11}" pool="${12}" cipher="${13}" \
-          psk="${14}" health="${15}" profile="${16}" proxy="${17}" forwards="${18}"
+          health="${14}" profile="${15}" proxy="${16}" forwards="${17}"
     install -d -m 0750 "$CONF_DIR"
     umask 077
     {
@@ -226,14 +219,13 @@ write_config() {
         echo "transport = \"$transport\""
         echo "mode = \"$mode\""
         [ -n "$peer" ] && echo "peer = \"$peer\""
-        echo "listen_port = $listen"
+        echo "tunnel_port = $tunnel"
         [ -n "$tun_ip" ] && echo "tun_ip = \"$tun_ip\""
         echo "tun_iface = \"$iface\""
         echo "mtu = $mtu"
         echo "workers = $workers"
         echo "pool = $pool"
         echo "cipher = \"$cipher\""
-        echo "psk = \"$psk\""
         echo "health_port = $health"
         echo "profile = \"$profile\""
         echo "log_level = \"info\""

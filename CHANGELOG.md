@@ -4,6 +4,41 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-07-08
+
+Removes the pre-shared key entirely and clarifies the port model. **Breaking**
+change to the link handshake — both ends must run 1.3.0.
+
+### Removed
+- **PSK (pre-shared key) — completely.** No `psk` config field, no `et-core
+  genpsk`, no panel prompt, no validation, no docs. There is nothing to copy
+  between servers anymore.
+
+### Changed
+- **Encryption is now key-exchange-based:** each link performs an **ephemeral
+  X25519 ECDH** handshake and derives per-direction AEAD keys via HKDF. Fresh
+  keys every connection (**forward secrecy**). AEAD framing (ChaCha20-Poly1305 /
+  AES-256-GCM) is unchanged.
+- **Port model clarified.** The server↔server port is now `tunnel_port`
+  (renamed from `listen_port`; the old key is still accepted as a deprecated
+  alias). It must be identical on both sides (default `1234`). The user
+  VPN/data ports (`forwards`) are the "listen ports" and exist only on the Iran
+  side — the Kharej side is never asked for one. Panel prompts relabelled
+  accordingly.
+- Config validation now rejects `health_port == tunnel_port`.
+
+### Security note
+- The ephemeral exchange provides **confidentiality + forward secrecy but not
+  peer authentication** (there is no shared secret to authenticate with). This
+  defeats passive DPI/censorship (the primary threat) but not an active MITM.
+  **Restrict the tunnel port to the peer's IP with a firewall**, e.g.
+  `ufw allow from <PEER_IP> to any port 1234 proto tcp`.
+
+### Verified
+- End-to-end loopback tunnel (Iran↔Kharej, mux engine) forwards data correctly
+  with no PSK. linux amd64/arm64/armv7 build; `go vet` clean; tests green
+  including `-race`; example configs validate; old `listen_port` alias parses.
+
 ## [1.2.1] — 2026-07-08
 
 Production review: corrected defaults, clearer naming/UX, and networking

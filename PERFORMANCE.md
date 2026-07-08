@@ -89,4 +89,4 @@ at high packet rates.
    `net.core.somaxconn`, `net.ipv4.tcp_fastopen`, BBR
    (`net.core.default_qdisc=fq`, `net.ipv4.tcp_congestion_control=bbr`).
 4. Watch `curl -s http://127.0.0.1:<health_port>/stats` for `link_errors` — a
-   rising count means handshake/PSK or connectivity problems, not data errors.
+   rising count means handshake or connectivity problems, not data errors.

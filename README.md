@@ -24,8 +24,8 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
   - **`l3`** — **TUN IP tunnel** (WireGuard-style): a multi-queue TUN device with
     **N encrypted links = N queues**, **packet batching**, **heartbeat
     auto-recovery**, **BBR / socket tuning**. Routes arbitrary IP traffic.
-  - All engines share the same AEAD encryption, mutual-auth handshake, and TCP
-    tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
+  - All engines share the same AEAD encryption, ephemeral X25519 key exchange,
+    and TCP tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a
   static binary, wires up systemd, and launches the panel.
 - **Interactive panel (`et`)** — banner, live IP/geo/ASN, create wizard, and full
@@ -34,18 +34,19 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
   - **`tcp`** — production-ready carrier for both engines. *(recommended)*
   - **`dns` / `ssh` / `hysteria` / `ipx`** — registered and selectable, currently
     **experimental placeholders** with documented extension points.
-- **Security** — ChaCha20-Poly1305 / AES-256-GCM, HKDF-derived per-direction keys,
-  HMAC challenge–response auth with fresh server nonce (replay-resistant),
-  handshake flood shedding, `0600` configs, hardened systemd unit.
+- **Security** — ChaCha20-Poly1305 / AES-256-GCM with **ephemeral X25519** key
+  exchange (forward secrecy, no pre-shared key), HKDF-derived per-direction keys,
+  handshake flood shedding, `0600` configs, hardened systemd unit. *(Encryption
+  is unauthenticated — firewall the tunnel port to the peer IP; see Security model.)*
 - **Resource discipline** — cgroup-aware worker sizing, pooled 32 KiB splice
   buffers, bounded goroutines, profile-based GC tuning, soft heap limit.
 
 ## Architecture
 
 ```
-cmd/et-core            daemon + helper subcommands (run/validate/version/genpsk/sysinfo/transports)
-internal/config        TOML schema, dependency-free parser/writer, validation, PSK gen
-internal/crypto        AEAD framed conn + mutual-auth handshake (HKDF/HMAC)
+cmd/et-core            daemon + helper subcommands (run/validate/version/sysinfo/transports)
+internal/config        TOML schema, dependency-free parser/writer, validation
+internal/crypto        AEAD framed conn + ephemeral X25519 key exchange (HKDF)
 internal/transport     transport interface + registry
         /tcp           production TCP transport (tuned sockets)
         /dns /ssh /hysteria /ipx   experimental extension points
@@ -116,17 +117,22 @@ official toolchain and builds a static (`CGO_ENABLED=0`) binary.
 
 Run `et`, choose **Create tunnel**, and follow the wizard on **both** servers.
 
-- **Iran (entry):** role=iran, mode=reverse, add your forwards (e.g. `443,8443`),
-  generate a PSK — **copy it**.
-- **Kharej (exit):** role=kharej, mode=reverse, `peer=<iran-ip>`, paste the **same** PSK.
+- **Iran (entry):** role=iran, mode=reverse, tunnel port `1234`, add your listen
+  ports (e.g. `443`). Encryption is automatic — no key to share.
+- **Kharej (exit):** role=kharej, mode=reverse, `peer=<iran-ip>`, same tunnel
+  port `1234`. No listen port on this side.
 
 The panel writes `/etc/emergency-tunnel/<name>.toml` and starts
 `emergency-tunnel@<name>.service`.
 
+> **Both ends must use the same tunnel port.** Encryption keys are negotiated
+> automatically per connection (ephemeral X25519) — there is no pre-shared key.
+> Because that means no peer authentication, **restrict the tunnel port to the
+> peer's IP** in your firewall (see Security model).
+
 ### Manual / systemd
 
 ```bash
-et-core genpsk                                   # secure pre-shared key
 et-core validate --config /etc/emergency-tunnel/iran1234.toml
 systemctl {start,stop,restart,status} emergency-tunnel@iran1234
 journalctl -u emergency-tunnel@iran1234 -f       # or /var/log/emergency-tunnel/iran1234.log
@@ -149,9 +155,14 @@ curl -s http://127.0.0.1:9090/stats              # live counters
 
 - **Confidentiality/integrity:** every byte is AEAD-sealed (ChaCha20-Poly1305 or
   AES-256-GCM) in ≤16 KiB frames with per-direction keys and monotonic nonces.
-- **Authentication:** HMAC-SHA256 challenge–response derived from the PSK; the
-  server issues a fresh random nonce per connection, so recorded transcripts
-  can't be replayed. Session keys are HKDF-derived from both nonces.
+- **Key exchange:** ephemeral **X25519** per connection — session keys are
+  HKDF-derived from the ECDH shared secret. No pre-shared key to manage or leak,
+  and every connection gets fresh keys (**forward secrecy**).
+- **Authentication (important):** the ephemeral exchange is **unauthenticated** —
+  it protects against passive eavesdropping/DPI (the primary censorship threat)
+  but not an active man-in-the-middle. **Mitigation:** restrict the tunnel port
+  to the peer's IP with a firewall, e.g.
+  `ufw allow from <PEER_IP> to any port 1234 proto tcp` (and deny it otherwise).
 - **Abuse resistance:** bounded concurrent handshakes (flood shedding), handshake
   timeouts, per-user assignment timeout, capped PROXY header size.
 - **File/permission hygiene:** configs `0600`, dirs `0750`, hardened unit

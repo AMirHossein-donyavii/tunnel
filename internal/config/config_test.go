@@ -2,7 +2,6 @@ package config
 
 import "testing"
 
-const testPSK = "VOyBVKjPzJcKPEeTBvHiAIFWSm7iIBCfvYxqTbCRL+8="
 
 func baseL3() Config {
 	c := Defaults()
@@ -11,7 +10,6 @@ func baseL3() Config {
 	c.Engine = EngineL3
 	c.Peer = "1.2.3.4"
 	c.TunIP = "10.20.0.2/24"
-	c.PSK = testPSK
 	return c
 }
 
@@ -53,8 +51,7 @@ func TestValidateMuxEngine(t *testing.T) {
 	c.Role = RoleIran
 	c.Mode = ModeReverse
 	c.Engine = EngineMux
-	c.PSK = testPSK
-	c.ListenPort = 443
+	c.TunnelPort = 443
 	c.Forwards = []string{"8443", "2052-2058"}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("valid mux config rejected: %v", err)
@@ -67,8 +64,7 @@ func TestValidateRejectsHealthPortCollision(t *testing.T) {
 	c.Role = RoleKharej
 	c.Engine = EngineMux
 	c.Peer = "1.2.3.4"
-	c.PSK = testPSK
-	c.ListenPort = 1234
+	c.TunnelPort = 1234
 	c.HealthPort = 1234 // same as tunnel port -> must be rejected
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error when health_port == listen_port")
@@ -80,10 +76,10 @@ func TestDefaultsAreSane(t *testing.T) {
 	if d.Engine != EngineMux {
 		t.Errorf("default engine should be mux (TCP Reverse), got %q", d.Engine)
 	}
-	if d.ListenPort != 1234 {
-		t.Errorf("default tunnel port should be 1234, got %d", d.ListenPort)
+	if d.TunnelPort != 1234 {
+		t.Errorf("default tunnel port should be 1234, got %d", d.TunnelPort)
 	}
-	if d.HealthPort == d.ListenPort {
+	if d.HealthPort == d.TunnelPort {
 		t.Errorf("default health port %d collides with tunnel port", d.HealthPort)
 	}
 	if d.TunIface != "emergency-tun" {
@@ -107,8 +103,7 @@ func TestValidateL4ForwardCollision(t *testing.T) {
 	c.Name = "t"
 	c.Role = RoleIran
 	c.Mode = ModeReverse // Iran is the listener, binds listen_port
-	c.PSK = testPSK
-	c.ListenPort = 443
+	c.TunnelPort = 443
 	c.Forwards = []string{"443"} // collides with the tunnel port
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected forward/listen_port collision error")

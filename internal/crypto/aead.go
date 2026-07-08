@@ -1,6 +1,6 @@
-// Package crypto provides the authenticated, encrypted framing used on every
-// Emergency Tunnel link, plus a mutual-authentication handshake derived from
-// the pre-shared key.
+// Package crypto provides the encrypted AEAD framing used on every Emergency
+// Tunnel link, plus an ephemeral X25519 key-exchange handshake (no pre-shared
+// key) that derives the per-direction session keys.
 package crypto
 
 import (

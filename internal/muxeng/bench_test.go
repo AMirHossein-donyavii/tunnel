@@ -1,7 +1,6 @@
 package muxeng
 
 import (
-	"bytes"
 	"io"
 	"net"
 	"sync"
@@ -32,7 +31,6 @@ func pipeWithDelay(d time.Duration) (net.Conn, net.Conn) {
 	return delayConn{c1, d}, delayConn{c2, d}
 }
 
-var benchPSK = bytes.Repeat([]byte{0x7}, 32)
 
 // --- mux: new connection = one stream on an existing session -----------------
 
@@ -80,19 +78,18 @@ func benchHandshakeSetup(b *testing.B, rtt time.Duration) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		c1, c2 := pipeWithDelay(rtt / 2)
-		now := time.Now().Unix()
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sc, err := crypto.ServerHandshake(c2, "chacha20-poly1305", benchPSK, now)
+			sc, err := crypto.ServerHandshake(c2, "chacha20-poly1305")
 			if err != nil {
 				return
 			}
 			io.CopyN(sc, sc, 64) // echo one request
 			sc.Close()
 		}()
-		cc, err := crypto.ClientHandshake(c1, "chacha20-poly1305", benchPSK, now)
+		cc, err := crypto.ClientHandshake(c1, "chacha20-poly1305")
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -10,138 +9,112 @@ import (
 	"net"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
 
-// Wire handshake (all sizes in bytes):
+// Handshake (ephemeral X25519 — no pre-shared key):
 //
-//   client -> server:  magic(4) ver(1) ts(8) clientNonce(32)
-//   server -> client:  serverNonce(32) serverTag(32)
-//   client -> server:  clientTag(32)
+//	client -> server:  magic(4) ver(1) clientPub(32)
+//	server -> client:  serverPub(32)
 //
-// serverTag = HMAC-SHA256(psk, "ET-SERVER" | clientNonce | serverNonce)
-// clientTag = HMAC-SHA256(psk, "ET-CLIENT" | clientNonce | serverNonce)
+// Both sides compute shared = X25519(ownPriv, peerPub) and derive per-direction
+// AEAD keys via HKDF(shared, salt = clientPub|serverPub). Keys are fresh per
+// connection (forward secrecy) and nothing needs to be pre-shared.
 //
-// Replay resistance: the server issues a fresh random serverNonce every
-// connection, and clientTag is bound to it, so a recorded client transcript is
-// useless against a new connection. The timestamp bounds accepted skew and lets
-// the server cheaply drop stale probes before doing HMAC work.
+// Security note: this provides confidentiality but NOT peer authentication — any
+// party that can reach the tunnel port can complete the exchange. Restrict the
+// tunnel port to the peer's IP with a firewall (see docs). This matches the
+// project's primary threat model (defeat passive DPI / censorship).
 const (
-	magic       = 0x45540201 // "ET" + version 2.1
-	protoVer    = 1
-	nonceLen    = 32
-	tagLen      = 32
+	magic       = 0x45540202 // "ET" protocol v2.2 (ephemeral ECDH)
+	protoVer    = 2
+	pubLen      = 32
 	handshakeTO = 10 * time.Second
-	maxSkew     = 5 * time.Minute
 )
 
 var (
-	labelServer  = []byte("ET-SERVER")
-	labelClient  = []byte("ET-CLIENT")
-	labelC2SKey  = []byte("emergency-tunnel c2s key")
-	labelS2CKey  = []byte("emergency-tunnel s2c key")
-	errBadMagic  = fmt.Errorf("handshake: bad magic (not an emergency-tunnel peer)")
-	errBadAuth   = fmt.Errorf("handshake: authentication failed (psk mismatch)")
-	errStaleTime = fmt.Errorf("handshake: timestamp outside accepted window")
+	labelC2SKey = []byte("emergency-tunnel c2s key")
+	labelS2CKey = []byte("emergency-tunnel s2c key")
+	errBadMagic = fmt.Errorf("handshake: not an emergency-tunnel peer (bad magic/version)")
+	errECDH     = fmt.Errorf("handshake: invalid key share")
 )
 
-func tag(psk, label, cn, sn []byte) []byte {
-	m := hmac.New(sha256.New, psk)
-	m.Write(label)
-	m.Write(cn)
-	m.Write(sn)
-	return m.Sum(nil)
-}
-
-func deriveKey(psk, cn, sn, label []byte) []byte {
-	salt := make([]byte, 0, len(cn)+len(sn))
-	salt = append(salt, cn...)
-	salt = append(salt, sn...)
-	r := hkdf.New(sha256.New, psk, salt, label)
+func deriveKey(shared, cpub, spub, label []byte) []byte {
+	salt := make([]byte, 0, len(cpub)+len(spub))
+	salt = append(salt, cpub...)
+	salt = append(salt, spub...)
+	r := hkdf.New(sha256.New, shared, salt, label)
 	key := make([]byte, 32)
 	_, _ = io.ReadFull(r, key)
 	return key
 }
 
-// ClientHandshake authenticates to the peer and returns an encrypted SecureConn.
-// nowUnix is injected for testability; callers pass time.Now().Unix().
-func ClientHandshake(conn net.Conn, cipherName string, psk []byte, nowUnix int64) (*SecureConn, error) {
+// ClientHandshake performs the ephemeral X25519 exchange (dialing side) and
+// returns an encrypted SecureConn.
+func ClientHandshake(conn net.Conn, cipherName string) (*SecureConn, error) {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTO))
 	defer conn.SetDeadline(time.Time{})
 
-	cn := make([]byte, nonceLen)
-	if _, err := rand.Read(cn); err != nil {
+	var cpriv [32]byte
+	if _, err := rand.Read(cpriv[:]); err != nil {
 		return nil, err
 	}
-	hdr := make([]byte, 4+1+8+nonceLen)
-	binary.BigEndian.PutUint32(hdr[0:], magic)
-	hdr[4] = protoVer
-	binary.BigEndian.PutUint64(hdr[5:], uint64(nowUnix))
-	copy(hdr[13:], cn)
-	if _, err := conn.Write(hdr); err != nil {
+	cpub, err := curve25519.X25519(cpriv[:], curve25519.Basepoint)
+	if err != nil {
 		return nil, err
 	}
-
-	resp := make([]byte, nonceLen+tagLen)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, fmt.Errorf("handshake: reading server response: %w", err)
-	}
-	sn := resp[:nonceLen]
-	gotTag := resp[nonceLen:]
-	if !hmac.Equal(gotTag, tag(psk, labelServer, cn, sn)) {
-		return nil, errBadAuth
-	}
-	if _, err := conn.Write(tag(psk, labelClient, cn, sn)); err != nil {
+	hello := make([]byte, 4+1+pubLen)
+	binary.BigEndian.PutUint32(hello, magic)
+	hello[4] = protoVer
+	copy(hello[5:], cpub)
+	if _, err := conn.Write(hello); err != nil {
 		return nil, err
 	}
 
-	c2s := deriveKey(psk, cn, sn, labelC2SKey)
-	s2c := deriveKey(psk, cn, sn, labelS2CKey)
-	return wrap(conn, cipherName, c2s, s2c) // client sends c2s, receives s2c
+	spub := make([]byte, pubLen)
+	if _, err := io.ReadFull(conn, spub); err != nil {
+		return nil, fmt.Errorf("handshake: reading server key: %w", err)
+	}
+	shared, err := curve25519.X25519(cpriv[:], spub)
+	if err != nil {
+		return nil, errECDH
+	}
+	c2s := deriveKey(shared, cpub, spub, labelC2SKey)
+	s2c := deriveKey(shared, cpub, spub, labelS2CKey)
+	return wrap(conn, cipherName, c2s, s2c) // client: send c2s, receive s2c
 }
 
-// ServerHandshake validates an incoming peer and returns an encrypted SecureConn.
-func ServerHandshake(conn net.Conn, cipherName string, psk []byte, nowUnix int64) (*SecureConn, error) {
+// ServerHandshake is the accepting side of the ephemeral X25519 exchange.
+func ServerHandshake(conn net.Conn, cipherName string) (*SecureConn, error) {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTO))
 	defer conn.SetDeadline(time.Time{})
 
-	hdr := make([]byte, 4+1+8+nonceLen)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
+	hello := make([]byte, 4+1+pubLen)
+	if _, err := io.ReadFull(conn, hello); err != nil {
 		return nil, fmt.Errorf("handshake: reading client hello: %w", err)
 	}
-	if binary.BigEndian.Uint32(hdr[0:]) != magic {
+	if binary.BigEndian.Uint32(hello) != magic || hello[4] != protoVer {
 		return nil, errBadMagic
 	}
-	ts := int64(binary.BigEndian.Uint64(hdr[5:]))
-	skew := nowUnix - ts
-	if skew < 0 {
-		skew = -skew
-	}
-	if skew > int64(maxSkew/time.Second) {
-		return nil, errStaleTime
-	}
-	cn := hdr[13:]
+	cpub := hello[5 : 5+pubLen]
 
-	sn := make([]byte, nonceLen)
-	if _, err := rand.Read(sn); err != nil {
+	var spriv [32]byte
+	if _, err := rand.Read(spriv[:]); err != nil {
 		return nil, err
 	}
-	resp := make([]byte, nonceLen+tagLen)
-	copy(resp[:nonceLen], sn)
-	copy(resp[nonceLen:], tag(psk, labelServer, cn, sn))
-	if _, err := conn.Write(resp); err != nil {
+	spub, err := curve25519.X25519(spriv[:], curve25519.Basepoint)
+	if err != nil {
 		return nil, err
 	}
-
-	gotTag := make([]byte, tagLen)
-	if _, err := io.ReadFull(conn, gotTag); err != nil {
-		return nil, fmt.Errorf("handshake: reading client tag: %w", err)
+	if _, err := conn.Write(spub); err != nil {
+		return nil, err
 	}
-	if !hmac.Equal(gotTag, tag(psk, labelClient, cn, sn)) {
-		return nil, errBadAuth
+	shared, err := curve25519.X25519(spriv[:], cpub)
+	if err != nil {
+		return nil, errECDH
 	}
-
-	c2s := deriveKey(psk, cn, sn, labelC2SKey)
-	s2c := deriveKey(psk, cn, sn, labelS2CKey)
-	return wrap(conn, cipherName, s2c, c2s) // server sends s2c, receives c2s
+	c2s := deriveKey(shared, cpub, spub, labelC2SKey)
+	s2c := deriveKey(shared, cpub, spub, labelS2CKey)
+	return wrap(conn, cipherName, s2c, c2s) // server: send s2c, receive c2s
 }

@@ -6,7 +6,7 @@
 # forward specific TCP ports.
 #
 # This is the IRAN (server) side of a reverse tunnel. The Kharej side uses
-# role="kharej", peer="<iran-ip>", tun_ip="10.10.10.2/24", and the SAME psk.
+# role="kharej", peer="<iran-ip>", tun_ip="10.10.10.2/24", (encryption is automatic — no shared key).
 
 name = "iran-l3"
 role = "iran"              # iran = server (listens); kharej = client (dials)
@@ -16,15 +16,14 @@ mode = "reverse"           # reverse = Kharej dials Iran (recommended)
 
 # peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
 
-listen_port = 1234         # TUNNEL port: server <-> server link
+tunnel_port = 1234         # TUNNEL port: server <-> server link
 tun_ip = "10.10.10.1/24"    # this host's tunnel address (Kharej: 10.10.10.2/24)
 tun_iface = "emergency-tun"
 mtu = 1380
 
 pool = 8                   # links == TUN queues; keep ≈ CPU cores on small VPS
 workers = 0                # 0 = auto (cgroup-aware)
-cipher = "chacha20-poly1305"
-psk = "REPLACE_WITH_GENERATED_KEY"   # et-core genpsk — identical on both sides
+cipher = "chacha20-poly1305"   # AEAD; keys auto-negotiated (ephemeral X25519, no PSK)
 
 health_port = 9090
 profile = "fast"           # fast | balance | resource (tunes buffers + GC + batching)

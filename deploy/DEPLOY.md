@@ -110,12 +110,12 @@ systemd, and launches the panel. Pin a version with `| bash -s -- --version 1.2.
 Either path runs the **same** installer. After it finishes, the user runs `et`
 and, in the panel:
 1. **Create tunnel** → choose engine (**mux** recommended), role (**iran**/**kharej**),
-   direction, ports, and generate/paste the shared **PSK** (same on both servers).
+   direction, ports, (encryption is automatic — no shared key).
 2. The panel writes `/etc/emergency-tunnel/<name>.toml` and starts
    `emergency-tunnel@<name>.service`.
 
 So the full end-user flow is exactly: **run the one-liner → run `et` → create the
-tunnel on each of their two servers with the same PSK.**
+tunnel on each of their two servers (same tunnel port; no shared key).**
 
 ---
 

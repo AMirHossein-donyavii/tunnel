@@ -7,8 +7,6 @@
 package config
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,14 +40,13 @@ type Config struct {
 	Transport  string `toml:"transport"`
 	Mode       string `toml:"mode"`
 	Peer       string `toml:"peer"`        // remote host the dialer connects to
-	ListenPort int    `toml:"listen_port"` // tunnel link port
+	TunnelPort int    `toml:"tunnel_port"` // server<->server link port (same on both sides)
 	TunIP      string `toml:"tun_ip"`      // L3 transports only
 	TunIface   string `toml:"tun_iface"`
 	MTU        int    `toml:"mtu"`
 	Workers    int    `toml:"workers"` // 0 = auto
 	Pool       int    `toml:"pool"`
 	Cipher     string `toml:"cipher"`
-	PSK        string `toml:"psk"`
 	HealthPort int    `toml:"health_port"`
 	Profile    string `toml:"profile"`
 	LogLevel   string `toml:"log_level"`
@@ -84,7 +81,7 @@ func Defaults() Config {
 	return Config{
 		Transport:     "tcp",
 		Mode:          ModeReverse,
-		ListenPort:    1234, // tunnel port: server<->server control/data link
+		TunnelPort:    1234, // server<->server link (same on both sides)
 		TunIface:      "emergency-tun",
 		MTU:           1380,
 		Workers:       0,
@@ -109,27 +106,6 @@ const (
 	EngineMux = "mux" // TCP port-forwarder, multiplexed streams over few links
 )
 
-// GeneratePSK returns a fresh 32-byte pre-shared key, base64 encoded.
-func GeneratePSK() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b), nil
-}
-
-// KeyBytes decodes the PSK into raw key material.
-func (c *Config) KeyBytes() ([]byte, error) {
-	k, err := base64.StdEncoding.DecodeString(strings.TrimSpace(c.PSK))
-	if err != nil {
-		return nil, fmt.Errorf("psk is not valid base64: %w", err)
-	}
-	if len(k) < 16 {
-		return nil, fmt.Errorf("psk too short (%d bytes, need >=16)", len(k))
-	}
-	return k, nil
-}
-
 // Validate checks the config for internal consistency and returns a helpful
 // error describing the first problem found.
 func (c *Config) Validate() error {
@@ -142,8 +118,8 @@ func (c *Config) Validate() error {
 	if c.Mode != ModeReverse && c.Mode != ModeDirect {
 		return fmt.Errorf("mode must be %q or %q, got %q", ModeReverse, ModeDirect, c.Mode)
 	}
-	if c.ListenPort < 1 || c.ListenPort > 65535 {
-		return fmt.Errorf("listen_port out of range: %d", c.ListenPort)
+	if c.TunnelPort < 1 || c.TunnelPort > 65535 {
+		return fmt.Errorf("tunnel_port out of range: %d", c.TunnelPort)
 	}
 	if c.Pool < 1 || c.Pool > 1024 {
 		return fmt.Errorf("pool out of range (1..1024): %d", c.Pool)
@@ -156,11 +132,8 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("cipher must be chacha20-poly1305 or aes-256-gcm, got %q", c.Cipher)
 	}
-	if _, err := c.KeyBytes(); err != nil {
-		return err
-	}
-	if c.HealthPort != 0 && c.HealthPort == c.ListenPort {
-		return fmt.Errorf("health_port (%d) must differ from the tunnel listen_port", c.HealthPort)
+	if c.HealthPort != 0 && c.HealthPort == c.TunnelPort {
+		return fmt.Errorf("health_port (%d) must differ from the tunnel_port", c.HealthPort)
 	}
 	if c.Engine != EngineL3 && c.Engine != EngineL4 && c.Engine != EngineMux {
 		return fmt.Errorf("engine must be %q, %q or %q, got %q", EngineL4, EngineMux, EngineL3, c.Engine)
@@ -190,7 +163,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one forward is required on the iran (entry) side")
 	}
 	// When this host also binds the tunnel link (i.e. it is the listener), a
-	// forwarded port must not collide with the tunnel's listen_port.
+	// forwarded (listen/VPN) port must not collide with the tunnel_port.
 	entryBindsLink := c.Role == RoleIran && !c.dialerSide()
 	for _, spec := range c.Forwards {
 		f, err := ParseForward(spec, c.ProxyProtocol)
@@ -199,8 +172,8 @@ func (c *Config) Validate() error {
 		}
 		if entryBindsLink {
 			for p := f.ListenStart; p <= f.ListenEnd; p++ {
-				if p == c.ListenPort {
-					return fmt.Errorf("forward %q collides with listen_port %d (in reverse mode Iran binds both; use a different port)", spec, c.ListenPort)
+				if p == c.TunnelPort {
+					return fmt.Errorf("listen port %q collides with tunnel_port %d — use a different VPN/listen port", spec, c.TunnelPort)
 				}
 			}
 		}

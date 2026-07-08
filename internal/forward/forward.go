@@ -62,17 +62,15 @@ type assignment struct {
 type Engine struct {
 	cfg      *config.Config
 	log      *logx.Logger
-	psk      []byte
 	cipher   string
 	dialer   transport.Dialer
 	listener transport.Listener
 	isDialer bool
 	isEntry  bool
 
-	routes map[int]target        // listen port -> target (entry side)
-	assign chan *assignment      // entry: user conns waiting for a worker
-	hsSem  chan struct{}         // inbound handshake concurrency limit
-	nowSec func() int64
+	routes map[int]target   // listen port -> target (entry side)
+	assign chan *assignment // entry: user conns waiting for a worker
+	hsSem  chan struct{}    // inbound handshake concurrency limit
 
 	stats struct {
 		activeConns int64
@@ -89,21 +87,15 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := cfg.KeyBytes()
-	if err != nil {
-		return nil, err
-	}
 	e := &Engine{
 		cfg:      cfg,
 		log:      log,
-		psk:      key,
 		cipher:   cfg.Cipher,
 		isDialer: cfg.IsDialer(),
 		isEntry:  cfg.IsEntry(),
 		routes:   map[int]target{},
 		assign:   make(chan *assignment),
 		hsSem:    make(chan struct{}, handshakeSlot),
-		nowSec:   func() int64 { return time.Now().Unix() },
 	}
 	if e.isEntry {
 		for _, spec := range cfg.Forwards {
@@ -185,7 +177,7 @@ func (e *Engine) dialLoop(ctx context.Context) {
 			}
 			continue
 		}
-		link, err := crypto.ClientHandshake(raw, e.cipher, e.psk, e.nowSec())
+		link, err := crypto.ClientHandshake(raw, e.cipher)
 		if err != nil {
 			_ = raw.Close()
 			e.linkErr("client handshake: %v", err)
@@ -223,7 +215,7 @@ func (e *Engine) acceptLoop(ctx context.Context) {
 		}
 		go func() {
 			defer func() { <-e.hsSem }()
-			link, err := crypto.ServerHandshake(raw, e.cipher, e.psk, e.nowSec())
+			link, err := crypto.ServerHandshake(raw, e.cipher)
 			if err != nil {
 				_ = raw.Close()
 				e.linkErr("server handshake from %s: %v", raw.RemoteAddr(), err)

@@ -26,12 +26,12 @@ func (Transport) Summary() string {
 }
 
 func (Transport) NewDialer(cfg *config.Config, log *logx.Logger) (transport.Dialer, error) {
-	addr := net.JoinHostPort(cfg.Peer, fmt.Sprintf("%d", cfg.ListenPort))
+	addr := net.JoinHostPort(cfg.Peer, fmt.Sprintf("%d", cfg.TunnelPort))
 	return &dialer{addr: addr, log: log}, nil
 }
 
 func (Transport) NewListener(cfg *config.Config, log *logx.Logger) (transport.Listener, error) {
-	addr := fmt.Sprintf(":%d", cfg.ListenPort)
+	addr := fmt.Sprintf(":%d", cfg.TunnelPort)
 	lc := net.ListenConfig{KeepAlive: 30 * time.Second}
 	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {

@@ -6,7 +6,6 @@
 //
 //	et-core run --config /etc/emergency-tunnel/<name>.toml
 //	et-core version
-//	et-core genpsk
 //	et-core sysinfo
 //	et-core transports
 //	et-core validate --config <file>
@@ -38,10 +37,6 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("Core Version    : v%s\n", core.CoreVersion)
-	case "genpsk":
-		psk, err := config.GeneratePSK()
-		check(err)
-		fmt.Println(psk)
 	case "sysinfo":
 		cmdSysinfo()
 	case "transports":
@@ -113,15 +108,7 @@ Usage:
   et-core run --config <file>    run a tunnel (used by systemd)
   et-core validate --config <f>  validate a config file
   et-core version                print core version
-  et-core genpsk                 generate a secure pre-shared key
   et-core sysinfo                print CPU/memory limits as JSON
   et-core transports             list available transports
 `, core.CoreVersion)
-}
-
-func check(err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
 }

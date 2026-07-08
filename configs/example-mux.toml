@@ -6,7 +6,7 @@
 # the forwarding engines and scales to thousands of concurrent connections.
 #
 # This is the IRAN (entry) side of a reverse tunnel. The Kharej side uses
-# role="kharej", peer="<iran-ip>", the SAME psk, and the same engine/forwards.
+# role="kharej", peer="<iran-ip>", no shared key needed, and the same engine/forwards.
 
 name = "iran-mux"
 role = "iran"              # iran = entry (users connect here); kharej = exit
@@ -16,13 +16,12 @@ mode = "reverse"           # reverse = Kharej dials Iran (recommended)
 
 # peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
 
-listen_port = 1234         # TUNNEL port: server <-> server link (open this in firewall)
+tunnel_port = 1234         # TUNNEL port: server <-> server link (open this in firewall)
 mtu = 1380
 pool = 4                   # number of MUX SESSIONS (links). With mux, keep this
                            # small — 2-4 is plenty; each carries many streams.
 workers = 0                # 0 = auto (cgroup-aware)
-cipher = "chacha20-poly1305"
-psk = "REPLACE_WITH_GENERATED_KEY"   # et-core genpsk — identical on both sides
+cipher = "chacha20-poly1305"   # AEAD; keys auto-negotiated (ephemeral X25519, no PSK)
 
 health_port = 9090
 profile = "fast"           # fast | balance | resource (tunes buffers + TCP opts)

@@ -41,7 +41,6 @@ type target struct {
 type Engine struct {
 	cfg      *config.Config
 	log      *logx.Logger
-	psk      []byte
 	cipher   string
 	isDialer bool
 	isEntry  bool
@@ -69,14 +68,9 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := cfg.KeyBytes()
-	if err != nil {
-		return nil, err
-	}
 	e := &Engine{
 		cfg:      cfg,
 		log:      log,
-		psk:      key,
 		cipher:   cfg.Cipher,
 		isDialer: cfg.IsDialer(),
 		isEntry:  cfg.IsEntry(),
@@ -161,7 +155,7 @@ func (e *Engine) dialSession(ctx context.Context) {
 			continue
 		}
 		nettune.Apply(raw, e.tune)
-		link, err := crypto.ClientHandshake(raw, e.cipher, e.psk, time.Now().Unix())
+		link, err := crypto.ClientHandshake(raw, e.cipher)
 		if err != nil {
 			_ = raw.Close()
 			e.sessionErr("handshake: %v", err)
@@ -188,7 +182,7 @@ func (e *Engine) acceptSessions(ctx context.Context) {
 		}
 		nettune.Apply(raw, e.tune)
 		go func() {
-			link, err := crypto.ServerHandshake(raw, e.cipher, e.psk, time.Now().Unix())
+			link, err := crypto.ServerHandshake(raw, e.cipher)
 			if err != nil {
 				_ = raw.Close()
 				e.sessionErr("handshake from %s: %v", raw.RemoteAddr(), err)
