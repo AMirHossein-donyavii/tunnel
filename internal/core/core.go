@@ -17,6 +17,7 @@ import (
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/forward"
+	"github.com/emergency-tunnel/et/internal/l3"
 	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
 )
@@ -24,7 +25,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.0.0"
+var CoreVersion = "1.1.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -49,7 +50,14 @@ func Run(path string) error {
 	log.Info("resources: workers=%d gomaxprocs=%d effective_cpus=%d profile=%s",
 		workers, runtime.GOMAXPROCS(0), sysinfo.EffectiveCPUs(), cfg.Profile)
 
-	eng, err := forward.New(cfg, log)
+	// Select the data plane. L3 is the TUN tunnel; L4 is the port-forwarder.
+	var eng engine
+	switch cfg.Engine {
+	case config.EngineL3:
+		eng, err = l3.New(cfg, log)
+	default:
+		eng, err = forward.New(cfg, log)
+	}
 	if err != nil {
 		return err
 	}
@@ -64,6 +72,12 @@ func Run(path string) error {
 	err = eng.Run(ctx)
 	log.Info("tunnel %q stopped", cfg.Name)
 	return err
+}
+
+// engine is the common interface implemented by both the l3 and l4 engines.
+type engine interface {
+	Run(context.Context) error
+	Snapshot() any
 }
 
 // newLogger returns a logger writing to both the per-tunnel rotating file and
@@ -109,7 +123,7 @@ func tuneGC(profile string) {
 }
 
 // serveHealth exposes a localhost-only health/stats endpoint.
-func serveHealth(ctx context.Context, cfg *config.Config, eng *forward.Engine, log *logx.Logger) {
+func serveHealth(ctx context.Context, cfg *config.Config, eng engine, log *logx.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -122,6 +136,7 @@ func serveHealth(ctx context.Context, cfg *config.Config, eng *forward.Engine, l
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"name":      cfg.Name,
 			"role":      cfg.Role,
+			"engine":    cfg.Engine,
 			"transport": cfg.Transport,
 			"stats":     s,
 		})

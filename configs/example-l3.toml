@@ -1,0 +1,45 @@
+# Emergency Tunnel — example L3 (TUN) configuration
+#
+# The L3 engine is a full IP tunnel (like a lightweight WireGuard): it creates a
+# TUN interface and carries raw IP packets over N encrypted, multi-queue links.
+# Use it when you want to route arbitrary traffic between the two hosts, not just
+# forward specific TCP ports.
+#
+# This is the IRAN (server) side of a reverse tunnel. The Kharej side uses
+# role="kharej", peer="<iran-ip>", tun_ip="10.20.0.2/24", and the SAME psk.
+
+name = "iran-l3"
+role = "iran"              # iran = server (listens); kharej = client (dials)
+engine = "l3"              # <-- selects the TUN tunnel engine
+transport = "tcp"          # carrier for the encrypted links
+mode = "reverse"           # reverse = Kharej dials Iran (recommended)
+
+# peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
+
+listen_port = 443          # tunnel link port
+tun_ip = "10.20.0.1/24"    # this host's tunnel address (Kharej: 10.20.0.2/24)
+tun_iface = "pengutun"
+mtu = 1380
+
+pool = 8                   # links == TUN queues; keep ≈ CPU cores on small VPS
+workers = 0                # 0 = auto (cgroup-aware)
+cipher = "chacha20-poly1305"
+psk = "REPLACE_WITH_GENERATED_KEY"   # et-core genpsk — identical on both sides
+
+health_port = 1234
+profile = "fast"           # fast | balance | resource (tunes buffers + GC + batching)
+log_level = "info"
+
+# Liveness: send a heartbeat every interval; cycle a link if silent past timeout.
+heartbeat_interval = 10
+heartbeat_timeout = 25
+
+# Optional tuning overrides (0 = auto from profile):
+# batch_size = 32          # packets coalesced per write
+# channel_size = 512       # per-queue buffer depth
+# so_sndbuf = 4194304      # socket send buffer (bytes)
+# so_rcvbuf = 4194304      # socket recv buffer (bytes)
+
+# After the tunnel is up, route traffic through it as needed, e.g. on Iran:
+#   ip route add <target> via 10.20.0.2
+# or run your services bound to the 10.20.0.0/24 tunnel network.

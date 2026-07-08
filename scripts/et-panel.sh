@@ -125,6 +125,12 @@ create_tunnel() {
         echo -e "  ${C_R}A tunnel named '$name' already exists.${C_RESET}"; pause; return
     fi
 
+    echo; echo -e "  Engine (data plane):"
+    echo -e "    ${C_G}1)${C_RESET} l4 — TCP port-forwarder (forward specific ports; default)"
+    echo -e "    ${C_G}2)${C_RESET} l3 — TUN IP tunnel (route all traffic; multi-queue, batched)"
+    local esel; esel="$(ask "Select" "1")"
+    local engine; [ "$esel" = "2" ] && engine="l3" || engine="l4"
+
     # Dialer side needs the peer address.
     local is_dialer="no" peer=""
     { [ "$mode" = "reverse" ] && [ "$role" = "kharej" ]; } && is_dialer="yes"
@@ -162,18 +168,20 @@ create_tunnel() {
     fi
     [ -z "$psk" ] && { echo -e "  ${C_R}PSK required.${C_RESET}"; pause; return; }
 
-    # Forwards (entry / Iran side only).
+    # Forwards apply to the L4 entry (Iran) side only. L3 routes all IP traffic.
     local forwards_toml="[]" proxy="false"
-    if [ "$role" = "iran" ]; then
+    if [ "$engine" = "l4" ] && [ "$role" = "iran" ]; then
         echo; echo -e "  Port forwarding (comma-separated). Examples:"
         echo -e "    ${C_C}2096${C_RESET}  ${C_C}2096,2097${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
         echo -e "  ${C_Y}Note:${C_RESET} in reverse mode Iran binds the tunnel on port ${listen_port}; forwards must differ."
         local flist; flist="$(ask "Forwards" "8443")"
         forwards_toml="$(csv_to_toml_array "$flist")"
         yesno "Enable PROXY protocol v2 by default?" "n" && proxy="true"
+    elif [ "$engine" = "l3" ]; then
+        echo -e "  ${C_C}L3 engine: all IP traffic to ${tun_ip%/*} peer is tunnelled (no port list).${C_RESET}"
     fi
 
-    write_config "$name" "$role" "$transport" "$mode" "$peer" "$listen_port" \
+    write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$listen_port" \
         "$tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" "$psk" \
         "$health" "$profile" "$proxy" "$forwards_toml"
 
@@ -204,15 +212,16 @@ csv_to_toml_array() { # "a,b,c" -> ["a", "b", "c"]
 }
 
 write_config() {
-    local name="$1" role="$2" transport="$3" mode="$4" peer="$5" listen="$6" \
-          tun_ip="$7" iface="$8" mtu="$9" workers="${10}" pool="${11}" cipher="${12}" \
-          psk="${13}" health="${14}" profile="${15}" proxy="${16}" forwards="${17}"
+    local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" listen="$7" \
+          tun_ip="$8" iface="$9" mtu="${10}" workers="${11}" pool="${12}" cipher="${13}" \
+          psk="${14}" health="${15}" profile="${16}" proxy="${17}" forwards="${18}"
     install -d -m 0750 "$CONF_DIR"
     umask 077
     {
         echo "# Emergency Tunnel configuration"
         echo "name = \"$name\""
         echo "role = \"$role\""
+        echo "engine = \"$engine\""
         echo "transport = \"$transport\""
         echo "mode = \"$mode\""
         [ -n "$peer" ] && echo "peer = \"$peer\""
@@ -227,8 +236,13 @@ write_config() {
         echo "health_port = $health"
         echo "profile = \"$profile\""
         echo "log_level = \"info\""
-        echo "proxy_protocol = $proxy"
-        echo "forwards = $forwards"
+        if [ "$engine" = "l3" ]; then
+            echo "heartbeat_interval = 10"
+            echo "heartbeat_timeout = 25"
+        else
+            echo "proxy_protocol = $proxy"
+            echo "forwards = $forwards"
+        fi
     } > "${CONF_DIR}/${name}.toml"
     chmod 0600 "${CONF_DIR}/${name}.toml"
 }

@@ -56,6 +56,20 @@ func assign(c *Config, key, val string) error {
 		c.Profile = unquote(val)
 	case "log_level":
 		c.LogLevel = unquote(val)
+	case "engine":
+		c.Engine = unquote(val)
+	case "heartbeat_interval":
+		return intField(val, &c.HeartbeatInterval)
+	case "heartbeat_timeout":
+		return intField(val, &c.HeartbeatTimeout)
+	case "batch_size":
+		return intField(val, &c.BatchSize)
+	case "channel_size":
+		return intField(val, &c.ChannelSize)
+	case "so_sndbuf":
+		return intField(val, &c.SoSndbuf)
+	case "so_rcvbuf":
+		return intField(val, &c.SoRcvbuf)
 	case "listen_port":
 		return intField(val, &c.ListenPort)
 	case "mtu":
@@ -178,6 +192,7 @@ func (c *Config) Marshal() string {
 
 	kv("name", c.Name)
 	kv("role", c.Role)
+	kv("engine", c.Engine)
 	kv("transport", c.Transport)
 	kv("mode", c.Mode)
 	if c.Peer != "" {
@@ -197,6 +212,23 @@ func (c *Config) Marshal() string {
 	kv("profile", c.Profile)
 	kv("log_level", c.LogLevel)
 	kb("proxy_protocol", c.ProxyProtocol)
+
+	if c.Engine == EngineL3 {
+		ki("heartbeat_interval", c.HeartbeatInterval)
+		ki("heartbeat_timeout", c.HeartbeatTimeout)
+		if c.BatchSize > 0 {
+			ki("batch_size", c.BatchSize)
+		}
+		if c.ChannelSize > 0 {
+			ki("channel_size", c.ChannelSize)
+		}
+		if c.SoSndbuf > 0 {
+			ki("so_sndbuf", c.SoSndbuf)
+		}
+		if c.SoRcvbuf > 0 {
+			ki("so_rcvbuf", c.SoRcvbuf)
+		}
+	}
 
 	b.WriteString("forwards = [")
 	for i, f := range c.Forwards {

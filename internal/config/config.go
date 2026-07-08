@@ -54,6 +54,20 @@ type Config struct {
 	Profile    string `toml:"profile"`
 	LogLevel   string `toml:"log_level"`
 
+	// Engine selects the data plane:
+	//   "l4" (default) — L4 TCP port-forwarder with a pooled-link model.
+	//   "l3"           — L3 TUN tunnel (raw IP packets, multi-queue, batched,
+	//                    heartbeat-monitored). The pengutunnel-style core.
+	Engine string `toml:"engine"`
+
+	// L3 / tuning knobs (ignored by the l4 engine).
+	HeartbeatInterval int `toml:"heartbeat_interval"` // seconds; 0 = default
+	HeartbeatTimeout  int `toml:"heartbeat_timeout"`  // seconds; 0 = default
+	BatchSize         int `toml:"batch_size"`         // packets per batch; 0 = auto
+	ChannelSize       int `toml:"channel_size"`       // per-queue queue depth; 0 = auto
+	SoSndbuf          int `toml:"so_sndbuf"`          // bytes; 0 = OS default
+	SoRcvbuf          int `toml:"so_rcvbuf"`          // bytes; 0 = OS default
+
 	// ProxyProtocol is the default; individual forwards may override with "@pp".
 	ProxyProtocol bool `toml:"proxy_protocol"`
 
@@ -80,8 +94,18 @@ func Defaults() Config {
 		Profile:       ProfileBalance,
 		LogLevel:      "info",
 		ProxyProtocol: false,
+
+		Engine:            EngineL4,
+		HeartbeatInterval: 10,
+		HeartbeatTimeout:  25,
 	}
 }
+
+// Engine identifiers.
+const (
+	EngineL4 = "l4" // TCP port-forwarder (pooled links)
+	EngineL3 = "l3" // TUN tunnel (raw IP, multi-queue, batched)
+)
 
 // GeneratePSK returns a fresh 32-byte pre-shared key, base64 encoded.
 func GeneratePSK() (string, error) {
@@ -133,10 +157,29 @@ func (c *Config) Validate() error {
 	if _, err := c.KeyBytes(); err != nil {
 		return err
 	}
+	if c.Engine != EngineL3 && c.Engine != EngineL4 {
+		return fmt.Errorf("engine must be %q or %q, got %q", EngineL4, EngineL3, c.Engine)
+	}
 	// The dialer side needs to know where to connect.
 	if c.dialerSide() && strings.TrimSpace(c.Peer) == "" {
 		return fmt.Errorf("peer is required on the dialing side (role=%s mode=%s)", c.Role, c.Mode)
 	}
+
+	// The L3 engine is a TUN tunnel: it needs an interface address, not forwards.
+	if c.Engine == EngineL3 {
+		if strings.TrimSpace(c.TunIP) == "" {
+			return fmt.Errorf("tun_ip is required for the l3 engine (e.g. 10.20.0.1/24)")
+		}
+		if !strings.Contains(c.TunIP, "/") {
+			return fmt.Errorf("tun_ip must include a prefix length (e.g. 10.20.0.1/24)")
+		}
+		if c.HeartbeatTimeout > 0 && c.HeartbeatInterval > 0 && c.HeartbeatTimeout <= c.HeartbeatInterval {
+			return fmt.Errorf("heartbeat_timeout (%d) must be greater than heartbeat_interval (%d)", c.HeartbeatTimeout, c.HeartbeatInterval)
+		}
+		return nil
+	}
+
+	// --- l4 engine: forwarding rules -------------------------------------
 	// Only the entry side (Iran) owns forwards.
 	if c.Role == RoleIran && len(c.Forwards) == 0 {
 		return fmt.Errorf("at least one forward is required on the iran (entry) side")

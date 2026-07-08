@@ -13,13 +13,20 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
 
 ## Highlights
 
+- **Two data-plane engines** (choose per tunnel):
+  - **`l4`** — TCP **port-forwarder**: pooled links, reverse **and** direct
+    modes, AEAD encryption, mutual-auth handshake, PROXY protocol v2. Forward
+    specific ports (single/list/range/mapping). *(default)*
+  - **`l3`** — **TUN IP tunnel** (WireGuard-style): a multi-queue TUN device with
+    **N encrypted links = N queues**, **packet batching**, **heartbeat-based
+    auto-recovery**, and **BBR / socket tuning**. Routes arbitrary IP traffic and
+    scales across cores. *(pengutunnel-inspired)*
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a
   static binary, wires up systemd, and launches the panel.
 - **Interactive panel (`et`)** — banner, live IP/geo/ASN, create wizard, and full
   lifecycle management (create/delete/restart/stop/status/logs/edit/update/info/uninstall).
 - **Pluggable transports** behind one interface:
-  - **`tcp`** — production-ready: pooled links, reverse **and** direct modes,
-    AEAD encryption, mutual-auth handshake, PROXY protocol v2. *(recommended)*
+  - **`tcp`** — production-ready carrier for both engines. *(recommended)*
   - **`dns` / `ssh` / `hysteria` / `ipx`** — registered and selectable, currently
     **experimental placeholders** with documented extension points.
 - **Security** — ChaCha20-Poly1305 / AES-256-GCM, HKDF-derived per-direction keys,
@@ -37,11 +44,14 @@ internal/crypto        AEAD framed conn + mutual-auth handshake (HKDF/HMAC)
 internal/transport     transport interface + registry
         /tcp           production TCP transport (tuned sockets)
         /dns /ssh /hysteria /ipx   experimental extension points
-internal/forward       data path: pool, control frame, entry/exit, PROXY v2, splice
+internal/forward       L4 data path: pool, control frame, entry/exit, PROXY v2, splice
+internal/l3            L3 data path: multi-queue TUN pump, datagram framing, batching, heartbeat
+internal/tun           multi-queue TUN device (linux impl + non-linux stub)
+internal/nettune       socket/kernel tuning (SO_SNDBUF/RCVBUF, TCP_NODELAY, BBR)
 internal/proxyproto    PROXY protocol v2 header builder
 internal/sysinfo       CPU cores (cgroup v1/v2 aware), memory limits
 internal/logx          leveled logging + size-based rotation
-internal/core          wiring: config -> logger -> health endpoint -> engine
+internal/core          wiring: config -> engine selector -> health endpoint
 scripts/               install.sh, uninstall.sh, et-panel.sh (installed as `et`)
 systemd/               emergency-tunnel@.service (template unit)
 configs/               example.toml
@@ -63,6 +73,22 @@ Who dials vs. accepts is set by **mode** (reverse ⇒ Kharej dials). Which side 
 the forwarded ports is set by **role** (Iran ⇒ entry). The two are orthogonal, so
 all four combinations work. Each pooled link is owned by exactly one worker for
 its lifetime — the pool size stays exact and there are no goroutine/conn leaks.
+
+### How packets flow (L3 TUN engine)
+
+```
+app ─▶ pengutun (TUN, 10.20.0.1/24)
+          │  kernel hashes the flow to queue i (ordering preserved)
+          ▼
+    reader i ─▶ [batch N packets] ─▶ AEAD link i ═══▶ peer link i ─▶ TUN queue i ─▶ peer stack
+                       ▲                                                  │
+                       └───────────── heartbeat every 10s ◀──────────────┘
+                         (no datagram for 25s ⇒ cycle & reconnect link i)
+```
+
+`pool` sets the number of queues **and** links (keep it ≈ CPU cores). Both ends
+must use the same `engine`. Pick **l4** to expose specific ports (proxy/CDN use
+cases); pick **l3** to route arbitrary IP traffic between the two hosts.
 
 ## Install
 

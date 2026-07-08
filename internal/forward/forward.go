@@ -419,8 +419,9 @@ type Stats struct {
 	LinkErrors uint64 `json:"link_errors"`
 }
 
-// Snapshot returns the current counters safely.
-func (e *Engine) Snapshot() Stats {
+// Snapshot returns the current counters safely (as any, to satisfy the shared
+// engine interface used by the health endpoint).
+func (e *Engine) Snapshot() any {
 	return Stats{
 		Active:     atomic.LoadInt64(&e.stats.activeConns),
 		Total:      atomic.LoadUint64(&e.stats.totalConns),

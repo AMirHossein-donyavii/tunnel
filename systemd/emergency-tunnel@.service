@@ -20,11 +20,11 @@ TasksMax=4096
 MemoryMax=256M
 CPUWeight=100
 
-# Security hardening. The core only needs to bind privileged ports and open
-# outbound/inbound sockets; grant just that.
+# Security hardening. The core needs to bind privileged ports, open sockets,
+# and (for the L3 engine) create/configure a TUN device — CAP_NET_ADMIN.
 User=root
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

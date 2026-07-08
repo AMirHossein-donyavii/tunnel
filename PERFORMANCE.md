@@ -52,6 +52,34 @@ tunnels concurrently without noticeable CPU or memory pressure.
 | `balance`  | 100  | 0.90 × cgroup   | the sensible default             |
 | `resource` | 50   | 0.85 × cgroup   | tiny/oversold VPS, many tunnels  |
 
+## L3 TUN engine tuning
+
+The L3 engine (`engine = "l3"`) has its own knobs:
+
+- **`pool`** sets the number of TUN queues *and* encrypted links. The kernel
+  hashes each flow to a fixed queue, so ordering is preserved while flows spread
+  across cores. Keep `pool ≈ CPU cores` — more queues than cores just share
+  cores (the core logs a warning if you overshoot).
+- **`batch_size`** (default 32) — packets coalesced into one write. Higher values
+  raise throughput for bulk transfers and lower syscall/CPU cost; very high
+  values add a little latency. The 2 ms flush timer bounds latency regardless.
+- **`channel_size`** (default 512) — per-queue buffer depth. Raise it for very
+  bursty traffic; lower it to cap memory on tiny VPS.
+- **`so_sndbuf` / `so_rcvbuf`** — socket buffers. Left at 0 they follow the
+  profile (fast = 4 MiB, balance = 1 MiB, resource = 256 KiB). For high
+  bandwidth-delay-product links (intercontinental), larger buffers help.
+- **BBR** is requested on every link automatically; enable it kernel-wide for
+  best effect: `net.core.default_qdisc=fq`, `net.ipv4.tcp_congestion_control=bbr`.
+- **`heartbeat_interval` / `heartbeat_timeout`** — lower them for faster failover
+  on flaky links (at the cost of a little more chatter), raise them on stable
+  links to reduce wakeups.
+- **MTU**: 1380 is a safe default that survives most encapsulation overhead. If
+  the underlay drops fragments, lowering to ~1280 avoids black-holing.
+
+The L3 hot path reuses read buffers via a `sync.Pool` and coalesces packets into
+≤16 KiB AEAD frames, so steady-state RAM stays flat and GC pressure is low even
+at high packet rates.
+
 ## Tuning checklist for busy nodes
 
 1. Raise file descriptors — the unit already sets `LimitNOFILE=1048576`.
