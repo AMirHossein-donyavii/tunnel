@@ -21,29 +21,16 @@ End users never touch GitHub.
 - A domain/subdomain pointing at it, e.g. `dl.example.com` (DNS **A** record).
 - Ports **80** and **443** open.
 
-### 1. Build the release tree (on a machine with Go, e.g. your laptop)
+### 1–2. Build the release AND bake in your domain (one command)
+On a machine with Go (your laptop is fine):
 ```bash
-git clone https://github.com/AMirHossein-donyavii/tunnel.git
-cd tunnel
-scripts/build-release.sh 1.2.0 --channel stable
-# → produces ./release/ with releases/v1.2.0/{binaries,SHA256SUMS,...},
-#   the `stable` channel pointer, and a copy of install.sh
+git clone https://github.com/AMirHossein-donyavii/tunnel.git && cd tunnel
+deploy/configure-host.sh dl.example.com 1.2.0
+# → builds ./release/ and sets install.sh to ET_SOURCE=host + your domain.
 ```
-*(Optional but recommended: sign it so installs verify offline.)*
-```bash
-minisign -G -p minisign.pub -s minisign.key       # one time; keep .key OFFLINE
-MINISIGN_KEY=./minisign.key scripts/build-release.sh 1.2.0 --sign
-cp minisign.pub release/minisign.pub
-```
-
-### 2. Point install.sh at YOUR host (before uploading)
-Edit two lines at the top of `release/install.sh`:
-```bash
-ET_SOURCE="${ET_SOURCE:-host}"                       # was: github
-ET_BASE_URL="${ET_BASE_URL:-https://dl.example.com}" # your domain
-# If you signed, also paste the 2nd line of minisign.pub:
-ET_PUBKEY="${ET_PUBKEY:-RWQ...your-public-key...}"
-```
+*(Optional, recommended — sign so installs verify offline: create a key once with
+`minisign -G -p minisign.pub -s minisign.key`, keep `.key` OFFLINE, then run the
+line above with `MINISIGN_KEY=./minisign.key` — the helper embeds the pubkey.)*
 
 ### 3. Copy the tree to the server's web root
 ```bash
