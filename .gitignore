@@ -1,9 +1,12 @@
 # Build output / release staging
+# NOTE: these are anchored with a leading "/" so they only match built binaries
+# at the repo root and do NOT match the source dir cmd/et-core/.
 /release/
 /dist/
 /bin/
-et-core
-et-core-linux-*
+/et-core
+/et-core-linux-*
+/et-core-check
 *.exe
 
 # Signing material — NEVER commit secret keys
