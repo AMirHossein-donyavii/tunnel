@@ -1,0 +1,28 @@
+# Emergency Tunnel release host — Caddy (automatic HTTPS).
+#
+# Simplest option: Caddy obtains and renews TLS certificates for you.
+#   1) put your files in /var/www/emergency-tunnel
+#   2) replace dl.example.com below
+#   3) caddy run --config ./Caddyfile   (or install as a service)
+
+dl.example.com {
+    root * /var/www/emergency-tunnel
+    encode gzip
+
+    # Plain-text content types for scripts and channel/checksum files.
+    @text path *.sh /stable /beta *.sha256 /SHA256SUMS
+    header @text Content-Type text/plain
+    header @text Cache-Control "no-cache"
+
+    # Long cache for immutable versioned assets.
+    @releases path /releases/*
+    header @releases Cache-Control "public, max-age=31536000, immutable"
+
+    # Block dotfiles and any stray secret keys.
+    @hidden path /.* *.sec *.key
+    respond @hidden 404
+
+    file_server {
+        hide .*
+    }
+}

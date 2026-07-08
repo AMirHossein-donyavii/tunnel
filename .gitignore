@@ -1,0 +1,30 @@
+# Build output / release staging
+/release/
+/dist/
+/bin/
+et-core
+et-core-linux-*
+*.exe
+
+# Signing material — NEVER commit secret keys
+*.key
+*.sec
+minisign.key
+
+# Signatures/checksums are published to the web root, not the repo
+*.minisig
+
+# Logs & runtime
+*.log
+*.log.*
+
+# Go
+/vendor/
+*.test
+*.out
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
