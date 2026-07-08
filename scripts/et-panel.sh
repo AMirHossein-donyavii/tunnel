@@ -179,10 +179,23 @@ create_tunnel() {
     local engine transport="tcp"
     [ "$(ask_choice "Select" "1" 2)" = "2" ] && engine="tun" || engine="mux"
 
-    echo; echo -e "  Direction:"
-    echo -e "    ${C_G}1)${C_RESET} Reverse (recommended) — Kharej connects to Iran"
-    echo -e "    ${C_G}2)${C_RESET} Direct                — Iran connects to Kharej"
-    local mode; [ "$(ask_choice "Select" "1" 2)" = "2" ] && mode="direct" || mode="reverse"
+    # TUN carrier mode. Shown immediately after selecting TUN.
+    local tun_mode="tcp"
+    if [ "$engine" = "tun" ]; then
+        echo; echo -e "  ${C_BOLD}TUN mode${C_RESET} (how the encrypted tunnel between the servers is carried):"
+        echo -e "    ${C_G}1)${C_RESET} TCP  — TCP transport over the TUN network ${C_Y}[recommended]${C_RESET}"
+        echo -e "         ${C_C}Uses TCP between the servers; tunnel traffic then flows through the"
+        echo -e "         private tunnel IP addresses (10.10.10.x).${C_RESET}"
+        echo -e "    ${C_G}2)${C_RESET} UDP  — UDP datagrams (lower overhead, good for gaming/VoIP)"
+        echo -e "    ${C_G}3)${C_RESET} ICMP — carried inside ICMP echo (ping) ${C_Y}[beta, Linux, CAP_NET_RAW]${C_RESET}"
+        echo -e "    ${C_G}4)${C_RESET} BIP  — ICMP over IPv6 ${C_Y}[beta, Linux, CAP_NET_RAW]${C_RESET}"
+        case "$(ask_choice "Select" "1" 4)" in
+            2) tun_mode="udp";; 3) tun_mode="icmp";; 4) tun_mode="bip";; *) tun_mode="tcp";;
+        esac
+    fi
+
+    # Direction is fixed: reverse (Kharej dials Iran). Direct mode was removed.
+    local mode="reverse"
 
     # Name: valid characters + unique. Re-prompts; never aborts.
     local defname="et$RANDOM"; defname="${defname:0:8}"
@@ -193,11 +206,9 @@ create_tunnel() {
         echo -e "  ${C_R}A tunnel named '$name' already exists — choose another.${C_RESET}"
     done
 
-    # Dialer side needs the peer's public address.
-    local is_dialer="no" peer=""
-    { [ "$mode" = "reverse" ] && [ "$role" = "kharej" ]; } && is_dialer="yes"
-    { [ "$mode" = "direct" ]  && [ "$role" = "iran" ]; }   && is_dialer="yes"
-    [ "$is_dialer" = "yes" ] && peer="$(ask_req "Peer address (the OTHER server's public IP or hostname)")"
+    # Reverse mode: the Foreign (Kharej) server dials, so it needs the peer address.
+    local peer=""
+    [ "$role" = "kharej" ] && peer="$(ask_req "Iran server public IP or hostname")"
 
     local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health
     local tun_ip="" peer_tun_ip="" forwards_toml="[]" proxy="false"
@@ -215,11 +226,9 @@ create_tunnel() {
     echo -e "  ${C_Y}Security:${C_RESET} restrict the tunnel port (${tunnel_port}) to the peer's IP in your firewall."
 
     if [ "$engine" = "tun" ]; then
-        echo; echo -e "  ${C_BOLD}TUN mode${C_RESET}"
-        echo -e "  ${C_C}TUN mode creates a virtual network interface between the Iran and Foreign"
-        echo -e "  servers. It allows TCP, UDP, ICMP, and IPv6 ICMP traffic to pass through a"
-        echo -e "  private tunnel network. The default subnet is 10.10.10.0/24, where Iran uses"
-        echo -e "  10.10.10.1 and Foreign uses 10.10.10.2.${C_RESET}"
+        echo; echo -e "  ${C_C}TUN creates a private virtual network (default 10.10.10.0/24) between the"
+        echo -e "  two servers: Iran uses 10.10.10.1, Foreign uses 10.10.10.2. TCP, UDP, ICMP and"
+        echo -e "  IPv6 ICMP traffic all flow through it via the assigned tunnel IPs.${C_RESET}"
         iface="$(ask_name "Tunnel interface name" "emergency-tun")"
         local def_ip def_peer
         if [ "$role" = "iran" ]; then def_ip="10.10.10.1/24"; def_peer="10.10.10.2"
@@ -250,7 +259,7 @@ create_tunnel() {
     fi
 
     write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$tunnel_port" \
-        "$tun_ip" "$peer_tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" \
+        "$tun_mode" "$tun_ip" "$peer_tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" \
         "$health" "$profile" "$proxy" "$forwards_toml"
 
     echo; echo -e "  ${C_C}Validating configuration...${C_RESET}"
@@ -281,8 +290,8 @@ csv_to_toml_array() { # "a,b,c" -> ["a", "b", "c"]
 
 write_config() {
     local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" tunnel="$7" \
-          tun_ip="$8" peer_tun_ip="$9" iface="${10}" mtu="${11}" workers="${12}" pool="${13}" \
-          cipher="${14}" health="${15}" profile="${16}" proxy="${17}" forwards="${18}"
+          tun_mode="$8" tun_ip="$9" peer_tun_ip="${10}" iface="${11}" mtu="${12}" workers="${13}" \
+          pool="${14}" cipher="${15}" health="${16}" profile="${17}" proxy="${18}" forwards="${19}"
     install -d -m 0750 "$CONF_DIR"
     umask 077
     {
@@ -304,6 +313,7 @@ write_config() {
         echo "heartbeat_interval = 10"
         echo "heartbeat_timeout = 25"
         if [ "$engine" = "tun" ]; then
+            echo "tun_mode = \"$tun_mode\""
             echo "tun_iface = \"$iface\""
             [ -n "$tun_ip" ]      && echo "tun_ip = \"$tun_ip\""
             [ -n "$peer_tun_ip" ] && echo "peer_tun_ip = \"$peer_tun_ip\""

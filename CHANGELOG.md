@@ -4,6 +4,48 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-07-09
+
+Adds selectable **TUN carrier modes** and removes the Direct direction.
+
+### Added
+- **TUN modes (`tun_mode`)** — choose how the encrypted link between the two
+  servers is carried:
+  - **`tcp`** (default, production) — reliable stream (existing).
+  - **`udp`** (production) — UDP datagrams with a new **datagram AEAD**
+    (explicit per-packet nonce, loss/reorder tolerant) and a retransmitted
+    X25519 handshake. Verified end-to-end over loopback (both ciphers, `-race`).
+  - **`icmp`** / **`bip`** (ICMPv6) — **beta** — frames ride in ICMP echo
+    payloads (ping mimicry) over raw sockets; Linux + `CAP_NET_RAW`. Requires
+    `net.ipv4.icmp_echo_ignore_all=1` on the listener. Compiled & cross-built;
+    **validate on a Linux host** (raw sockets are not runtime-testable in CI here).
+  - The wizard now shows the mode menu immediately after selecting TUN, with a
+    clear explanation of TCP mode.
+- **`link` abstraction** in the TUN engine (`WriteFrame`/`ReadFrame`) so all four
+  carriers share the same batching, heartbeat, and reconnect logic.
+- `crypto.Datagram` (connectionless AEAD) + `ClientHandshakePacket`/
+  `ServerHandshakePacket`.
+
+### Removed
+- **Direct mode — completely.** `mode` is reverse-only (Foreign dials Iran);
+  `ModeDirect` and the panel Direction question are gone. Validation rejects
+  `mode = "direct"`.
+
+### Kept (reviewed)
+- **Health/stats port** — kept and confirmed **local-only** (`127.0.0.1`), used
+  by the panel status view and debugging; validation prevents collision with
+  `tunnel_port`; set `health_port = 0` to disable.
+
+### Changed
+- New dependency `golang.org/x/net` (ICMP marshaling/checksums).
+- Panel input handling continues to re-prompt on invalid values (ports, IPs,
+  names, menu choices) and never aborts.
+
+### Verified
+- linux amd64/arm64/armv7 build (incl. ICMP); `go vet` clean; tests green incl.
+  `-race`; UDP carrier loopback e2e; TUN configs for all four modes validate;
+  Direct/invalid-mode rejected.
+
 ## [1.4.0] — 2026-07-09
 
 Streamlines the project to **two tunnel protocols** and makes **TUN** a

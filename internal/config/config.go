@@ -21,10 +21,10 @@ const (
 	RoleKharej = "kharej" // exit: runs the real services (Xray/etc.)
 )
 
-// Mode identifies who initiates the tunnel link.
+// Mode identifies who initiates the tunnel link. Only "reverse" is supported:
+// the Foreign (Kharej) server always dials the Iran server.
 const (
-	ModeReverse = "reverse" // Kharej dials Iran (recommended)
-	ModeDirect  = "direct"  // Iran dials Kharej
+	ModeReverse = "reverse" // Kharej dials Iran
 )
 
 // Performance profiles tune buffer sizes and worker scaling.
@@ -42,6 +42,7 @@ type Config struct {
 	Mode       string `toml:"mode"`
 	Peer       string `toml:"peer"`        // remote host the dialer connects to
 	TunnelPort int    `toml:"tunnel_port"` // server<->server link port (same on both sides)
+	TunMode    string `toml:"tun_mode"`    // TUN carrier: tcp | udp | icmp | bip
 	TunIP      string `toml:"tun_ip"`      // TUN engine: this host's tunnel address (CIDR)
 	TunIP6     string `toml:"tun_ip6"`     // TUN engine: optional IPv6 tunnel address (CIDR)
 	PeerTunIP  string `toml:"peer_tun_ip"` // TUN engine: peer's tunnel address (for routing/logs)
@@ -98,6 +99,7 @@ func Defaults() Config {
 
 		// TCP Reverse Tunnel (multiplexed) is the primary, recommended engine.
 		Engine:            EngineMux,
+		TunMode:           TunModeTCP,
 		HeartbeatInterval: 10,
 		HeartbeatTimeout:  25,
 	}
@@ -113,6 +115,28 @@ const (
 // IsTUN reports whether the config selects the TUN engine (accepts the "l3" alias).
 func (c *Config) IsTUN() bool { return c.Engine == EngineTUN || c.Engine == EngineL3 }
 
+// TUN carrier modes (how the encrypted link between the two servers is carried).
+const (
+	TunModeTCP  = "tcp"  // reliable TCP stream (default, production)
+	TunModeUDP  = "udp"  // UDP datagrams (low overhead)
+	TunModeICMP = "icmp" // inside ICMP echo (IPv4) — beta, needs CAP_NET_RAW
+	TunModeBIP  = "bip"  // inside ICMPv6 echo — beta, needs CAP_NET_RAW
+)
+
+// TunModeName returns a human label for a carrier mode.
+func TunModeName(m string) string {
+	switch m {
+	case TunModeUDP:
+		return "UDP"
+	case TunModeICMP:
+		return "ICMP"
+	case TunModeBIP:
+		return "BIP (ICMPv6)"
+	default:
+		return "TCP"
+	}
+}
+
 // Validate checks the config for internal consistency and returns a helpful
 // error describing the first problem found.
 func (c *Config) Validate() error {
@@ -122,8 +146,8 @@ func (c *Config) Validate() error {
 	if c.Role != RoleIran && c.Role != RoleKharej {
 		return fmt.Errorf("role must be %q or %q, got %q", RoleIran, RoleKharej, c.Role)
 	}
-	if c.Mode != ModeReverse && c.Mode != ModeDirect {
-		return fmt.Errorf("mode must be %q or %q, got %q", ModeReverse, ModeDirect, c.Mode)
+	if c.Mode != ModeReverse {
+		return fmt.Errorf("mode must be %q (Kharej dials Iran); direct mode was removed", ModeReverse)
 	}
 	if c.TunnelPort < 1 || c.TunnelPort > 65535 {
 		return fmt.Errorf("tunnel_port out of range: %d", c.TunnelPort)
@@ -182,6 +206,13 @@ func (c *Config) Validate() error {
 // validateTUN validates the TUN-engine addressing (IPv4 required, IPv6 optional)
 // and the peer/heartbeat settings.
 func (c *Config) validateTUN() error {
+	switch c.TunMode {
+	case TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP:
+	case "":
+		c.TunMode = TunModeTCP
+	default:
+		return fmt.Errorf("tun_mode must be tcp, udp, icmp or bip, got %q", c.TunMode)
+	}
 	ip, ipnet, err := net.ParseCIDR(strings.TrimSpace(c.TunIP))
 	if err != nil {
 		return fmt.Errorf("tun_ip must be an address with prefix, e.g. 10.10.10.1/24 (got %q)", c.TunIP)
@@ -214,12 +245,9 @@ func (c *Config) validateTUN() error {
 }
 
 // dialerSide reports whether THIS host initiates the tunnel link.
-// reverse => Kharej dials; direct => Iran dials.
+// Reverse-only: the Kharej (Foreign) server always dials.
 func (c *Config) dialerSide() bool {
-	if c.Mode == ModeReverse {
-		return c.Role == RoleKharej
-	}
-	return c.Role == RoleIran
+	return c.Role == RoleKharej
 }
 
 // IsDialer is the exported form of dialerSide.

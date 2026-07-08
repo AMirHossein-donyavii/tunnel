@@ -13,15 +13,15 @@
 package l3
 
 import (
-	"bufio"
 	"context"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/emergency-tunnel/et/internal/config"
-	"github.com/emergency-tunnel/et/internal/crypto"
 	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/nettune"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
@@ -29,16 +29,17 @@ import (
 	"github.com/emergency-tunnel/et/internal/tun"
 )
 
-// Engine is one L3 tunnel instance.
+// Engine is one L3 (TUN) tunnel instance.
 type Engine struct {
 	cfg      *config.Config
 	log      *logx.Logger
 	cipher   string
+	mode     string // carrier: tcp | udp | icmp | bip
 	queues   int
 	isDialer bool
 
-	dialer   transport.Dialer
-	listener transport.Listener
+	ldialer   linkDialer
+	llistener linkListener
 
 	sndbuf, rcvbuf int
 	batchSize      int
@@ -60,16 +61,13 @@ type Engine struct {
 	}
 }
 
-// New builds an L3 engine from validated config.
+// New builds a TUN engine from validated config.
 func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
-	tr, err := transport.Get(cfg.Transport)
-	if err != nil {
-		return nil, err
-	}
 	e := &Engine{
 		cfg:         cfg,
 		log:         log,
 		cipher:      cfg.Cipher,
+		mode:        cfg.TunMode,
 		queues:      cfg.Pool,
 		isDialer:    cfg.IsDialer(),
 		batchSize:   orDefault(cfg.BatchSize, 32),
@@ -79,22 +77,61 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, 25)) * time.Second,
 		nowSec:      func() int64 { return time.Now().Unix() },
 	}
+	if e.mode == "" {
+		e.mode = config.TunModeTCP
+	}
 	if e.queues < 1 {
 		e.queues = 1
 	}
 	e.pool.New = func() any { b := make([]byte, e.pktLen); return &b }
 	e.sndbuf, e.rcvbuf = nettune.BufSizes(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
 
-	if e.isDialer {
-		if e.dialer, err = tr.NewDialer(cfg, log); err != nil {
-			return nil, err
-		}
-	} else {
-		if e.listener, err = tr.NewListener(cfg, log); err != nil {
-			return nil, err
-		}
+	if err := e.buildCarrier(cfg, log); err != nil {
+		return nil, err
 	}
 	return e, nil
+}
+
+// buildCarrier constructs the dialer or listener for the selected TUN mode.
+func (e *Engine) buildCarrier(cfg *config.Config, log *logx.Logger) error {
+	tune := nettune.LinkOptions(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
+	switch e.mode {
+	case config.TunModeUDP:
+		if e.isDialer {
+			e.ldialer = &udpLinkDialer{addr: net.JoinHostPort(cfg.Peer, strconv.Itoa(cfg.TunnelPort)), cipher: e.cipher}
+		} else {
+			l, err := newUDPListener(cfg.TunnelPort, e.cipher)
+			if err != nil {
+				return err
+			}
+			e.llistener = l
+		}
+	case config.TunModeICMP, config.TunModeBIP:
+		d, l, err := newICMPCarrier(e.mode, cfg, e.isDialer, e.cipher)
+		if err != nil {
+			return err
+		}
+		e.ldialer, e.llistener = d, l
+	default: // tcp
+		tr, err := transport.Get("tcp")
+		if err != nil {
+			return err
+		}
+		if e.isDialer {
+			d, err := tr.NewDialer(cfg, log)
+			if err != nil {
+				return err
+			}
+			e.ldialer = &tcpLinkDialer{d: d, cipher: e.cipher, tune: tune}
+		} else {
+			l, err := tr.NewListener(cfg, log)
+			if err != nil {
+				return err
+			}
+			e.llistener = &tcpLinkListener{l: l, cipher: e.cipher, tune: tune}
+		}
+	}
+	return nil
 }
 
 // Run opens the TUN device, establishes the links, and pumps packets until ctx
@@ -144,11 +181,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
-	if e.dialer != nil {
-		_ = e.dialer.Close()
+	if e.ldialer != nil {
+		_ = e.ldialer.Close()
 	}
-	if e.listener != nil {
-		_ = e.listener.Close()
+	if e.llistener != nil {
+		_ = e.llistener.Close()
 	}
 	dev.Close() // unblocks the queue readers
 	pumps.Wait()
@@ -216,26 +253,16 @@ func (e *Engine) queueReader(ctx context.Context, q queue, ch chan<- []byte) {
 func (e *Engine) clientQueue(ctx context.Context, q queue, ch <-chan []byte, id int) {
 	backoff := time.Second
 	for ctx.Err() == nil {
-		raw, err := e.dialer.Dial(ctx)
+		lk, err := e.ldialer.DialLink(ctx)
 		if err != nil {
-			e.log.Warn("queue %d dial: %v", id, err)
-			if !sleepCtx(ctx, &backoff) {
-				return
-			}
-			continue
-		}
-		nettune.TuneConn(raw, e.sndbuf, e.rcvbuf)
-		link, err := crypto.ClientHandshake(raw, e.cipher)
-		if err != nil {
-			_ = raw.Close()
-			e.log.Warn("queue %d handshake: %v", id, err)
+			e.log.Warn("queue %d connect (%s): %v", id, config.TunModeName(e.mode), err)
 			if !sleepCtx(ctx, &backoff) {
 				return
 			}
 			continue
 		}
 		backoff = time.Second
-		e.pump(ctx, q, ch, link, id)
+		e.pump(ctx, q, ch, lk, id)
 		atomic.AddUint64(&e.stats.reconnects, 1)
 	}
 }
@@ -248,44 +275,37 @@ func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txChans []ch
 	}
 	var wg sync.WaitGroup
 	for ctx.Err() == nil {
-		raw, err := e.listener.Accept()
+		lk, err := e.llistener.AcceptLink()
 		if err != nil {
 			if ctx.Err() != nil {
 				break
 			}
-			e.log.Warn("accept: %v", err)
+			e.log.Warn("accept (%s): %v", config.TunModeName(e.mode), err)
 			continue
 		}
 		var slot int
 		select {
 		case slot = <-free:
 		default:
-			_ = raw.Close() // all queues occupied
+			_ = lk.Close() // all queues occupied
 			continue
 		}
-		nettune.TuneConn(raw, e.sndbuf, e.rcvbuf)
 		wg.Add(1)
-		go func(slot int) {
+		go func(slot int, lk link) {
 			defer wg.Done()
 			defer func() { free <- slot }()
-			link, err := crypto.ServerHandshake(raw, e.cipher)
-			if err != nil {
-				_ = raw.Close()
-				e.log.Warn("handshake from %s: %v", raw.RemoteAddr(), err)
-				return
-			}
-			e.pump(ctx, dev.Queues()[slot], txChans[slot], link, slot)
-		}(slot)
+			e.pump(ctx, dev.Queues()[slot], txChans[slot], lk, slot)
+		}(slot, lk)
 	}
 	wg.Wait()
 }
 
 // pump bridges one TUN queue with one link until either side fails or the
 // heartbeat times out.
-func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, link *crypto.SecureConn, id int) {
+func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, lk link, id int) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	defer link.Close()
+	defer lk.Close()
 
 	var lastRecv atomic.Int64
 	lastRecv.Store(e.nowSec())
@@ -300,16 +320,17 @@ func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, link *cryp
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); defer cancel(); e.tunToLink(ctx, ch, link) }()
-	go func() { defer wg.Done(); defer cancel(); e.linkToTun(ctx, q, link, &lastRecv) }()
+	go func() { defer wg.Done(); defer cancel(); e.tunToLink(ctx, ch, lk) }()
+	go func() { defer wg.Done(); defer cancel(); e.linkToTun(ctx, q, lk, &lastRecv) }()
 	e.heartbeatMonitor(ctx, cancel, &lastRecv, id) // blocks until ctx is done
 	wg.Wait()
 }
 
-// tunToLink consumes packets from the queue channel, batches them, and writes
-// to the link. It also emits periodic heartbeats.
-func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, link *crypto.SecureConn) {
-	batch := make([]byte, 0, e.batchSize*e.pktLen)
+// tunToLink consumes packets from the queue channel, batches them (up to the
+// link's max frame), and writes to the link. It also emits periodic heartbeats.
+func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, lk link) {
+	maxFrame := lk.MaxFrame()
+	batch := make([]byte, 0, maxFrame)
 	pending := 0
 
 	hb := time.NewTicker(e.hbInterval)
@@ -325,7 +346,7 @@ func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, link *crypto.S
 		if len(batch) == 0 {
 			return true
 		}
-		if _, err := link.Write(batch); err != nil {
+		if err := lk.WriteFrame(batch); err != nil {
 			return false
 		}
 		atomic.AddUint64(&e.stats.txPackets, uint64(pending))
@@ -340,12 +361,18 @@ func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, link *crypto.S
 		case <-ctx.Done():
 			return
 		case pkt := <-ch:
+			// Flush first if this packet would overflow the frame budget.
+			if len(batch) > 0 && len(batch)+2+len(pkt) > maxFrame {
+				if !send() {
+					return
+				}
+			}
 			batch = appendPacket(batch, pkt)
 			pending++
 			if pending == 1 {
 				flush.Reset(flushEvery)
 			}
-			if pending >= e.batchSize || len(batch) >= 60*1024 {
+			if pending >= e.batchSize || len(batch) >= maxFrame-e.pktLen {
 				if !flush.Stop() {
 					select {
 					case <-flush.C:
@@ -361,6 +388,8 @@ func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, link *crypto.S
 				return
 			}
 		case <-hb.C:
+			// Heartbeat goes in its own frame if the batch is empty; else it
+			// rides with the pending packets.
 			batch = appendHeartbeat(batch)
 			if !send() {
 				return
@@ -369,27 +398,39 @@ func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, link *crypto.S
 	}
 }
 
-// linkToTun reads datagrams and writes packets to the queue.
-func (e *Engine) linkToTun(ctx context.Context, q queue, link *crypto.SecureConn, lastRecv *atomic.Int64) {
-	stop := context.AfterFunc(ctx, func() { _ = link.SetReadDeadline(time.Now()) })
+// linkToTun reads encrypted frames, splits each into its packets, and writes
+// them to the TUN queue.
+func (e *Engine) linkToTun(ctx context.Context, q queue, lk link, lastRecv *atomic.Int64) {
+	stop := context.AfterFunc(ctx, func() { _ = lk.SetReadDeadline(time.Now()) })
 	defer stop()
 
-	r := bufio.NewReaderSize(link, 64*1024)
-	buf := make([]byte, maxPacket)
+	buf := make([]byte, lk.MaxFrame()+64)
 	for {
-		n, hb, err := readDatagram(r, buf)
+		n, err := lk.ReadFrame(buf)
 		if err != nil {
 			return
 		}
 		lastRecv.Store(e.nowSec())
-		if hb {
-			continue
+		// A frame is a sequence of [uint16 len][payload] datagrams; len 0 is a
+		// heartbeat (already counted by updating lastRecv above).
+		frame := buf[:n]
+		for len(frame) >= 2 {
+			plen := int(frame[0])<<8 | int(frame[1])
+			frame = frame[2:]
+			if plen == 0 {
+				continue // heartbeat marker
+			}
+			if plen > len(frame) {
+				break // truncated frame; drop remainder
+			}
+			pkt := frame[:plen]
+			frame = frame[plen:]
+			if _, err := q.Write(pkt); err != nil {
+				return
+			}
+			atomic.AddUint64(&e.stats.rxPackets, 1)
+			atomic.AddUint64(&e.stats.rxBytes, uint64(plen))
 		}
-		if _, err := q.Write(buf[:n]); err != nil {
-			return
-		}
-		atomic.AddUint64(&e.stats.rxPackets, 1)
-		atomic.AddUint64(&e.stats.rxBytes, uint64(n))
 	}
 }
 

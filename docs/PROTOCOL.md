@@ -126,6 +126,41 @@ IPs with **any** IP protocol — TCP, UDP, ICMP (ping), and IPv6 ICMP.
 
 Requires `CAP_NET_ADMIN` (granted by the systemd unit) to create the device.
 
+### TUN carrier modes (`tun_mode`)
+
+How the encrypted link between the two servers' public IPs is carried. The inner
+TUN traffic is identical in all modes; only the envelope changes.
+
+| `tun_mode` | Carrier | Crypto | Status |
+|-----------|---------|--------|--------|
+| **`tcp`** *(default)* | reliable TCP stream | stream AEAD (`SecureConn`, sequential nonce) | production |
+| **`udp`** | UDP datagrams | **datagram AEAD** (explicit 8-byte per-packet nonce) + retransmitted handshake | production |
+| **`icmp`** | inside ICMPv4 echo (ping) | datagram AEAD | **beta** — Linux, `CAP_NET_RAW` |
+| **`bip`** | inside ICMPv6 echo | datagram AEAD | **beta** — Linux, `CAP_NET_RAW` |
+
+- **Datagram carriers** (`udp`/`icmp`/`bip`) use a connectionless AEAD: each
+  packet carries its own counter, so loss/reordering is tolerated (fine for a
+  TUN, whose inner IP traffic already retransmits). The handshake retransmits
+  until the peer replies. One carrier datagram holds one full inner packet (the
+  batcher caps a frame at ~1400 B so it fits under a 1500-byte path MTU).
+- **ICMP/BIP** send Echo Requests from the dialer and Echo Replies from the
+  listener, demultiplexed by (source IP, ICMP id). On the **listener** set
+  `sysctl -w net.ipv4.icmp_echo_ignore_all=1` (or the icmpv6 equivalent) so the
+  kernel does not also auto-reply. These modes mimic ping and are useful where
+  TCP/UDP are filtered, but are **beta** — validate on a Linux host before
+  production use.
+
+> **Direction:** the tunnel is always **reverse** (Foreign dials Iran). The old
+> "direct" mode was removed.
+
+### Health / stats port
+
+Kept, and **local-only** by design. `et-core` serves `/health` and `/stats` on
+`127.0.0.1:<health_port>` (default `9090`) — used by the panel's status view and
+for debugging (live sessions/streams, rx/tx bytes, RTT, link errors, reconnects).
+It never listens on a public address, and validation rejects
+`health_port == tunnel_port`. Set `health_port = 0` to disable it entirely.
+
 ---
 
 ## Choosing a protocol

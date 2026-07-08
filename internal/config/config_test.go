@@ -23,6 +23,29 @@ func TestValidateTUN(t *testing.T) {
 	}
 }
 
+func TestValidateTUNModes(t *testing.T) {
+	for _, m := range []string{TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP} {
+		c := baseTUN()
+		c.TunMode = m
+		if err := c.Validate(); err != nil {
+			t.Fatalf("tun_mode %q rejected: %v", m, err)
+		}
+	}
+	c := baseTUN()
+	c.TunMode = "wireguard"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for invalid tun_mode")
+	}
+}
+
+func TestDirectModeRejected(t *testing.T) {
+	c := baseTUN()
+	c.Mode = "direct"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: direct mode was removed")
+	}
+}
+
 func TestValidateTUNRequiresPrefix(t *testing.T) {
 	c := baseTUN()
 	c.TunIP = "10.10.10.2"

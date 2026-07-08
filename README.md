@@ -20,9 +20,11 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
      connections. Per-stream **flow control**, priority scheduling, adaptive
      batching, PING/RTT health. *(recommended, default)*
   2. **TUN (`tun`)** — a **virtual network interface** between the two servers
-     (multi-queue TUN device). All IP traffic — **TCP, UDP, ICMP, IPv6 ICMP** —
-     flows over the tunnel subnet (default `10.10.10.0/24`; Iran `10.10.10.1`,
-     Foreign `10.10.10.2`). Packet batching, heartbeat auto-recovery, BBR/socket
+     (multi-queue TUN device). All IP traffic flows over the tunnel subnet
+     (default `10.10.10.0/24`; Iran `10.10.10.1`, Foreign `10.10.10.2`).
+     Selectable **carrier mode** (`tun_mode`): **`tcp`** (default) · **`udp`**
+     (low overhead) · **`icmp`** / **`bip`** (ICMP / ICMPv6 mimicry — *beta*,
+     Linux + `CAP_NET_RAW`). Packet batching, heartbeat auto-recovery, BBR/socket
      tuning.
   - Both protocols share the same AEAD encryption, ephemeral X25519 key exchange,
     and TCP tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
@@ -76,10 +78,10 @@ user ──▶ Iran:443 (entry, listener)
               └─ AEAD-encrypted link the whole way
 ```
 
-Who dials vs. accepts is set by **mode** (reverse ⇒ Kharej dials). Which side owns
-the forwarded ports is set by **role** (Iran ⇒ entry). The two are orthogonal, so
-all four combinations work. Each pooled link is owned by exactly one worker for
-its lifetime — the pool size stays exact and there are no goroutine/conn leaks.
+The tunnel is always **reverse**: the Foreign (Kharej) server dials the Iran
+server (which owns the user-facing/tunnel ports). Each pooled link/session is
+owned by exactly one worker for its lifetime — the pool size stays exact and
+there are no goroutine/conn leaks.
 
 ### How packets flow (TUN engine)
 

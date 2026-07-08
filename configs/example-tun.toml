@@ -12,8 +12,12 @@
 name = "iran-tun"
 role = "iran"              # iran = 10.10.10.1 side; kharej = 10.10.10.2 side
 engine = "tun"             # virtual network interface (all IP protocols)
-transport = "tcp"          # carrier for the encrypted links
-mode = "reverse"           # reverse = Kharej dials Iran (recommended)
+mode = "reverse"           # reverse: Kharej dials Iran (the only supported mode)
+
+# TUN carrier — how the encrypted link between the servers is carried:
+#   tcp  (default, production)  |  udp  (low overhead)
+#   icmp (beta, Linux+CAP_NET_RAW) | bip (ICMPv6, beta, Linux+CAP_NET_RAW)
+tun_mode = "tcp"
 
 # peer = "203.0.113.10"    # required on the DIALING side (Kharej in reverse)
 
