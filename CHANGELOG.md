@@ -4,6 +4,52 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] — 2026-07-09
+
+Bug-fix release for issues found testing 1.6.0: fast restart/delete, the SPF
+setup wizard, and SPF source-IP spoofing on **both** carrier profiles.
+
+### Fixed
+- **Fast tunnel restart and delete.** Shutdown no longer waits on a blocked TUN
+  read. The TUN fd is now opened non-blocking so the Go runtime poller can
+  interrupt `Read` the instant the device is closed; the core adds a 3 s
+  shutdown watchdog as a hard backstop, and the systemd unit sets
+  `TimeoutStopSec=5s` + `KillMode=mixed`. Measured stop-to-exit is now well under
+  a second (was up to systemd's 90 s default on a stuck read). Repeated
+  create/restart/delete leaves no zombie processes, leaked FDs, or lingering
+  goroutines.
+- **SPF setup wizard now asks for the spoof IPs.** The panel was missing its
+  `ask_ip` helper, so SPF creation silently skipped `spoof_src_ip` /
+  `spoof_dst_ip` and then failed config validation. The wizard now prompts for
+  both (validated IPv4, must differ) before writing the config.
+- **SPF spoofing applies to the TCP profile too.** Previously only the ICMP
+  profile spoofed the source IP; the TCP profile ran as an ordinary reliable
+  link. Both profiles now share the same raw-socket spoof carrier — every SPF
+  frame, ICMP or TCP, is sent with `spoof_src_ip` as its source and accepted
+  only from `spoof_dst_ip`. The old non-spoofing SPF-TCP wrapper was removed.
+
+### Added
+- **Role-based SPF spoof defaults.** The wizard pre-fills Iran →
+  `spoof_src_ip=195.62.4.29`, `spoof_dst_ip=5.34.222.4` and Foreign the reverse.
+  Both remain editable and are format/pairing-validated.
+- **SPF logging.** `SPF tunnel connected: <local> <-> <peer>` on link-up and
+  `SPF spoof mapping initialized successfully: profile=… src=… dst=…` at carrier
+  start. The panel prints `Tunnel restart completed successfully` and
+  `Tunnel removed successfully`.
+
+### Changed
+- SPF codec logic (ICMP + TCP envelopes) split into a platform-neutral file with
+  round-trip unit tests; the raw-socket send/receive stays Linux-only.
+
+### Notes
+- SPF spoofing is strictly a point-to-point tunnel between two servers you
+  control — outgoing packets use your configured `spoof_src_ip`, inbound are
+  accepted **only** from `spoof_dst_ip`. It is not an attack tool.
+- SPF-TCP caveat unchanged: drop the kernel's RST for the unsolicited segments on
+  both hosts — `iptables -A OUTPUT -p tcp --sport <tunnel_port> --tcp-flags RST
+  RST -j DROP`. SPF remains Linux + `CAP_NET_RAW`, framing/validation tested but
+  not runtime-verified in CI.
+
 ## [1.6.0] — 2026-07-09
 
 Adds the SPF protocol, fixes the update-then-reload flow, and applies a measured

@@ -119,11 +119,13 @@ func (e *Engine) buildCarrier(cfg *config.Config, log *logx.Logger) error {
 		}
 		e.ldialer, e.llistener = d, l
 	case "spf":
-		d, l, err := newSPFCarrier(cfg, log, e.isDialer, e.cipher, tune)
+		d, l, err := newSPFRawCarrier(cfg, e.isDialer, e.cipher)
 		if err != nil {
 			return err
 		}
 		e.ldialer, e.llistener = d, l
+		log.Info("SPF spoof mapping initialized successfully: profile=%s src=%s dst=%s",
+			cfg.SpfProfile, cfg.SpoofSrcIP, cfg.SpoofDstIP)
 	default: // tcp
 		tr, err := transport.Get("tcp")
 		if err != nil {
@@ -217,6 +219,10 @@ func (e *Engine) logConnected(id int) {
 	peer := e.cfg.PeerTunIP
 	if peer == "" {
 		peer = "peer"
+	}
+	if e.cfg.IsSPF() {
+		e.log.Info("SPF tunnel connected: %s <-> %s", local, peer)
+		return
 	}
 	e.log.Info("Tunnel connected successfully: %s %s <-> %s %s",
 		e.roleName(true), local, e.roleName(false), peer)

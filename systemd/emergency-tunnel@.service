@@ -11,7 +11,14 @@ Type=simple
 ExecStartPre=/usr/local/bin/et-core validate --config /etc/emergency-tunnel/%i.toml
 ExecStart=/usr/local/bin/et-core run --config /etc/emergency-tunnel/%i.toml
 Restart=always
-RestartSec=2
+RestartSec=1
+
+# Fast, deterministic shutdown: the core exits promptly on SIGTERM (poller-
+# interruptible reads). Cap the wait so stop/restart/delete never hang, and
+# SIGKILL the whole cgroup if anything lingers.
+TimeoutStopSec=5s
+KillMode=mixed
+SendSIGKILL=yes
 
 # Resource discipline for small VPS targets. TasksMax bounds goroutine-backed
 # threads; MemoryMax is a safety net (the core also self-limits its heap).

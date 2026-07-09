@@ -129,6 +129,14 @@ ask_ipcidr() { # prompt [default] — IPv4/prefix, e.g. 10.10.10.1/24
         echo -e "  ${C_R}Invalid address. Use IP/prefix, e.g. 10.10.10.1/24.${C_RESET}" >&2
     done
 }
+ask_ip() { # prompt [default] — plain IPv4 (no prefix)
+    local v
+    while true; do
+        v="$(ask "$1" "${2:-}")"
+        if valid_ipv4 "$v"; then echo "$v"; return; fi
+        echo -e "  ${C_R}Invalid IPv4 address. Try again.${C_RESET}" >&2
+    done
+}
 ask_name() { # prompt [default] — alnum/_/- only, non-empty
     local raw v
     while true; do
@@ -254,12 +262,17 @@ create_tunnel() {
         if [ "$engine" = "spf" ]; then
             echo; echo -e "  ${C_C}SPF source-IP spoofing (point-to-point between YOUR two servers only)."
             echo -e "  These two values are REVERSED on the other server.${C_RESET}"
-            spoof_src="$(ask_ip "spoof_src_ip (source written on outgoing packets)")"
+            # Role-based defaults (editable). Iran and Foreign mirror each other.
+            local def_ssrc def_sdst
+            if [ "$role" = "iran" ]; then def_ssrc="195.62.4.29"; def_sdst="5.34.222.4"
+            else def_ssrc="5.34.222.4"; def_sdst="195.62.4.29"; fi
+            spoof_src="$(ask_ip "spoof_src_ip (source written on outgoing packets)" "$def_ssrc")"
             while true; do
-                spoof_dst="$(ask_ip "spoof_dst_ip (expected source of the peer's packets)")"
+                spoof_dst="$(ask_ip "spoof_dst_ip (expected source of the peer's packets)" "$def_sdst")"
                 [ "$spoof_dst" != "$spoof_src" ] && break
                 echo -e "  ${C_R}spoof_dst_ip must differ from spoof_src_ip.${C_RESET}"
             done
+            echo -e "  ${C_G}SPF spoof mapping:${C_RESET} src=${spoof_src} <-> dst=${spoof_dst}"
         fi
     else
         # mux: VPN/listen ports live only on the Iran (entry) side.
@@ -370,8 +383,16 @@ pick_tunnel() {
 svc_action() { # verb
     local verb="$1" name; banner
     name="$(pick_tunnel)" || { pause; return; }
-    systemctl "$verb" "${SVC_PREFIX}${name}"
-    echo -e "  ${C_G}${verb} -> ${name}${C_RESET}"
+    echo -e "  ${C_C}${verb^}ing ${name}...${C_RESET}"
+    if systemctl "$verb" "${SVC_PREFIX}${name}"; then
+        case "$verb" in
+            restart) echo -e "  ${C_G}✓ Tunnel restart completed successfully.${C_RESET}" ;;
+            stop)    echo -e "  ${C_G}✓ Tunnel stopped.${C_RESET}" ;;
+            *)       echo -e "  ${C_G}✓ ${verb} -> ${name}${C_RESET}" ;;
+        esac
+    else
+        echo -e "  ${C_R}✗ ${verb} failed — check logs (menu 6).${C_RESET}"
+    fi
     pause
 }
 
@@ -408,10 +429,11 @@ edit_config() {
 delete_tunnel() {
     banner; local name; name="$(pick_tunnel)" || { pause; return; }
     yesno "Really delete '${name}'?" "n" || { pause; return; }
+    echo -e "  ${C_C}Removing ${name}...${C_RESET}"
     systemctl disable --now "${SVC_PREFIX}${name}" >/dev/null 2>&1
     rm -f "${CONF_DIR}/${name}.toml" "${LOG_DIR}/${name}.log" "${LOG_DIR}/${name}.log.1"
     systemctl reset-failed "${SVC_PREFIX}${name}" 2>/dev/null || true
-    echo -e "  ${C_R}Deleted ${name}.${C_RESET}"
+    echo -e "  ${C_G}✓ Tunnel removed successfully.${C_RESET}"
     pause
 }
 

@@ -27,8 +27,8 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
      Linux + `CAP_NET_RAW`). Packet batching, heartbeat auto-recovery, BBR/socket
      tuning.
   3. **SPF (`spf`)** — TUN + IPX-style encapsulation with **source-IP spoofing**
-     over ICMP (or a reliable TCP profile). A point-to-point obfuscation tunnel
-     between your two servers. *(beta, Linux + `CAP_NET_RAW`)*
+     over ICMP **or** TCP — both profiles rewrite the source IP. A point-to-point
+     obfuscation tunnel between your two servers. *(beta, Linux + `CAP_NET_RAW`)*
   - All protocols share the same AEAD encryption, ephemeral X25519 key exchange,
     and TCP tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a

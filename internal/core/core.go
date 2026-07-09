@@ -25,7 +25,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.6.0"
+var CoreVersion = "1.6.1"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -71,7 +71,20 @@ func Run(path string) error {
 		go serveHealth(ctx, cfg, eng, log)
 	}
 
-	err = eng.Run(ctx)
+	// Run the engine; on a termination signal, give it a brief window to clean
+	// up and then force-exit so stop/restart/delete are always fast.
+	done := make(chan error, 1)
+	go func() { done <- eng.Run(ctx) }()
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		select {
+		case err = <-done:
+		case <-time.After(3 * time.Second):
+			log.Warn("shutdown exceeded 3s — forcing exit")
+			os.Exit(0)
+		}
+	}
 	log.Info("tunnel %q stopped", cfg.Name)
 	return err
 }

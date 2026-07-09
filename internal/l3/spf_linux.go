@@ -1,16 +1,22 @@
 //go:build linux
 
-// SPF ICMP carrier with source-IP spoofing — BETA.
+// SPF carrier with source-IP spoofing — BETA (both ICMP and TCP profiles).
 //
-// SPF is a point-to-point tunnel between two servers YOU control. Each side
-// sends the encrypted frames inside ICMP echo packets whose IP SOURCE address is
-// rewritten to `spoof_src_ip` (obfuscation), routed to the peer's real IP
-// (`peer`). Inbound packets are accepted only when their source equals
-// `spoof_dst_ip` (the peer's spoofed source) — a strict point-to-point filter,
-// so this is a configured tunnel endpoint, not a general spoofing tool.
+// SPF is a point-to-point tunnel between two servers YOU control. Every
+// encrypted frame is sent as a raw IPv4 packet whose SOURCE address is rewritten
+// to spoof_src_ip and destination is the peer's real IP (peer). Inbound packets
+// are accepted only when their source equals spoof_dst_ip (the peer's spoofed
+// source) — a strict point-to-point filter. The inner envelope is chosen by
+// spf_profile:
+//   - icmp: an ICMP echo (id demultiplexes links)
+//   - tcp:  a bare TCP segment  (source port demultiplexes links)
+// Both use the SAME datagram AEAD, handshake, and link framing; only the L4
+// envelope and the spoofed IP header differ.
 //
-// Requires Linux + CAP_NET_RAW (granted by the systemd unit). NOT runtime-tested
-// in CI; validate on a real Linux host before production use.
+// Requires Linux + CAP_NET_RAW. For the tcp profile the peer kernel will emit a
+// RST for the unsolicited segments — drop them so they don't reset the flow:
+//   iptables -A OUTPUT -p tcp --sport <tunnel_port> --tcp-flags RST RST -j DROP
+// (both hosts). NOT runtime-tested in CI — validate on a real Linux host.
 package l3
 
 import (
@@ -23,34 +29,37 @@ import (
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/crypto"
-	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
+
+// ---- carrier construction --------------------------------------------------
 
 func newSPFRawCarrier(cfg *config.Config, isDialer bool, cipher string) (linkDialer, linkListener, error) {
 	spoofSrc := net.ParseIP(cfg.SpoofSrcIP).To4()
 	spoofDst := net.ParseIP(cfg.SpoofDstIP).To4()
 	peer := net.ParseIP(cfg.Peer).To4()
 	if spoofSrc == nil || spoofDst == nil || peer == nil {
-		return nil, nil, fmt.Errorf("spf: spoof_src_ip, spoof_dst_ip and peer must all be IPv4 addresses")
+		return nil, nil, fmt.Errorf("spf: spoof_src_ip, spoof_dst_ip and peer must be IPv4 addresses")
 	}
+	codec := codecFor(cfg.SpfProfile)
 	if isDialer {
-		return &spfLinkDialer{spoofSrc: spoofSrc, spoofDst: spoofDst, peer: peer, cipher: cipher}, nil, nil
+		return &spfLinkDialer{codec: codec, spoofSrc: spoofSrc, spoofDst: spoofDst, peer: peer,
+			tunnelPort: cfg.TunnelPort, cipher: cipher}, nil, nil
 	}
-	rc, err := openRawICMP()
+	rc, err := openRawIPv4(codec.network())
 	if err != nil {
 		return nil, nil, err
 	}
-	l := &spfLinkListener{rc: rc, spoofSrc: spoofSrc, spoofDst: spoofDst, peer: peer, cipher: cipher,
-		flows: map[int]*spfFlow{}, accept: make(chan *spfFlow, 64), closed: make(chan struct{})}
+	l := &spfLinkListener{codec: codec, rc: rc, spoofSrc: spoofSrc, spoofDst: spoofDst, peer: peer,
+		tunnelPort: cfg.TunnelPort, cipher: cipher, flows: map[int]*spfFlow{}, accept: make(chan *spfFlow, 64), closed: make(chan struct{})}
 	go l.route()
 	return nil, l, nil
 }
 
-func openRawICMP() (*ipv4.RawConn, error) {
-	c, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+func openRawIPv4(network string) (*ipv4.RawConn, error) {
+	c, err := net.ListenPacket(network, "0.0.0.0")
 	if err != nil {
-		return nil, fmt.Errorf("spf raw socket: %w (needs CAP_NET_RAW)", err)
+		return nil, fmt.Errorf("spf raw socket %s: %w (needs CAP_NET_RAW)", network, err)
 	}
 	rc, err := ipv4.NewRawConn(c)
 	if err != nil {
@@ -60,39 +69,36 @@ func openRawICMP() (*ipv4.RawConn, error) {
 	return rc, nil
 }
 
-// writeEcho crafts an IP+ICMP echo packet with a spoofed source and sends it.
-func writeEcho(rc *ipv4.RawConn, spoofSrc, dst net.IP, typ icmp.Type, id, seq int, data []byte) error {
-	msg := icmp.Message{Type: typ, Code: 0, Body: &icmp.Echo{ID: id, Seq: seq, Data: data}}
-	b, err := msg.Marshal(nil)
-	if err != nil {
-		return err
-	}
+// writeSpoofed wraps L4 bytes in an IP header with a spoofed source and sends it.
+func writeSpoofed(rc *ipv4.RawConn, proto int, spoofSrc, dst net.IP, l4 []byte) error {
 	h := &ipv4.Header{
 		Version:  ipv4.Version,
 		Len:      ipv4.HeaderLen,
-		TotalLen: ipv4.HeaderLen + len(b),
+		TotalLen: ipv4.HeaderLen + len(l4),
 		TTL:      64,
-		Protocol: 1, // ICMP
+		Protocol: proto,
 		Src:      spoofSrc,
 		Dst:      dst,
 	}
-	return rc.WriteTo(h, b, nil)
+	return rc.WriteTo(h, l4, nil)
 }
 
 // ---- dialer / client -------------------------------------------------------
 
 type spfLinkDialer struct {
+	codec                    spfCodec
 	spoofSrc, spoofDst, peer net.IP
+	tunnelPort               int
 	cipher                   string
 }
 
 func (d *spfLinkDialer) DialLink(_ context.Context) (link, error) {
-	rc, err := openRawICMP()
+	rc, err := openRawIPv4(d.codec.network())
 	if err != nil {
 		return nil, err
 	}
-	conn := &spfConn{rc: rc, spoofSrc: d.spoofSrc, spoofDst: d.spoofDst, peer: d.peer,
-		id: rand.Intn(0xfffe) + 1, echoType: ipv4.ICMPTypeEcho}
+	conn := &spfConn{codec: d.codec, rc: rc, spoofSrc: d.spoofSrc, spoofDst: d.spoofDst, peer: d.peer,
+		tunnelPort: d.tunnelPort, key: rand.Intn(0xfffe) + 1}
 	dg, err := crypto.ClientHandshakePacket(conn, d.cipher)
 	if err != nil {
 		_ = rc.Close()
@@ -102,18 +108,21 @@ func (d *spfLinkDialer) DialLink(_ context.Context) (link, error) {
 }
 func (d *spfLinkDialer) Close() error { return nil }
 
-// spfConn is one client-side SPF flow as a net.Conn.
 type spfConn struct {
+	codec                    spfCodec
 	rc                       *ipv4.RawConn
 	spoofSrc, spoofDst, peer net.IP
-	id                       int
+	tunnelPort, key          int
 	seq                      uint32
-	echoType                 icmp.Type
 }
 
 func (c *spfConn) Write(b []byte) (int, error) {
 	c.seq++
-	if err := writeEcho(c.rc, c.spoofSrc, c.peer, c.echoType, c.id, int(c.seq&0xffff), b); err != nil {
+	l4, err := c.codec.encode(c.spoofSrc, c.peer, c.key, c.tunnelPort, int(c.seq&0xffff), b, false)
+	if err != nil {
+		return 0, err
+	}
+	if err := writeSpoofed(c.rc, c.codec.proto(), c.spoofSrc, c.peer, l4); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -129,7 +138,7 @@ func (c *spfConn) Read(b []byte) (int, error) {
 		if !h.Src.Equal(c.spoofDst) { // strict point-to-point source filter
 			continue
 		}
-		data, ok := parseEchoAny(p, c.id)
+		data, ok := c.codec.matchClient(p, c.key, c.tunnelPort)
 		if !ok {
 			continue
 		}
@@ -147,8 +156,10 @@ func (c *spfConn) RemoteAddr() net.Addr               { return &net.IPAddr{IP: c
 // ---- listener / server -----------------------------------------------------
 
 type spfLinkListener struct {
+	codec                    spfCodec
 	rc                       *ipv4.RawConn
 	spoofSrc, spoofDst, peer net.IP
+	tunnelPort               int
 	cipher                   string
 
 	mu     sync.Mutex
@@ -170,24 +181,24 @@ func (l *spfLinkListener) route() {
 		if !h.Src.Equal(l.spoofDst) {
 			continue
 		}
-		data, id, ok := parseEchoRequestAny(p)
+		data, key, ok := l.codec.parseServer(p, l.tunnelPort)
 		if !ok {
 			continue
 		}
 		l.mu.Lock()
-		f := l.flows[id]
+		f := l.flows[key]
 		l.mu.Unlock()
 		pkt := make([]byte, len(data))
 		copy(pkt, data)
 		if f == nil {
-			f = &spfFlow{l: l, id: id, in: make(chan []byte, 256), firstMsg: pkt, closed: make(chan struct{})}
+			f = &spfFlow{l: l, key: key, in: make(chan []byte, 256), firstMsg: pkt, closed: make(chan struct{})}
 			l.mu.Lock()
-			l.flows[id] = f
+			l.flows[key] = f
 			l.mu.Unlock()
 			select {
 			case l.accept <- f:
 			default:
-				l.remove(id)
+				l.remove(key)
 			}
 		} else {
 			select {
@@ -199,9 +210,9 @@ func (l *spfLinkListener) route() {
 	}
 }
 
-func (l *spfLinkListener) remove(id int) {
+func (l *spfLinkListener) remove(key int) {
 	l.mu.Lock()
-	delete(l.flows, id)
+	delete(l.flows, key)
 	l.mu.Unlock()
 }
 
@@ -228,7 +239,7 @@ func (l *spfLinkListener) Close() error {
 
 type spfFlow struct {
 	l        *spfLinkListener
-	id       int
+	key      int
 	in       chan []byte
 	firstMsg []byte
 	seq      uint32
@@ -265,7 +276,11 @@ func (f *spfFlow) Read(b []byte) (int, error) {
 
 func (f *spfFlow) Write(b []byte) (int, error) {
 	f.seq++
-	if err := writeEcho(f.l.rc, f.l.spoofSrc, f.l.peer, ipv4.ICMPTypeEchoReply, f.id, int(f.seq&0xffff), b); err != nil {
+	l4, err := f.l.codec.encode(f.l.spoofSrc, f.l.peer, f.key, f.l.tunnelPort, int(f.seq&0xffff), b, true)
+	if err != nil {
+		return 0, err
+	}
+	if err := writeSpoofed(f.l.rc, f.l.codec.proto(), f.l.spoofSrc, f.l.peer, l4); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -278,35 +293,10 @@ func (f *spfFlow) SetReadDeadline(t time.Time) error {
 	return nil
 }
 func (f *spfFlow) Close() error {
-	f.closeOnce.Do(func() { close(f.closed); f.l.remove(f.id) })
+	f.closeOnce.Do(func() { close(f.closed); f.l.remove(f.key) })
 	return nil
 }
 func (f *spfFlow) SetWriteDeadline(t time.Time) error { return nil }
 func (f *spfFlow) SetDeadline(t time.Time) error      { return f.SetReadDeadline(t) }
 func (f *spfFlow) LocalAddr() net.Addr                { return &net.IPAddr{IP: f.l.spoofSrc} }
 func (f *spfFlow) RemoteAddr() net.Addr               { return &net.IPAddr{IP: f.l.peer} }
-
-// parseEchoAny returns the Echo data for either request or reply with the id.
-func parseEchoAny(raw []byte, wantID int) ([]byte, bool) {
-	m, err := icmp.ParseMessage(1, raw)
-	if err != nil {
-		return nil, false
-	}
-	echo, ok := m.Body.(*icmp.Echo)
-	if !ok || echo.ID != wantID {
-		return nil, false
-	}
-	return echo.Data, true
-}
-
-func parseEchoRequestAny(raw []byte) ([]byte, int, bool) {
-	m, err := icmp.ParseMessage(1, raw)
-	if err != nil || m.Type != ipv4.ICMPTypeEcho {
-		return nil, 0, false
-	}
-	echo, ok := m.Body.(*icmp.Echo)
-	if !ok {
-		return nil, 0, false
-	}
-	return echo.Data, echo.ID, true
-}

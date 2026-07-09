@@ -158,23 +158,26 @@ TUN traffic is identical in all modes; only the envelope changes.
 
 SPF is the TUN engine plus **IPX-style encapsulation with source-IP spoofing**.
 It builds the same private `10.10.10.0/24` interface, but wraps the encrypted
-frames in ICMP echo packets whose **IP source is rewritten** to `spoof_src_ip`,
-routed to the peer's real IP (`peer`). It is a **point-to-point** tunnel between
-two servers you control — inbound packets are accepted only when their source is
-`spoof_dst_ip` (the peer's spoofed source), so this is a configured tunnel
-endpoint, not a general spoofing tool.
+frames in an L4 envelope (ICMP echo or a bare TCP segment) whose **IP source is
+rewritten** to `spoof_src_ip`, routed to the peer's real IP (`peer`). It is a
+**point-to-point** tunnel between two servers you control — inbound packets are
+accepted only when their source is `spoof_dst_ip` (the peer's spoofed source), so
+this is a configured tunnel endpoint, not a general spoofing tool.
 
 - **Reversed on the two sides:** Iran uses `spoof_src=Iran, spoof_dst=Foreign`;
   Foreign uses `spoof_src=Foreign, spoof_dst=Iran`. Both sides need the other's
   real IP in `peer`.
-- **Profiles:** `icmp` (source-spoofed, raw sockets, beta) or `tcp` (a reliable
-  TCP carrier with IPX framing, no spoofing — stateless TCP spoofing is
-  impractical).
+- **Profiles — both spoof the source IP:** `icmp` demultiplexes links by the
+  echo `id`; `tcp` sends bare TCP segments (source port demultiplexes links) with
+  a spoofed IP header. Both go through the same raw-socket carrier; only the L4
+  envelope differs.
 - **Crypto/link reuse:** SPF reuses the same datagram AEAD, handshake, batching,
   heartbeat, and reconnect as the UDP/ICMP carriers; only the packet envelope and
   the spoofed IP header differ (built with `x/net/ipv4.RawConn`).
-- **Requirements:** Linux + `CAP_NET_RAW`; on the `icmp` profile also
-  `sysctl -w net.ipv4.icmp_echo_ignore_all=1` on both hosts.
+- **Requirements:** Linux + `CAP_NET_RAW`. On the `icmp` profile also
+  `sysctl -w net.ipv4.icmp_echo_ignore_all=1` on both hosts. On the `tcp` profile
+  drop the kernel's RST for the unsolicited segments on both hosts:
+  `iptables -A OUTPUT -p tcp --sport <tunnel_port> --tcp-flags RST RST -j DROP`.
 - **Validation:** `spoof_src_ip`/`spoof_dst_ip` must be valid IPs and differ;
   `spf_profile ∈ {icmp, tcp}`; the TUN addressing checks also apply.
 

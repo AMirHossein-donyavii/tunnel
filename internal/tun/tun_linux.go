@@ -69,6 +69,14 @@ func createQueue(name string, flags uint16) (*os.File, string, error) {
 		unix.Close(fd)
 		return nil, "", fmt.Errorf("TUNSETIFF: %w", errno)
 	}
+	// Put the fd in non-blocking mode so os.NewFile registers it with the Go
+	// runtime poller. This lets a blocked Read be interrupted immediately when
+	// the fd is Closed (fast, deterministic shutdown) instead of hanging until
+	// the next packet arrives.
+	if err := unix.SetNonblock(fd, true); err != nil {
+		unix.Close(fd)
+		return nil, "", fmt.Errorf("set nonblock: %w", err)
+	}
 	real := string(bytes.TrimRight(req[:ifnamsiz], "\x00"))
 	return os.NewFile(uintptr(fd), "/dev/net/tun"), real, nil
 }
