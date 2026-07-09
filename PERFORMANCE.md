@@ -60,10 +60,10 @@ The L3 engine (`engine = "l3"`) has its own knobs:
   hashes each flow to a fixed queue, so ordering is preserved while flows spread
   across cores. Keep `pool ≈ CPU cores` — more queues than cores just share
   cores (the core logs a warning if you overshoot).
-- **`batch_size`** (default 32) — packets coalesced into one write. Higher values
+- **`batch_size`** (default 64) — packets coalesced into one write. Higher values
   raise throughput for bulk transfers and lower syscall/CPU cost; very high
   values add a little latency. The 2 ms flush timer bounds latency regardless.
-- **`channel_size`** (default 512) — per-queue buffer depth. Raise it for very
+- **`channel_size`** (default 1024) — per-queue buffer depth. Raise it for very
   bursty traffic; lower it to cap memory on tiny VPS.
 - **`so_sndbuf` / `so_rcvbuf`** — socket buffers. Left at 0 they follow the
   profile (fast = 4 MiB, balance = 1 MiB, resource = 256 KiB). For high

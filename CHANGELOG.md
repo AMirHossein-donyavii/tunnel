@@ -4,6 +4,43 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-07-09
+
+Adds the SPF protocol, fixes the update-then-reload flow, and applies a measured
+performance pass.
+
+### Fixed
+- **Update now reloads automatically.** Panel option 8 downloads + verifies the
+  new version, and on success **re-execs `et`** so you're immediately on the new
+  build (no manual restart). On failure it keeps the previous version and says so.
+
+### Added
+- **SPF protocol (`spf`) — beta.** TUN + IPX-style encapsulation with **source-IP
+  spoofing** over ICMP (raw sockets) or a reliable TCP profile. A point-to-point
+  obfuscation tunnel between two servers you control: outgoing packets use
+  `spoof_src_ip`; inbound are accepted only from `spoof_dst_ip` (reversed on the
+  two sides). New config: `spf_profile`, `encapsulation`, `spoof_src_ip`,
+  `spoof_dst_ip`. Panel offers it as protocol #3. Reuses the datagram AEAD, link,
+  batching, heartbeat, and reconnect from the TUN carriers. Linux + `CAP_NET_RAW`;
+  compiled + cross-built + framing/validation tested, **not runtime-verified in
+  CI** — validate on a Linux host. `configs/example-spf.toml` added.
+
+### Performance (reviewed against the reference tuning config)
+- **Applied:** `batch_size` default 32→**64** (fills the ~60 KiB TCP frame →
+  fewer frames/syscalls); `channel_size` default 512→**1024** (better burst
+  absorption at modest RAM). Latency still bounded by the 2 ms flush.
+- **Rejected:** `kdf_iterations=100000` — we derive keys from ECDH + HKDF, not a
+  password, so PBKDF-style iterations would burn CPU per handshake for **zero**
+  benefit. `algorithm="aes-256-gcm"` not forced — ChaCha20 wins without AES-NI
+  and both ends must match, so the default stays `chacha20-poly1305` (panel still
+  offers AES). `so_sndbuf=0` not adopted — our profile-based buffers beat the OS
+  default on high-BDP links. `workers=0`/`auto_tuning` already present.
+
+### Verified
+- linux amd64/arm64/armv7 build (incl. SPF); `go vet` clean; tests green incl.
+  `-race`; mux tunnel loopback still forwards; SPF (both profiles) + spoof
+  validation pass; bad/missing spoof rejected.
+
 ## [1.5.0] — 2026-07-09
 
 Adds selectable **TUN carrier modes** and removes the Direct direction.

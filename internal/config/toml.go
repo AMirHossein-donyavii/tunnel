@@ -46,6 +46,14 @@ func assign(c *Config, key, val string) error {
 		c.Peer = unquote(val)
 	case "tun_mode":
 		c.TunMode = unquote(val)
+	case "spf_profile":
+		c.SpfProfile = unquote(val)
+	case "encapsulation":
+		c.Encapsulation = unquote(val)
+	case "spoof_src_ip":
+		c.SpoofSrcIP = unquote(val)
+	case "spoof_dst_ip":
+		c.SpoofDstIP = unquote(val)
 	case "tun_ip":
 		c.TunIP = unquote(val)
 	case "tun_ip6":
@@ -208,6 +216,12 @@ func (c *Config) Marshal() string {
 	if c.IsTUN() {
 		kv("tun_mode", c.TunMode)
 	}
+	if c.IsSPF() {
+		kv("spf_profile", c.SpfProfile)
+		kv("encapsulation", c.Encapsulation)
+		kv("spoof_src_ip", c.SpoofSrcIP)
+		kv("spoof_dst_ip", c.SpoofDstIP)
+	}
 	if c.TunIP != "" {
 		kv("tun_ip", c.TunIP)
 	}
@@ -227,7 +241,7 @@ func (c *Config) Marshal() string {
 	kv("log_level", c.LogLevel)
 	kb("proxy_protocol", c.ProxyProtocol)
 
-	if c.IsTUN() {
+	if c.UsesL3() {
 		ki("heartbeat_interval", c.HeartbeatInterval)
 		ki("heartbeat_timeout", c.HeartbeatTimeout)
 		if c.BatchSize > 0 {

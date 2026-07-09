@@ -176,11 +176,12 @@ create_tunnel() {
     echo; echo -e "  Tunnel protocol:"
     echo -e "    ${C_G}1)${C_RESET} TCP Reverse Tunnel — multiplexed, lowest latency ${C_Y}[recommended, default]${C_RESET}"
     echo -e "    ${C_G}2)${C_RESET} TUN                — virtual network interface, routes all IP traffic"
+    echo -e "    ${C_G}3)${C_RESET} SPF                — TUN + IPX encapsulation with IP spoofing ${C_Y}[beta]${C_RESET}"
     local engine transport="tcp"
-    [ "$(ask_choice "Select" "1" 2)" = "2" ] && engine="tun" || engine="mux"
+    case "$(ask_choice "Select" "1" 3)" in 2) engine="tun";; 3) engine="spf";; *) engine="mux";; esac
 
     # TUN carrier mode. Shown immediately after selecting TUN.
-    local tun_mode="tcp"
+    local tun_mode="tcp" spf_profile="icmp" spoof_src="" spoof_dst=""
     if [ "$engine" = "tun" ]; then
         echo; echo -e "  ${C_BOLD}TUN mode${C_RESET} (how the encrypted tunnel between the servers is carried):"
         echo -e "    ${C_G}1)${C_RESET} TCP  — TCP transport over the TUN network ${C_Y}[recommended]${C_RESET}"
@@ -192,6 +193,11 @@ create_tunnel() {
         case "$(ask_choice "Select" "1" 4)" in
             2) tun_mode="udp";; 3) tun_mode="icmp";; 4) tun_mode="bip";; *) tun_mode="tcp";;
         esac
+    elif [ "$engine" = "spf" ]; then
+        echo; echo -e "  ${C_BOLD}SPF transport${C_RESET} (IPX-style encapsulation):"
+        echo -e "    ${C_G}1)${C_RESET} ICMP — inside ICMP echo, with source-IP spoofing ${C_Y}[beta, Linux, CAP_NET_RAW]${C_RESET}"
+        echo -e "    ${C_G}2)${C_RESET} TCP  — reliable TCP carrier (IPX framing, no spoofing)"
+        [ "$(ask_choice "Select" "1" 2)" = "2" ] && spf_profile="tcp" || spf_profile="icmp"
     fi
 
     # Direction is fixed: reverse (Kharej dials Iran). Direct mode was removed.
@@ -206,9 +212,14 @@ create_tunnel() {
         echo -e "  ${C_R}A tunnel named '$name' already exists — choose another.${C_RESET}"
     done
 
-    # Reverse mode: the Foreign (Kharej) server dials, so it needs the peer address.
+    # Reverse mode: the Foreign (Kharej) server dials, so it needs Iran's address.
+    # SPF needs the peer's real public IP on BOTH sides (for spoofed routing).
     local peer=""
-    [ "$role" = "kharej" ] && peer="$(ask_req "Iran server public IP or hostname")"
+    if [ "$role" = "kharej" ]; then
+        peer="$(ask_req "Iran server public IP or hostname")"
+    elif [ "$engine" = "spf" ]; then
+        peer="$(ask_req "Foreign server public IP (SPF needs the peer's real IP)")"
+    fi
 
     local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health
     local tun_ip="" peer_tun_ip="" forwards_toml="[]" proxy="false"
@@ -225,10 +236,10 @@ create_tunnel() {
     echo -e "  ${C_G}Encryption is automatic${C_RESET} (ephemeral X25519 — no key to share)."
     echo -e "  ${C_Y}Security:${C_RESET} restrict the tunnel port (${tunnel_port}) to the peer's IP in your firewall."
 
-    if [ "$engine" = "tun" ]; then
-        echo; echo -e "  ${C_C}TUN creates a private virtual network (default 10.10.10.0/24) between the"
-        echo -e "  two servers: Iran uses 10.10.10.1, Foreign uses 10.10.10.2. TCP, UDP, ICMP and"
-        echo -e "  IPv6 ICMP traffic all flow through it via the assigned tunnel IPs.${C_RESET}"
+    if [ "$engine" = "tun" ] || [ "$engine" = "spf" ]; then
+        echo; echo -e "  ${C_C}Creates a private virtual network (default 10.10.10.0/24) between the two"
+        echo -e "  servers: Iran uses 10.10.10.1, Foreign uses 10.10.10.2. All IP traffic flows"
+        echo -e "  through it via the assigned tunnel IPs.${C_RESET}"
         iface="$(ask_name "Tunnel interface name" "emergency-tun")"
         local def_ip def_peer
         if [ "$role" = "iran" ]; then def_ip="10.10.10.1/24"; def_peer="10.10.10.2"
@@ -240,6 +251,16 @@ create_tunnel() {
             if valid_ipv4 "$peer_tun_ip" && [ "$peer_tun_ip" != "${tun_ip%/*}" ]; then break; fi
             echo -e "  ${C_R}Enter a valid IP in the tunnel subnet, different from ${tun_ip%/*}.${C_RESET}"
         done
+        if [ "$engine" = "spf" ]; then
+            echo; echo -e "  ${C_C}SPF source-IP spoofing (point-to-point between YOUR two servers only)."
+            echo -e "  These two values are REVERSED on the other server.${C_RESET}"
+            spoof_src="$(ask_ip "spoof_src_ip (source written on outgoing packets)")"
+            while true; do
+                spoof_dst="$(ask_ip "spoof_dst_ip (expected source of the peer's packets)")"
+                [ "$spoof_dst" != "$spoof_src" ] && break
+                echo -e "  ${C_R}spoof_dst_ip must differ from spoof_src_ip.${C_RESET}"
+            done
+        fi
     else
         # mux: VPN/listen ports live only on the Iran (entry) side.
         if [ "$role" = "iran" ]; then
@@ -259,8 +280,8 @@ create_tunnel() {
     fi
 
     write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$tunnel_port" \
-        "$tun_mode" "$tun_ip" "$peer_tun_ip" "$iface" "$mtu" "$workers" "$pool" "$cipher" \
-        "$health" "$profile" "$proxy" "$forwards_toml"
+        "$tun_mode" "$spf_profile" "$spoof_src" "$spoof_dst" "$tun_ip" "$peer_tun_ip" \
+        "$iface" "$mtu" "$workers" "$pool" "$cipher" "$health" "$profile" "$proxy" "$forwards_toml"
 
     echo; echo -e "  ${C_C}Validating configuration...${C_RESET}"
     if ! "$CORE" validate --config "${CONF_DIR}/${name}.toml"; then
@@ -290,8 +311,9 @@ csv_to_toml_array() { # "a,b,c" -> ["a", "b", "c"]
 
 write_config() {
     local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" tunnel="$7" \
-          tun_mode="$8" tun_ip="$9" peer_tun_ip="${10}" iface="${11}" mtu="${12}" workers="${13}" \
-          pool="${14}" cipher="${15}" health="${16}" profile="${17}" proxy="${18}" forwards="${19}"
+          tun_mode="$8" spf_profile="$9" spoof_src="${10}" spoof_dst="${11}" tun_ip="${12}" \
+          peer_tun_ip="${13}" iface="${14}" mtu="${15}" workers="${16}" pool="${17}" \
+          cipher="${18}" health="${19}" profile="${20}" proxy="${21}" forwards="${22}"
     install -d -m 0750 "$CONF_DIR"
     umask 077
     {
@@ -314,6 +336,14 @@ write_config() {
         echo "heartbeat_timeout = 25"
         if [ "$engine" = "tun" ]; then
             echo "tun_mode = \"$tun_mode\""
+            echo "tun_iface = \"$iface\""
+            [ -n "$tun_ip" ]      && echo "tun_ip = \"$tun_ip\""
+            [ -n "$peer_tun_ip" ] && echo "peer_tun_ip = \"$peer_tun_ip\""
+        elif [ "$engine" = "spf" ]; then
+            echo "spf_profile = \"$spf_profile\""
+            echo "encapsulation = \"ipx\""
+            echo "spoof_src_ip = \"$spoof_src\""
+            echo "spoof_dst_ip = \"$spoof_dst\""
             echo "tun_iface = \"$iface\""
             [ -n "$tun_ip" ]      && echo "tun_ip = \"$tun_ip\""
             [ -n "$peer_tun_ip" ] && echo "peer_tun_ip = \"$peer_tun_ip\""
@@ -393,14 +423,34 @@ update_core() {
     local cur; cur="$(core_version)"
     echo -e "  Installed core: ${C_G}v${cur}${C_RESET}"
     echo -e "  Update source:  ${C_C}${url}${C_RESET}"
-    echo -e "  (the installer verifies checksums and restarts active tunnels)"
+    echo -e "  (the installer verifies checksums and restarts active tunnels, then this panel reloads)"
     yesno "Proceed with update?" "n" || { pause; return; }
-    if have curl; then
-        curl -fsSL "${url}" | bash || echo -e "  ${C_R}Update failed.${C_RESET}"
-    else
-        echo -e "  ${C_R}curl not available.${C_RESET}"
+    have curl || { echo -e "  ${C_R}curl not available.${C_RESET}"; pause; return; }
+
+    # Download first so a failed fetch never runs a partial installer.
+    local tmp; tmp="$(mktemp)"
+    echo -e "  ${C_C}Downloading update...${C_RESET}"
+    if ! curl -fsSL "${url}" -o "$tmp" || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo -e "  ${C_R}✗ Download failed — keeping the current version (v${cur}).${C_RESET}"
+        pause; return
     fi
-    pause
+    # Run the installer with stdin detached so it doesn't prompt to relaunch;
+    # we handle the reload ourselves only if it succeeds.
+    echo -e "  ${C_C}Installing...${C_RESET}"
+    if bash "$tmp" </dev/null; then
+        rm -f "$tmp"
+        local new; new="$(core_version)"
+        echo -e "  ${C_G}✓ Updated: v${cur} -> v${new}. Reloading panel...${C_RESET}"
+        sleep 1
+        # Replace the running (old) panel with the freshly installed one.
+        exec et 2>/dev/null || exec /usr/local/bin/et 2>/dev/null || {
+            echo -e "  ${C_Y}Update installed; please run 'et' again.${C_RESET}"; exit 0; }
+    else
+        rm -f "$tmp"
+        echo -e "  ${C_R}✗ Update failed — the previous version (v${cur}) is unchanged.${C_RESET}"
+        pause
+    fi
 }
 
 system_info() {

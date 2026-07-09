@@ -38,6 +38,60 @@ func TestValidateTUNModes(t *testing.T) {
 	}
 }
 
+func baseSPF() Config {
+	c := Defaults()
+	c.Name = "s"
+	c.Role = RoleKharej
+	c.Engine = EngineSPF
+	c.Peer = "203.0.113.10"
+	c.TunIP = "10.10.10.2/24"
+	c.PeerTunIP = "10.10.10.1"
+	c.SpfProfile = SpfProfileICMP
+	c.SpoofSrcIP = "5.34.222.4"
+	c.SpoofDstIP = "195.62.4.29"
+	return c
+}
+
+func TestValidateSPF(t *testing.T) {
+	for _, p := range []string{SpfProfileICMP, SpfProfileTCP} {
+		c := baseSPF()
+		c.SpfProfile = p
+		if err := c.Validate(); err != nil {
+			t.Fatalf("valid spf (%s) rejected: %v", p, err)
+		}
+	}
+}
+
+func TestValidateSPFSpoofRequired(t *testing.T) {
+	c := baseSPF()
+	c.SpoofSrcIP = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: spoof_src_ip required")
+	}
+	c = baseSPF()
+	c.SpoofDstIP = c.SpoofSrcIP // equal
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: spoof src == dst")
+	}
+	c = baseSPF()
+	c.SpfProfile = "quic"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: invalid spf_profile")
+	}
+}
+
+func TestUsesL3(t *testing.T) {
+	spf, tun := baseSPF(), baseTUN()
+	if !spf.UsesL3() || !tun.UsesL3() {
+		t.Fatal("SPF and TUN should use the L3 data plane")
+	}
+	c := Defaults()
+	c.Engine = EngineMux
+	if c.UsesL3() {
+		t.Fatal("mux should not use L3")
+	}
+}
+
 func TestDirectModeRejected(t *testing.T) {
 	c := baseTUN()
 	c.Mode = "direct"

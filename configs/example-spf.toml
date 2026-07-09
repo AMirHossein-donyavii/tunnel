@@ -1,0 +1,48 @@
+# Emergency Tunnel — example SPF configuration  (BETA)
+#
+# SPF = TUN + IPX-style encapsulation with source-IP SPOOFING. It creates the
+# same private virtual network as TUN (default 10.10.10.0/24), but carries the
+# encrypted frames inside ICMP echo packets whose IP source is rewritten to
+# spoof_src_ip (obfuscation). It is a point-to-point tunnel between the two
+# servers YOU control; inbound packets are accepted only from spoof_dst_ip.
+#
+# Requirements: Linux + CAP_NET_RAW (granted by the systemd unit). On the ICMP
+# profile, also disable the kernel's auto-reply so it doesn't answer the tunnel's
+# pings:   sysctl -w net.ipv4.icmp_echo_ignore_all=1
+#
+# BETA: cross-compiled and framing-tested, but validate on a Linux host first.
+#
+# This is the FOREIGN (Kharej) side. The Iran side reverses the spoof values:
+#   Iran:    spoof_src_ip = <Iran spoof>,    spoof_dst_ip = <Foreign spoof>
+#   Foreign: spoof_src_ip = <Foreign spoof>, spoof_dst_ip = <Iran spoof>
+
+name = "spf-foreign"
+role = "kharej"            # kharej = Foreign; iran = Iran
+engine = "spf"
+mode = "reverse"
+
+# Real public IP of the OTHER server (SPF needs this on BOTH sides for routing).
+peer = "203.0.113.10"
+tunnel_port = 1234
+
+spf_profile = "icmp"       # icmp (source-spoofed, beta) | tcp (reliable, no spoof)
+encapsulation = "ipx"
+
+# Source-IP spoofing (reversed on the Iran side). Point-to-point only.
+spoof_src_ip = "5.34.222.4"     # written as the source of our outgoing packets
+spoof_dst_ip = "195.62.4.29"    # expected source of the peer's packets (inbound filter)
+
+# Private tunnel network (same subnet both sides):
+tun_ip = "10.10.10.2/24"        # Iran: 10.10.10.1/24
+peer_tun_ip = "10.10.10.1"
+tun_iface = "emergency-tun"
+mtu = 1280                       # a little lower for ICMP/IP overhead
+
+pool = 4
+workers = 0
+cipher = "chacha20-poly1305"
+health_port = 9090
+profile = "fast"
+log_level = "info"
+heartbeat_interval = 10
+heartbeat_timeout = 25

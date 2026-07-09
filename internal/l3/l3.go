@@ -70,12 +70,18 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		mode:        cfg.TunMode,
 		queues:      cfg.Pool,
 		isDialer:    cfg.IsDialer(),
-		batchSize:   orDefault(cfg.BatchSize, 32),
-		channelSize: orDefault(cfg.ChannelSize, 512),
+		// Defaults tuned for throughput without wasting RAM: a 64-packet batch
+		// fills the ~60 KiB TCP frame (fewer frames/syscalls), and a 1024-deep
+		// per-queue channel absorbs bursts. The 2 ms flush still bounds latency.
+		batchSize:   orDefault(cfg.BatchSize, 64),
+		channelSize: orDefault(cfg.ChannelSize, 1024),
 		pktLen:      cfg.MTU + 4,
 		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, 10)) * time.Second,
 		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, 25)) * time.Second,
 		nowSec:      func() int64 { return time.Now().Unix() },
+	}
+	if cfg.IsSPF() {
+		e.mode = "spf"
 	}
 	if e.mode == "" {
 		e.mode = config.TunModeTCP
@@ -108,6 +114,12 @@ func (e *Engine) buildCarrier(cfg *config.Config, log *logx.Logger) error {
 		}
 	case config.TunModeICMP, config.TunModeBIP:
 		d, l, err := newICMPCarrier(e.mode, cfg, e.isDialer, e.cipher)
+		if err != nil {
+			return err
+		}
+		e.ldialer, e.llistener = d, l
+	case "spf":
+		d, l, err := newSPFCarrier(cfg, log, e.isDialer, e.cipher, tune)
 		if err != nil {
 			return err
 		}
@@ -153,8 +165,13 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.log.Warn("pool=%d queues but only %d usable cores — extra queues share cores; consider pool≈%d on both ends",
 			e.queues, cores, cores)
 	}
-	e.log.Info("TUN tunnel starting: iface=%s addr=%s mtu=%d queues=%d cipher=%s role=%s dialer=%v",
-		dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, e.cfg.Cipher, e.cfg.Role, e.isDialer)
+	label := "TUN"
+	carrier := e.mode
+	if e.cfg.IsSPF() {
+		label, carrier = "SPF", e.cfg.SpfProfile+"+spoof"
+	}
+	e.log.Info("%s tunnel starting: iface=%s addr=%s mtu=%d queues=%d carrier=%s cipher=%s role=%s dialer=%v",
+		label, dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, carrier, e.cfg.Cipher, e.cfg.Role, e.isDialer)
 	e.log.Debug("tuning: batch=%d channel=%d hb=%s/%s sndbuf=%d rcvbuf=%d",
 		e.batchSize, e.channelSize, e.hbInterval, e.hbTimeout, e.sndbuf, e.rcvbuf)
 

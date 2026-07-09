@@ -43,6 +43,11 @@ type Config struct {
 	Peer       string `toml:"peer"`        // remote host the dialer connects to
 	TunnelPort int    `toml:"tunnel_port"` // server<->server link port (same on both sides)
 	TunMode    string `toml:"tun_mode"`    // TUN carrier: tcp | udp | icmp | bip
+	// SPF (TUN + IPX-style encapsulation with source-IP spoofing) settings.
+	SpfProfile    string `toml:"spf_profile"`   // SPF carrier: icmp | tcp
+	Encapsulation string `toml:"encapsulation"` // SPF: "ipx"
+	SpoofSrcIP    string `toml:"spoof_src_ip"`  // SPF: spoofed source IP for our packets
+	SpoofDstIP    string `toml:"spoof_dst_ip"`  // SPF: peer's spoofed source (inbound filter)
 	TunIP      string `toml:"tun_ip"`      // TUN engine: this host's tunnel address (CIDR)
 	TunIP6     string `toml:"tun_ip6"`     // TUN engine: optional IPv6 tunnel address (CIDR)
 	PeerTunIP  string `toml:"peer_tun_ip"` // TUN engine: peer's tunnel address (for routing/logs)
@@ -100,6 +105,8 @@ func Defaults() Config {
 		// TCP Reverse Tunnel (multiplexed) is the primary, recommended engine.
 		Engine:            EngineMux,
 		TunMode:           TunModeTCP,
+		SpfProfile:        SpfProfileICMP,
+		Encapsulation:     "ipx",
 		HeartbeatInterval: 10,
 		HeartbeatTimeout:  25,
 	}
@@ -109,11 +116,18 @@ func Defaults() Config {
 const (
 	EngineMux = "mux" // TCP Reverse Tunnel (multiplexed streams over few links)
 	EngineTUN = "tun" // virtual network interface (L3, all IP protocols)
+	EngineSPF = "spf" // TUN + IPX-style encapsulation with source-IP spoofing
 	EngineL3  = "l3"  // deprecated alias for EngineTUN (normalised on load)
 )
 
 // IsTUN reports whether the config selects the TUN engine (accepts the "l3" alias).
 func (c *Config) IsTUN() bool { return c.Engine == EngineTUN || c.Engine == EngineL3 }
+
+// IsSPF reports whether the config selects the SPF engine.
+func (c *Config) IsSPF() bool { return c.Engine == EngineSPF }
+
+// UsesL3 reports whether the engine is built on the L3/TUN data plane.
+func (c *Config) UsesL3() bool { return c.IsTUN() || c.IsSPF() }
 
 // TUN carrier modes (how the encrypted link between the two servers is carried).
 const (
@@ -121,6 +135,12 @@ const (
 	TunModeUDP  = "udp"  // UDP datagrams (low overhead)
 	TunModeICMP = "icmp" // inside ICMP echo (IPv4) — beta, needs CAP_NET_RAW
 	TunModeBIP  = "bip"  // inside ICMPv6 echo — beta, needs CAP_NET_RAW
+)
+
+// SPF carrier profiles.
+const (
+	SpfProfileICMP = "icmp"
+	SpfProfileTCP  = "tcp"
 )
 
 // TunModeName returns a human label for a carrier mode.
@@ -166,17 +186,20 @@ func (c *Config) Validate() error {
 	if c.HealthPort != 0 && c.HealthPort == c.TunnelPort {
 		return fmt.Errorf("health_port (%d) must differ from the tunnel_port", c.HealthPort)
 	}
-	if c.Engine != EngineMux && !c.IsTUN() {
-		return fmt.Errorf("engine must be %q (TCP Reverse) or %q (TUN), got %q", EngineMux, EngineTUN, c.Engine)
+	if c.Engine != EngineMux && !c.IsTUN() && !c.IsSPF() {
+		return fmt.Errorf("engine must be %q (TCP Reverse), %q (TUN) or %q (SPF), got %q", EngineMux, EngineTUN, EngineSPF, c.Engine)
 	}
 	// The dialer side needs to know where to connect.
 	if c.dialerSide() && strings.TrimSpace(c.Peer) == "" {
 		return fmt.Errorf("peer is required on the dialing side (role=%s mode=%s)", c.Role, c.Mode)
 	}
 
-	// The TUN engine is a virtual network interface: it needs a tunnel address.
+	// The TUN/SPF engines are virtual network interfaces: they need a tunnel address.
 	if c.IsTUN() {
 		return c.validateTUN()
+	}
+	if c.IsSPF() {
+		return c.validateSPF()
 	}
 
 	// --- mux engine: VPN/listen port forwarding rules --------------------
@@ -240,6 +263,36 @@ func (c *Config) validateTUN() error {
 	}
 	if c.HeartbeatTimeout > 0 && c.HeartbeatInterval > 0 && c.HeartbeatTimeout <= c.HeartbeatInterval {
 		return fmt.Errorf("heartbeat_timeout (%d) must be greater than heartbeat_interval (%d)", c.HeartbeatTimeout, c.HeartbeatInterval)
+	}
+	return nil
+}
+
+// validateSPF validates the SPF engine: a TUN interface plus IPX-style
+// encapsulation with source-IP spoofing between the two configured endpoints.
+func (c *Config) validateSPF() error {
+	// Reuse the TUN addressing checks (tun_ip, peer_tun_ip, tun_ip6, heartbeat).
+	if err := c.validateTUN(); err != nil {
+		return err
+	}
+	switch c.SpfProfile {
+	case SpfProfileICMP, SpfProfileTCP:
+	case "":
+		c.SpfProfile = SpfProfileICMP
+	default:
+		return fmt.Errorf("spf_profile must be icmp or tcp, got %q", c.SpfProfile)
+	}
+	// Source-IP spoofing is a point-to-point tunnel feature: both spoof
+	// addresses are required, must be valid, and must differ.
+	src := net.ParseIP(strings.TrimSpace(c.SpoofSrcIP))
+	dst := net.ParseIP(strings.TrimSpace(c.SpoofDstIP))
+	if src == nil {
+		return fmt.Errorf("spoof_src_ip is required and must be a valid IP for the SPF engine")
+	}
+	if dst == nil {
+		return fmt.Errorf("spoof_dst_ip is required and must be a valid IP for the SPF engine")
+	}
+	if src.Equal(dst) {
+		return fmt.Errorf("spoof_src_ip and spoof_dst_ip must differ (they are reversed on the two servers)")
 	}
 	return nil
 }

@@ -25,7 +25,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.5.0"
+var CoreVersion = "1.6.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -50,10 +50,10 @@ func Run(path string) error {
 	log.Info("resources: workers=%d gomaxprocs=%d effective_cpus=%d profile=%s",
 		workers, runtime.GOMAXPROCS(0), sysinfo.EffectiveCPUs(), cfg.Profile)
 
-	// Select the data plane: mux = TCP Reverse Tunnel; tun = virtual interface.
+	// Select the data plane: mux = TCP Reverse Tunnel; tun/spf = virtual interface.
 	var eng engine
 	switch {
-	case cfg.IsTUN():
+	case cfg.UsesL3(): // TUN or SPF — both use the L3 data plane
 		eng, err = l3.New(cfg, log)
 	case cfg.Engine == config.EngineMux:
 		eng, err = muxeng.New(cfg, log)

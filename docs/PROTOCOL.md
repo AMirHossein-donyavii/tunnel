@@ -1,6 +1,6 @@
 # Emergency Tunnel — Protocol & Engine Architecture
 
-Emergency Tunnel ships **two tunnel protocols** behind one config, one CLI, one
+Emergency Tunnel ships **three tunnel protocols** behind one config, one CLI, one
 installer. They share the same encrypted link layer and differ only in how they
 move bytes:
 
@@ -8,6 +8,7 @@ move bytes:
 |-------------------|------------|----------|
 | **TCP Reverse Tunnel (`mux`)** | Multiplexed TCP — many user streams over a few links | Reverse proxy / CDN / gaming / thousands of connections *(recommended, default)* |
 | **TUN (`tun`)** | Virtual network interface — all IP traffic over a private subnet | Routing arbitrary IP (TCP/UDP/ICMP/ICMPv6) between two hosts, VPN-style |
+| **SPF (`spf`)** *(beta)* | TUN + IPX encapsulation with source-IP spoofing (ICMP/TCP) | DPI evasion where plain traffic is fingerprinted (Linux + `CAP_NET_RAW`) |
 
 Both use the same ephemeral-X25519 handshake and AEAD framing (below), so
 encryption is identical. (`l3` is accepted as a deprecated alias for `tun`.)
@@ -153,7 +154,35 @@ TUN traffic is identical in all modes; only the envelope changes.
 > **Direction:** the tunnel is always **reverse** (Foreign dials Iran). The old
 > "direct" mode was removed.
 
-### Health / stats port
+## The SPF protocol (`spf`) — beta
+
+SPF is the TUN engine plus **IPX-style encapsulation with source-IP spoofing**.
+It builds the same private `10.10.10.0/24` interface, but wraps the encrypted
+frames in ICMP echo packets whose **IP source is rewritten** to `spoof_src_ip`,
+routed to the peer's real IP (`peer`). It is a **point-to-point** tunnel between
+two servers you control — inbound packets are accepted only when their source is
+`spoof_dst_ip` (the peer's spoofed source), so this is a configured tunnel
+endpoint, not a general spoofing tool.
+
+- **Reversed on the two sides:** Iran uses `spoof_src=Iran, spoof_dst=Foreign`;
+  Foreign uses `spoof_src=Foreign, spoof_dst=Iran`. Both sides need the other's
+  real IP in `peer`.
+- **Profiles:** `icmp` (source-spoofed, raw sockets, beta) or `tcp` (a reliable
+  TCP carrier with IPX framing, no spoofing — stateless TCP spoofing is
+  impractical).
+- **Crypto/link reuse:** SPF reuses the same datagram AEAD, handshake, batching,
+  heartbeat, and reconnect as the UDP/ICMP carriers; only the packet envelope and
+  the spoofed IP header differ (built with `x/net/ipv4.RawConn`).
+- **Requirements:** Linux + `CAP_NET_RAW`; on the `icmp` profile also
+  `sysctl -w net.ipv4.icmp_echo_ignore_all=1` on both hosts.
+- **Validation:** `spoof_src_ip`/`spoof_dst_ip` must be valid IPs and differ;
+  `spf_profile ∈ {icmp, tcp}`; the TUN addressing checks also apply.
+
+> **Beta:** compiled and cross-built for Linux with the framing unit-tested, but
+> the raw-socket path is **not runtime-verified in CI**. Validate on a real Linux
+> host before production. TCP-Reverse and TUN(tcp/udp) are the production paths.
+
+## Health / stats port
 
 Kept, and **local-only** by design. `et-core` serves `/health` and `/stats` on
 `127.0.0.1:<health_port>` (default `9090`) — used by the panel's status view and
