@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/emergency-tunnel/et/internal/config"
+	"github.com/emergency-tunnel/et/internal/firewall"
 	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/nettune"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
@@ -104,9 +105,9 @@ func (e *Engine) buildCarrier(cfg *config.Config, log *logx.Logger) error {
 	switch e.mode {
 	case config.TunModeUDP:
 		if e.isDialer {
-			e.ldialer = &udpLinkDialer{addr: net.JoinHostPort(cfg.Peer, strconv.Itoa(cfg.TunnelPort)), cipher: e.cipher}
+			e.ldialer = &udpLinkDialer{addr: net.JoinHostPort(cfg.Peer, strconv.Itoa(cfg.TunnelPort)), cipher: e.cipher, sndbuf: e.sndbuf, rcvbuf: e.rcvbuf}
 		} else {
-			l, err := newUDPListener(cfg.TunnelPort, e.cipher)
+			l, err := newUDPListener(cfg.TunnelPort, e.sndbuf, e.rcvbuf, e.cipher)
 			if err != nil {
 				return err
 			}
@@ -176,6 +177,16 @@ func (e *Engine) Run(ctx context.Context) error {
 		label, dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, carrier, e.cfg.Cipher, e.cfg.Role, e.isDialer)
 	e.log.Debug("tuning: batch=%d channel=%d hb=%s/%s sndbuf=%d rcvbuf=%d",
 		e.batchSize, e.channelSize, e.hbInterval, e.hbTimeout, e.sndbuf, e.rcvbuf)
+
+	// Port forwarding: DNAT the configured VPN/service ports across the tunnel to
+	// the peer. Applied once the interface is up and torn down on shutdown. A
+	// failure here is logged but never stops the data plane.
+	if firewall.Enabled(e.cfg) {
+		if err := firewall.Apply(e.cfg, dev.Name(), e.log); err != nil {
+			e.log.Warn("port forwarding not applied (tunnel continues): %v", err)
+		}
+		defer firewall.Remove(e.cfg, e.log)
+	}
 
 	// One persistent reader per queue feeds a bounded channel. This survives
 	// link reconnects without leaking a blocked TUN read.

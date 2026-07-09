@@ -25,7 +25,7 @@ mode = "reverse"
 peer = "203.0.113.10"
 tunnel_port = 1234
 
-spf_profile = "icmp"       # icmp (source-spoofed, beta) | tcp (reliable, no spoof)
+spf_profile = "icmp"       # icmp | tcp — both source-spoofed (beta, Linux+CAP_NET_RAW)
 encapsulation = "ipx"
 
 # Source-IP spoofing (reversed on the Iran side). Point-to-point only.
@@ -46,3 +46,9 @@ profile = "fast"
 log_level = "info"
 heartbeat_interval = 10
 heartbeat_timeout = 25
+
+# Optional port forwarding: DNAT these ports across the tunnel to peer_tun_ip
+# (both TCP and UDP). Requires peer_tun_ip; the panel enables/persists
+# net.ipv4.ip_forward automatically. Usually set on the Iran (entry) side.
+#   "443" single | "443,8443" list | "200-300" range | "8000=9000" map
+# forwards = ["443"]

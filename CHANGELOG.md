@@ -4,6 +4,54 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-07-10
+
+Adds kernel port forwarding for the TUN and SPF engines, confirms source-IP
+spoofing on both SPF profiles, and applies an allocation/buffer pass to the
+datagram data path.
+
+### Added
+- **Port forwarding for TUN and SPF.** A tunnel can now forward a VPN/service
+  port across the tunnel to the peer. During creation the wizard asks for the
+  port(s); the daemon installs the matching iptables rules when the interface
+  comes up and removes them on stop, so a restart or reboot restores them (they
+  are tied to the tunnel process) and a delete clears them. Each forward is
+  applied for **both TCP and UDP** so it covers WireGuard, OpenVPN, game servers
+  and streaming without the user picking a transport. Rules are:
+  - `nat/PREROUTING` DNAT the listen port to `peer_tun_ip:<port>`,
+  - `filter/FORWARD` ACCEPT the forward **and** its return (works even when the
+    default FORWARD policy is DROP),
+  - `nat/POSTROUTING` MASQUERADE out the tunnel interface so replies route back.
+
+  Rules are idempotent (existing rules are swept by a per-tunnel comment tag
+  before re-adding, so no duplicates) and validated (ports 1–65535, a required
+  `peer_tun_ip` target). Config: reuses the existing `forwards = [...]` syntax
+  (`443`, `443,8443`, `200-300`, `8000=9000`). New `et-core firewall-down
+  --config <f>` subcommand and a `firewall.Plan`/`Apply`/`Remove` package. The
+  panel enables and persists `net.ipv4.ip_forward` when a forwarding tunnel is
+  created.
+
+### Fixed
+- **SPF TCP now spoofs the source IP** (confirming the 1.6.1 unification). Both
+  the `icmp` and `tcp` SPF profiles send every frame through the raw-socket
+  carrier with `spoof_src_ip` as the IP source and accept only packets from
+  `spoof_dst_ip`. The panel's "TCP — no spoofing" wording is corrected.
+
+### Performance
+- **SPF receive path allocates nothing per packet.** `spfConn.Read` now reuses a
+  single receive buffer (was a fresh allocation on every read) — measurably lower
+  GC pressure and CPU on the SPF hot path.
+- **Raw and UDP socket buffers follow the performance profile** (`SO_RCVBUF` /
+  `SO_SNDBUF` sized from `fast`/`balance`/`resource`, best-effort), so
+  high-throughput bursts aren't dropped by a small default kernel buffer.
+
+### Notes
+- Port forwarding is Linux-only (iptables/netfilter) and requires the daemon's
+  `CAP_NET_ADMIN` (already granted by the unit). The rule-generation logic is
+  unit-tested; the live iptables interaction should be validated on a real Linux
+  host. Forwarding is a routed L3 relay to the peer's tunnel IP — the peer must
+  have the service listening on that port.
+
 ## [1.6.1] — 2026-07-09
 
 Bug-fix release for issues found testing 1.6.0: fast restart/delete, the SPF

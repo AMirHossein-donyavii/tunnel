@@ -14,7 +14,7 @@ import (
 func TestUDPLinkRoundTrip(t *testing.T) {
 	for _, cipher := range []string{"chacha20-poly1305", "aes-256-gcm"} {
 		t.Run(cipher, func(t *testing.T) {
-			ln, err := newUDPListener(0, cipher)
+			ln, err := newUDPListener(0, 0, 0, cipher)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,7 +68,7 @@ func TestUDPLinkRoundTrip(t *testing.T) {
 }
 
 func TestUDPHandshakeWrongMagic(t *testing.T) {
-	ln, err := newUDPListener(0, "chacha20-poly1305")
+	ln, err := newUDPListener(0, 0, 0, "chacha20-poly1305")
 	if err != nil {
 		t.Fatal(err)
 	}

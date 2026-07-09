@@ -16,8 +16,9 @@ import (
 // one socket and demultiplexes inbound datagrams by source address into flows.
 
 type udpLinkDialer struct {
-	addr   string
-	cipher string
+	addr           string
+	cipher         string
+	sndbuf, rcvbuf int
 }
 
 func (u *udpLinkDialer) DialLink(ctx context.Context) (link, error) {
@@ -29,6 +30,7 @@ func (u *udpLinkDialer) DialLink(ctx context.Context) (link, error) {
 	if err != nil {
 		return nil, err
 	}
+	setUDPBuffers(conn, u.sndbuf, u.rcvbuf)
 	dg, err := crypto.ClientHandshakePacket(conn, u.cipher)
 	if err != nil {
 		_ = conn.Close()
@@ -51,11 +53,23 @@ type udpLinkListener struct {
 	closed    chan struct{}
 }
 
-func newUDPListener(port int, cipher string) (*udpLinkListener, error) {
+// setUDPBuffers applies best-effort socket buffer sizes; failures are ignored so
+// a restrictive kernel never breaks the carrier.
+func setUDPBuffers(c *net.UDPConn, snd, rcv int) {
+	if rcv > 0 {
+		_ = c.SetReadBuffer(rcv)
+	}
+	if snd > 0 {
+		_ = c.SetWriteBuffer(snd)
+	}
+}
+
+func newUDPListener(port, sndbuf, rcvbuf int, cipher string) (*udpLinkListener, error) {
 	pc, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
 		return nil, fmt.Errorf("udp listen :%d: %w", port, err)
 	}
+	setUDPBuffers(pc, sndbuf, rcvbuf)
 	l := &udpLinkListener{
 		pc:     pc,
 		cipher: cipher,

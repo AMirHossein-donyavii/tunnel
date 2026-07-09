@@ -185,6 +185,41 @@ this is a configured tunnel endpoint, not a general spoofing tool.
 > the raw-socket path is **not runtime-verified in CI**. Validate on a real Linux
 > host before production. TCP-Reverse and TUN(tcp/udp) are the production paths.
 
+## Port forwarding (TUN / SPF)
+
+The `mux` engine forwards at the application layer (it dials the remote for each
+listen port). The `tun` and `spf` engines are routed L3 interfaces, so they
+forward a port with kernel NAT instead. Set `forwards` on the tunnel and the
+daemon installs, per listen port and for **both TCP and UDP**:
+
+```
+# listen port P on this host -> peer_tun_ip:P' across the tunnel
+iptables -t nat -A PREROUTING  -p <proto> --dport P         -m comment --comment et:<name> -j DNAT --to-destination <peer_tun_ip>:P'
+iptables       -A FORWARD      -p <proto> -d <peer_tun_ip> --dport P' -m comment --comment et:<name> -j ACCEPT
+iptables       -A FORWARD      -p <proto> -s <peer_tun_ip> --sport P' -m comment --comment et:<name> -j ACCEPT
+iptables -t nat -A POSTROUTING -o <iface> -p <proto> -d <peer_tun_ip> --dport P' -m comment --comment et:<name> -j MASQUERADE
+```
+
+- **Config:** the same `forwards` syntax as `mux` — `"443"`, `"443,8443"`,
+  `"200-300"`, `"8000=9000"`. A valid `peer_tun_ip` is required as the DNAT
+  target; ports are validated 1–65535.
+- **Lifecycle:** rules are applied when the interface comes up and removed on
+  shutdown, so `systemctl restart` and reboot restore them (they are tied to the
+  tunnel process). Every apply first sweeps the tunnel's own rules by their
+  comment tag `et:<name>`, so re-applies never duplicate and never touch other
+  tunnels' or hand-written rules. Delete also runs `et-core firewall-down` as a
+  safety net for an ungraceful kill.
+- **Forwarding sysctl:** the panel enables and persists `net.ipv4.ip_forward=1`
+  (`/etc/sysctl.d/99-emergency-tunnel.conf`) when a forwarding tunnel is created;
+  the hardened unit (`ProtectKernelTunables=true`) intentionally can't set it
+  itself.
+- **Peer side:** forwarding is a routed relay to `peer_tun_ip:P'` — the peer must
+  have the service listening on that port (on its tunnel IP or `0.0.0.0`).
+
+> Linux-only (iptables/netfilter), using the daemon's existing `CAP_NET_ADMIN`.
+> The rule generation is unit-tested; validate the live iptables path on a real
+> Linux host.
+
 ## Health / stats port
 
 Kept, and **local-only** by design. `et-core` serves `/health` and `/stats` on

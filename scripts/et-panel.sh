@@ -19,6 +19,16 @@ need_root() { [ "$(id -u)" -eq 0 ] || { echo -e "${C_R}Run as root.${C_RESET}"; 
 pause() { echo; read -r -p "Press Enter to continue..." _; }
 have()  { command -v "$1" >/dev/null 2>&1; }
 
+# enable_ip_forwarding turns on IPv4 forwarding now and persists it across reboot
+# (needed for TUN/SPF port forwarding; the daemon only manages the iptables rules).
+enable_ip_forwarding() {
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    local f="/etc/sysctl.d/99-emergency-tunnel.conf"
+    if ! grep -qs '^net.ipv4.ip_forward *= *1' "$f" 2>/dev/null; then
+        echo "net.ipv4.ip_forward=1" >> "$f" 2>/dev/null
+    fi
+}
+
 core_version() { [ -x "$CORE" ] && "$CORE" version 2>/dev/null | awk -F': *' '{print $2}' || echo "not installed"; }
 core_status()  { [ -x "$CORE" ] && echo -e "${C_G}installed${C_RESET}" || echo -e "${C_R}missing${C_RESET}"; }
 
@@ -204,7 +214,7 @@ create_tunnel() {
     elif [ "$engine" = "spf" ]; then
         echo; echo -e "  ${C_BOLD}SPF transport${C_RESET} (IPX-style encapsulation):"
         echo -e "    ${C_G}1)${C_RESET} ICMP — inside ICMP echo, with source-IP spoofing ${C_Y}[beta, Linux, CAP_NET_RAW]${C_RESET}"
-        echo -e "    ${C_G}2)${C_RESET} TCP  — reliable TCP carrier (IPX framing, no spoofing)"
+        echo -e "    ${C_G}2)${C_RESET} TCP  — inside bare TCP segments, with source-IP spoofing ${C_Y}[beta, Linux, CAP_NET_RAW]${C_RESET}"
         [ "$(ask_choice "Select" "1" 2)" = "2" ] && spf_profile="tcp" || spf_profile="icmp"
     fi
 
@@ -274,6 +284,18 @@ create_tunnel() {
             done
             echo -e "  ${C_G}SPF spoof mapping:${C_RESET} src=${spoof_src} <-> dst=${spoof_dst}"
         fi
+        # Optional port forwarding for TUN/SPF: DNAT a VPN/service port across the
+        # tunnel to the peer's tunnel IP (both TCP and UDP). Leave blank to skip.
+        echo; echo -e "  ${C_BOLD}Port forwarding${C_RESET} (optional)"
+        echo -e "  ${C_C}Forward a VPN/service port to the peer over the tunnel. Incoming connections"
+        echo -e "  to these ports on THIS server are sent to ${peer_tun_ip} (TCP+UDP). Blank = skip.${C_RESET}"
+        echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}"
+        local flist
+        flist="$(ask "Forward port(s)" "")"
+        if [ -n "$flist" ]; then
+            forwards_toml="$(csv_to_toml_array "$flist")"
+            [ "$forwards_toml" != "[]" ] && echo -e "  ${C_G}Forwarding:${C_RESET} ${flist} -> ${peer_tun_ip} (tcp+udp)"
+        fi
     else
         # mux: VPN/listen ports live only on the Iran (entry) side.
         if [ "$role" = "iran" ]; then
@@ -299,6 +321,11 @@ create_tunnel() {
     echo; echo -e "  ${C_C}Validating configuration...${C_RESET}"
     if ! "$CORE" validate --config "${CONF_DIR}/${name}.toml"; then
         echo -e "  ${C_R}Validation failed. Config saved but not started.${C_RESET}"; pause; return
+    fi
+
+    # TUN/SPF port forwarding needs kernel IPv4 forwarding enabled + persisted.
+    if { [ "$engine" = "tun" ] || [ "$engine" = "spf" ]; } && [ "$forwards_toml" != "[]" ]; then
+        enable_ip_forwarding
     fi
 
     systemctl enable --now "${SVC_PREFIX}${name}" >/dev/null 2>&1
@@ -352,6 +379,7 @@ write_config() {
             echo "tun_iface = \"$iface\""
             [ -n "$tun_ip" ]      && echo "tun_ip = \"$tun_ip\""
             [ -n "$peer_tun_ip" ] && echo "peer_tun_ip = \"$peer_tun_ip\""
+            [ "$forwards" != "[]" ] && echo "forwards = $forwards"
         elif [ "$engine" = "spf" ]; then
             echo "spf_profile = \"$spf_profile\""
             echo "encapsulation = \"ipx\""
@@ -360,6 +388,7 @@ write_config() {
             echo "tun_iface = \"$iface\""
             [ -n "$tun_ip" ]      && echo "tun_ip = \"$tun_ip\""
             [ -n "$peer_tun_ip" ] && echo "peer_tun_ip = \"$peer_tun_ip\""
+            [ "$forwards" != "[]" ] && echo "forwards = $forwards"
         else
             echo "proxy_protocol = $proxy"
             echo "forwards = $forwards"
@@ -431,6 +460,9 @@ delete_tunnel() {
     yesno "Really delete '${name}'?" "n" || { pause; return; }
     echo -e "  ${C_C}Removing ${name}...${C_RESET}"
     systemctl disable --now "${SVC_PREFIX}${name}" >/dev/null 2>&1
+    # Safety net: clear any port-forward rules in case the daemon was killed
+    # before it could clean up (idempotent comment-tag sweep).
+    [ -f "${CONF_DIR}/${name}.toml" ] && "$CORE" firewall-down --config "${CONF_DIR}/${name}.toml" >/dev/null 2>&1
     rm -f "${CONF_DIR}/${name}.toml" "${LOG_DIR}/${name}.log" "${LOG_DIR}/${name}.log.1"
     systemctl reset-failed "${SVC_PREFIX}${name}" 2>/dev/null || true
     echo -e "  ${C_G}✓ Tunnel removed successfully.${C_RESET}"

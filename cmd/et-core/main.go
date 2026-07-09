@@ -19,6 +19,7 @@ import (
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/core"
+	"github.com/emergency-tunnel/et/internal/firewall"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
 	"github.com/emergency-tunnel/et/internal/transport"
 
@@ -43,6 +44,8 @@ func main() {
 		cmdTransports()
 	case "validate":
 		cmdValidate(os.Args[2:])
+	case "firewall-down":
+		cmdFirewallDown(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -81,6 +84,26 @@ func cmdValidate(args []string) {
 	fmt.Println("ok")
 }
 
+// cmdFirewallDown removes any port-forward rules left by a tunnel. The panel
+// calls it on delete as a safety net in case the daemon was killed before it
+// could clean up gracefully. It is idempotent (a comment-tag sweep).
+func cmdFirewallDown(args []string) {
+	fs := flag.NewFlagSet("firewall-down", flag.ExitOnError)
+	cfgPath := fs.String("config", "", "path to tunnel TOML config")
+	_ = fs.Parse(args)
+	if *cfgPath == "" {
+		fmt.Fprintln(os.Stderr, "firewall-down: --config is required")
+		os.Exit(2)
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "firewall-down: %v\n", err)
+		os.Exit(1)
+	}
+	firewall.Remove(cfg, nil)
+	fmt.Println("ok")
+}
+
 func cmdSysinfo() {
 	out := map[string]any{
 		"effective_cpus":     sysinfo.EffectiveCPUs(),
@@ -107,6 +130,7 @@ func usage() {
 Usage:
   et-core run --config <file>    run a tunnel (used by systemd)
   et-core validate --config <f>  validate a config file
+  et-core firewall-down --config <f>  remove a tunnel's port-forward rules
   et-core version                print core version
   et-core sysinfo                print CPU/memory limits as JSON
   et-core transports             list available transports

@@ -40,6 +40,12 @@ log_level = "info"
 heartbeat_interval = 10
 heartbeat_timeout = 25
 
+# Optional port forwarding: DNAT these ports across the tunnel to peer_tun_ip
+# (both TCP and UDP). Same syntax as the mux engine. Requires peer_tun_ip and,
+# on the host, net.ipv4.ip_forward=1 (the panel sets/persists it automatically).
+#   "443" single | "443,8443" list | "200-300" range | "8000=9000" map
+# forwards = ["443"]
+
 # After the tunnel is up, reach the peer directly on its tunnel IP, e.g.:
 #   ping 10.10.10.2            # ICMP over the tunnel
 #   ssh user@10.10.10.2        # TCP over the tunnel

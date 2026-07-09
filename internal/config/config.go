@@ -264,6 +264,18 @@ func (c *Config) validateTUN() error {
 	if c.HeartbeatTimeout > 0 && c.HeartbeatInterval > 0 && c.HeartbeatTimeout <= c.HeartbeatInterval {
 		return fmt.Errorf("heartbeat_timeout (%d) must be greater than heartbeat_interval (%d)", c.HeartbeatTimeout, c.HeartbeatInterval)
 	}
+	// Port forwarding is optional for the L3 engines, but when present each spec
+	// must parse and needs a peer_tun_ip to DNAT toward across the tunnel.
+	if len(c.Forwards) > 0 {
+		if strings.TrimSpace(c.PeerTunIP) == "" {
+			return fmt.Errorf("port forwarding requires peer_tun_ip (the DNAT target across the tunnel)")
+		}
+		for _, spec := range c.Forwards {
+			if _, err := ParseForward(spec, false); err != nil {
+				return fmt.Errorf("invalid forward %q: %w", spec, err)
+			}
+		}
+	}
 	return nil
 }
 

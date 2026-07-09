@@ -29,6 +29,7 @@ import (
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/crypto"
+	"github.com/emergency-tunnel/et/internal/nettune"
 	"golang.org/x/net/ipv4"
 )
 
@@ -42,11 +43,14 @@ func newSPFRawCarrier(cfg *config.Config, isDialer bool, cipher string) (linkDia
 		return nil, nil, fmt.Errorf("spf: spoof_src_ip, spoof_dst_ip and peer must be IPv4 addresses")
 	}
 	codec := codecFor(cfg.SpfProfile)
+	// Size the raw-socket buffers from the performance profile so bursts aren't
+	// dropped by a small default kernel buffer on high-throughput links.
+	snd, rcv := nettune.BufSizes(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
 	if isDialer {
 		return &spfLinkDialer{codec: codec, spoofSrc: spoofSrc, spoofDst: spoofDst, peer: peer,
-			tunnelPort: cfg.TunnelPort, cipher: cipher}, nil, nil
+			tunnelPort: cfg.TunnelPort, cipher: cipher, sndbuf: snd, rcvbuf: rcv}, nil, nil
 	}
-	rc, err := openRawIPv4(codec.network())
+	rc, err := openRawIPv4(codec.network(), snd, rcv)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -56,10 +60,20 @@ func newSPFRawCarrier(cfg *config.Config, isDialer bool, cipher string) (linkDia
 	return nil, l, nil
 }
 
-func openRawIPv4(network string) (*ipv4.RawConn, error) {
+// openRawIPv4 opens an IP_HDRINCL raw socket, sizing its send/recv buffers
+// (best-effort) so throughput bursts survive a small default kernel buffer.
+func openRawIPv4(network string, snd, rcv int) (*ipv4.RawConn, error) {
 	c, err := net.ListenPacket(network, "0.0.0.0")
 	if err != nil {
 		return nil, fmt.Errorf("spf raw socket %s: %w (needs CAP_NET_RAW)", network, err)
+	}
+	if ip, ok := c.(*net.IPConn); ok {
+		if rcv > 0 {
+			_ = ip.SetReadBuffer(rcv)
+		}
+		if snd > 0 {
+			_ = ip.SetWriteBuffer(snd)
+		}
 	}
 	rc, err := ipv4.NewRawConn(c)
 	if err != nil {
@@ -90,10 +104,11 @@ type spfLinkDialer struct {
 	spoofSrc, spoofDst, peer net.IP
 	tunnelPort               int
 	cipher                   string
+	sndbuf, rcvbuf           int
 }
 
 func (d *spfLinkDialer) DialLink(_ context.Context) (link, error) {
-	rc, err := openRawIPv4(d.codec.network())
+	rc, err := openRawIPv4(d.codec.network(), d.sndbuf, d.rcvbuf)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +129,7 @@ type spfConn struct {
 	spoofSrc, spoofDst, peer net.IP
 	tunnelPort, key          int
 	seq                      uint32
+	rbuf                     []byte // reusable receive buffer (single reader)
 }
 
 func (c *spfConn) Write(b []byte) (int, error) {
@@ -129,7 +145,12 @@ func (c *spfConn) Write(b []byte) (int, error) {
 }
 
 func (c *spfConn) Read(b []byte) (int, error) {
-	buf := make([]byte, len(b)+128)
+	// Reuse a single receive buffer across reads (ReadFrame has one reader), so
+	// the hot path allocates nothing. Sized to hold the L4 payload plus headers.
+	if cap(c.rbuf) < len(b)+128 {
+		c.rbuf = make([]byte, len(b)+128)
+	}
+	buf := c.rbuf[:len(b)+128]
 	for {
 		h, p, _, err := c.rc.ReadFrom(buf)
 		if err != nil {

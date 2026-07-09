@@ -31,6 +31,12 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
      obfuscation tunnel between your two servers. *(beta, Linux + `CAP_NET_RAW`)*
   - All protocols share the same AEAD encryption, ephemeral X25519 key exchange,
     and TCP tuning (`TCP_NODELAY/QUICKACK/USER_TIMEOUT`, `SO_*BUF`, BBR).
+- **Port forwarding** — for every engine. `mux` forwards at the application layer;
+  **`tun`/`spf` forward a VPN/service port over the tunnel via iptables** (DNAT to
+  the peer's tunnel IP + FORWARD + MASQUERADE, TCP **and** UDP). The wizard asks
+  for the port(s) (`443`, `443,8443`, `200-300`, `8000=9000`); rules are created
+  on start, removed on delete, restored on restart/reboot, and idempotent (no
+  duplicates). *(L3 forwarding is Linux-only.)*
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a
   static binary, wires up systemd, and launches the panel.
 - **Interactive panel (`et`)** — banner, live IP/geo/ASN, create wizard, and full
