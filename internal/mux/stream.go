@@ -27,6 +27,7 @@ type Stream struct {
 	wmu     sync.Mutex
 	wcond   *sync.Cond
 	sendWin int
+	winGrip int  // bytes consumed before a WINDOW_UPDATE is sent (window/2)
 	wFIN    bool // we sent FIN
 
 	// shared
@@ -47,7 +48,13 @@ func (st *Stream) maybeReap() {
 }
 
 func newStream(id uint32, s *Session, hi bool) *Stream {
-	st := &Stream{id: id, s: s, hi: hi, sendWin: defaultWindow}
+	// Both ends start with the same initial window (from Config, else the
+	// default), so send-side credit matches the peer's receive accounting.
+	win := s.cfg.Window
+	if win <= 0 {
+		win = defaultWindow
+	}
+	st := &Stream{id: id, s: s, hi: hi, sendWin: win, winGrip: win / 2}
 	st.rcond = sync.NewCond(&st.rmu)
 	st.wcond = sync.NewCond(&st.wmu)
 	return st
@@ -99,15 +106,18 @@ func (st *Stream) Read(p []byte) (int, error) {
 	}
 	st.consumed += n
 	var grant int
-	if st.consumed >= winUpdateGrip {
+	if st.consumed >= st.winGrip {
 		grant = st.consumed
 		st.consumed = 0
 	}
 	st.rmu.Unlock()
 
 	if grant > 0 {
-		// Replenish the peer's send window. Best-effort; ignore shutdown error.
-		_ = st.s.queue(outFrame{typ: frameWinUp, id: st.id, ctl: uint32(grant)}, st.hi)
+		// Replenish the peer's send window. WINDOW_UPDATE goes on the HIGH
+		// priority queue so it is never stuck behind this session's bulk DATA —
+		// otherwise the sender stalls waiting for credit and throughput (notably
+		// the lighter/upload direction) collapses under load.
+		_ = st.s.queue(outFrame{typ: frameWinUp, id: st.id, ctl: uint32(grant)}, true)
 	}
 	return n, nil
 }

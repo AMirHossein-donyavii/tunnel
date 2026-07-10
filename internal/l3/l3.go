@@ -341,6 +341,13 @@ func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, lk link, i
 	defer cancel()
 	defer lk.Close()
 
+	// On cancellation (heartbeat timeout or shutdown) close the link at once so a
+	// writer blocked in WriteFrame on a dead socket unblocks immediately, rather
+	// than waiting out TCP_USER_TIMEOUT — the difference between a ~1 s and a
+	// ~20 s reconnect after a network drop.
+	stopClose := context.AfterFunc(ctx, func() { _ = lk.Close() })
+	defer stopClose()
+
 	var lastRecv atomic.Int64
 	lastRecv.Store(e.nowSec())
 	if atomic.AddInt64(&e.stats.liveLinks, 1) == 1 {
@@ -495,6 +502,10 @@ type Stats struct {
 	RxBytes    uint64 `json:"rx_bytes"`
 	Reconnects uint64 `json:"reconnects"`
 }
+
+// Healthy reports whether at least one link of the tunnel is currently up. The
+// core watchdog uses it to detect a wedged tunnel and force a clean restart.
+func (e *Engine) Healthy() bool { return atomic.LoadInt64(&e.stats.liveLinks) > 0 }
 
 // Snapshot returns current counters (as any, to satisfy the shared engine
 // interface used by the health endpoint).

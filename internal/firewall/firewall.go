@@ -40,7 +40,7 @@ var protos = [...]string{"tcp", "udp"}
 // an error when forwards are configured but the target (peer_tun_ip) is missing
 // or malformed. Plan is platform-neutral and unit-tested.
 func Plan(cfg *config.Config) ([]Rule, error) {
-	if len(cfg.Forwards) == 0 {
+	if !Enabled(cfg) {
 		return nil, nil
 	}
 	dest := strings.TrimSpace(cfg.PeerTunIP)
@@ -104,10 +104,24 @@ func rulesFor(r Rule, iface, tag string) []iptRule {
 	}
 }
 
+// mssClampRule clamps the TCP MSS of forwarded connections entering the tunnel
+// to the path MTU. Without it, a client negotiating a 1460 MSS over a 1500 MTU
+// path will blackhole large segments once they hit the smaller tunnel MTU
+// (DF set, no PMTUD) — the classic "SSH connects, big transfers hang" symptom.
+// One rule per tunnel covers all its TCP forwards.
+func mssClampRule(iface, tag string) iptRule {
+	return iptRule{"mangle", "FORWARD", []string{
+		"-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+		"-m", "comment", "--comment", tag,
+		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}}
+}
+
 // Tag is the iptables comment stamped on every rule this tunnel owns. Teardown
 // removes exactly the rules carrying this tag, so tunnels never disturb each
 // other's rules or anything the operator added by hand.
 func Tag(name string) string { return "et:" + name }
 
-// Enabled reports whether the tunnel has any forwarding configured.
-func Enabled(cfg *config.Config) bool { return len(cfg.Forwards) > 0 }
+// Enabled reports whether this host installs forwarding rules: it has forwards
+// configured AND is the Iran (entry) server. The Foreign side never binds
+// client ports or installs NAT, so it is always disabled there.
+func Enabled(cfg *config.Config) bool { return len(cfg.Forwards) > 0 && cfg.IsEntry() }

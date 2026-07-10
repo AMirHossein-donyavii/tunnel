@@ -4,6 +4,47 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] — 2026-07-10
+
+Makes the VPN listen port an Iran-only concept, hardens long-running stability
+with automatic recovery, and lifts single-stream throughput substantially.
+
+### Changed
+- **The VPN Listen Port is now Iran-only, for every engine.** The wizard asks for
+  it only on the Iran (entry) server with the description "This is the VPN/service
+  port that your VPN clients connect to. It is only required on the Iran server."
+  The Foreign server is never asked for a listen port, forwarding, or NAT — it
+  only carries the tunnel. Enforced at three layers: the panel doesn't prompt,
+  `config.Validate` rejects `forwards` on a `kharej` config, and the firewall
+  installs rules only when `role = iran`.
+
+### Performance
+- **Up to ~8.8× higher single-stream throughput (mux).** The per-stream receive
+  window is now sized by performance profile — `fast` 4 MiB, `balance` 2 MiB,
+  `resource` 512 KiB (was a fixed 512 KiB) — lifting the bandwidth-delay-product
+  ceiling on long-distance links. Measured single-stream throughput at 10 ms RTT
+  rose from ~42 MiB/s to ~373 MiB/s (see `BenchmarkWindowThroughput`).
+- **WINDOW_UPDATE frames are now high-priority.** They previously queued behind
+  bulk DATA, stalling the sender's credit and collapsing throughput under load
+  (notably the lighter/upload direction). This evens out upload vs download.
+- **MSS clamping for forwarded TCP.** Port-forward rules now add a
+  `TCPMSS --clamp-mss-to-pmtu` mangle rule so large segments don't blackhole at
+  the smaller tunnel MTU (the classic "connects but big transfers hang").
+- Raw/UDP socket buffers and the SPF zero-alloc receive path from 1.7.0 are
+  retained.
+
+### Stability (fixed)
+- **Automatic recovery from a wedged tunnel.** A new liveness watchdog exits the
+  process (systemd then restarts it cleanly) if the tunnel was healthy and then
+  stays down past a 120 s recovery window. It never fires before the tunnel has
+  come up once, so an unreachable peer can't cause a restart loop. No more manual
+  restarts after a long-run drop.
+- **Faster reconnect after a network drop (TUN/SPF).** On heartbeat timeout or
+  shutdown the link is now closed immediately, so a writer blocked on a dead
+  socket unblocks at once instead of waiting out `TCP_USER_TIMEOUT` (~20 s → ~1 s
+  reconnect). End-to-end reconnect verified: sessions drop to 0 on peer loss and
+  return automatically with data intact.
+
 ## [1.7.0] — 2026-07-10
 
 Adds kernel port forwarding for the TUN and SPF engines, confirms source-IP

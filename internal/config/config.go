@@ -194,6 +194,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("peer is required on the dialing side (role=%s mode=%s)", c.Role, c.Mode)
 	}
 
+	// Port forwarding (the client-facing VPN/service port) belongs ONLY to the
+	// Iran (entry) server, for every engine. The Foreign server just carries the
+	// tunnel; it never binds client ports or installs NAT.
+	if c.Role != RoleIran && len(c.Forwards) > 0 {
+		return fmt.Errorf("forwards are configured on the Iran (entry) server only; remove them from this %s config", c.Role)
+	}
+
 	// The TUN/SPF engines are virtual network interfaces: they need a tunnel address.
 	if c.IsTUN() {
 		return c.validateTUN()

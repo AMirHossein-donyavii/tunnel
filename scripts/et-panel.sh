@@ -284,24 +284,27 @@ create_tunnel() {
             done
             echo -e "  ${C_G}SPF spoof mapping:${C_RESET} src=${spoof_src} <-> dst=${spoof_dst}"
         fi
-        # Optional port forwarding for TUN/SPF: DNAT a VPN/service port across the
-        # tunnel to the peer's tunnel IP (both TCP and UDP). Leave blank to skip.
-        echo; echo -e "  ${C_BOLD}Port forwarding${C_RESET} (optional)"
-        echo -e "  ${C_C}Forward a VPN/service port to the peer over the tunnel. Incoming connections"
-        echo -e "  to these ports on THIS server are sent to ${peer_tun_ip} (TCP+UDP). Blank = skip.${C_RESET}"
-        echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}"
-        local flist
-        flist="$(ask "Forward port(s)" "")"
-        if [ -n "$flist" ]; then
-            forwards_toml="$(csv_to_toml_array "$flist")"
-            [ "$forwards_toml" != "[]" ] && echo -e "  ${C_G}Forwarding:${C_RESET} ${flist} -> ${peer_tun_ip} (tcp+udp)"
+        # VPN Listen Port lives ONLY on the Iran (entry) server. The Foreign server
+        # just carries the tunnel — it is never asked for client-facing ports.
+        if [ "$role" = "iran" ]; then
+            echo; echo -e "  ${C_BOLD}VPN Listen Port${C_RESET} (optional)"
+            echo -e "  ${C_C}This is the VPN/service port that your VPN clients connect to. It is only"
+            echo -e "  required on the Iran server. Connections here are forwarded over the tunnel"
+            echo -e "  to ${peer_tun_ip} (TCP+UDP). Leave blank to skip.${C_RESET}"
+            echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}"
+            local flist
+            flist="$(ask "VPN Listen Port(s)" "")"
+            if [ -n "$flist" ]; then
+                forwards_toml="$(csv_to_toml_array "$flist")"
+                [ "$forwards_toml" != "[]" ] && echo -e "  ${C_G}Forwarding:${C_RESET} ${flist} -> ${peer_tun_ip} (tcp+udp)"
+            fi
         fi
     else
-        # mux: VPN/listen ports live only on the Iran (entry) side.
+        # mux: the VPN Listen Port lives only on the Iran (entry) side.
         if [ "$role" = "iran" ]; then
-            echo; echo -e "  ${C_BOLD}VPN configuration / data port(s)${C_RESET}"
-            echo -e "  ${C_C}This is your VPN configuration/data port. Users will connect through this port."
-            echo -e "  Common choices are ports like 443.${C_RESET}"
+            echo; echo -e "  ${C_BOLD}VPN Listen Port${C_RESET}"
+            echo -e "  ${C_C}This is the VPN/service port that your VPN clients connect to. It is only"
+            echo -e "  required on the Iran server. Common choices are ports like 443.${C_RESET}"
             echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
             local flist
             while true; do

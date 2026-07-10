@@ -80,23 +80,45 @@ func TestValidateSPFSpoofRequired(t *testing.T) {
 	}
 }
 
-func TestValidateL3Forwards(t *testing.T) {
-	// A valid forward on a TUN tunnel with a peer_tun_ip target is accepted.
+// iranTUN is an Iran-side (entry) TUN fixture — the side that owns forwards.
+func iranTUN() Config {
 	c := baseTUN()
+	c.Role = RoleIran
+	c.Peer = "" // the entry side listens; it does not dial
+	c.TunIP = "10.10.10.1/24"
+	c.PeerTunIP = "10.10.10.2"
+	return c
+}
+
+func TestValidateL3Forwards(t *testing.T) {
+	// A valid forward on an Iran TUN tunnel with a peer_tun_ip target is accepted.
+	c := iranTUN()
 	c.Forwards = []string{"443", "8000=9000", "200-202"}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("valid L3 forwards rejected: %v", err)
 	}
 	// SPF forwards are validated the same way (shared validateTUN path).
 	s := baseSPF()
+	s.Role = RoleIran
+	s.Peer = ""
+	s.TunIP = "10.10.10.1/24"
+	s.PeerTunIP = "10.10.10.2"
 	s.Forwards = []string{"51820"}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("valid SPF forward rejected: %v", err)
 	}
 }
 
+func TestValidateForwardsRejectedOnForeign(t *testing.T) {
+	c := baseTUN() // role = kharej
+	c.Forwards = []string{"443"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: forwards not allowed on the foreign (kharej) side")
+	}
+}
+
 func TestValidateL3ForwardsRequirePeerTunIP(t *testing.T) {
-	c := baseTUN()
+	c := iranTUN()
 	c.PeerTunIP = ""
 	c.Forwards = []string{"443"}
 	if err := c.Validate(); err == nil {
@@ -105,7 +127,7 @@ func TestValidateL3ForwardsRequirePeerTunIP(t *testing.T) {
 }
 
 func TestValidateL3ForwardsRejectBadSpec(t *testing.T) {
-	c := baseTUN()
+	c := iranTUN()
 	c.Forwards = []string{"70000"}
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for out-of-range forward port")

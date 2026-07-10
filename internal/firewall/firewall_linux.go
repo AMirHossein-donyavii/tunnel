@@ -47,16 +47,21 @@ func Apply(cfg *config.Config, iface string, log Logger) error {
 
 	tag := Tag(cfg.Name)
 	ipt.sweep(tag) // clear any prior/duplicate rules for this tunnel
+
+	all := make([]iptRule, 0, len(rules)*4+1)
 	for _, r := range rules {
-		for _, ir := range rulesFor(r, iface, tag) {
-			if err := ipt.add(ir); err != nil {
-				ipt.sweep(tag) // roll back the partial set
-				return fmt.Errorf("apply %s/%s: %w", ir.table, ir.chain, err)
-			}
+		all = append(all, rulesFor(r, iface, tag)...)
+	}
+	// One MSS clamp per tunnel guards TCP forwards against MTU blackholing.
+	all = append(all, mssClampRule(iface, tag))
+	for _, ir := range all {
+		if err := ipt.add(ir); err != nil {
+			ipt.sweep(tag) // roll back the partial set
+			return fmt.Errorf("apply %s/%s: %w", ir.table, ir.chain, err)
 		}
 	}
 	if log != nil {
-		log.Info("Port forwarding enabled: %d rule(s) -> %s via %s", len(rules), cfg.PeerTunIP, iface)
+		log.Info("Port forwarding enabled: %d rule(s) -> %s via %s (mss clamped to path mtu)", len(rules), cfg.PeerTunIP, iface)
 	}
 	return nil
 }
@@ -97,7 +102,7 @@ func (i iptables) sweep(tag string) int {
 		return 0
 	}
 	deleted := 0
-	for _, table := range []string{"nat", "filter"} {
+	for _, table := range []string{"nat", "filter", "mangle"} {
 		out, err := exec.Command(i.save, "-t", table).Output()
 		if err != nil {
 			continue

@@ -31,12 +31,12 @@ const (
 const (
 	headerLen = 10
 	maxFrame  = 16 * 1024 // max DATA payload per frame
-	// defaultWindow is the initial per-stream receive window. It caps the
-	// bandwidth-delay product a single stream can fill: 512 KiB keeps a stream
-	// from being throttled on long-distance links (e.g. ~40 Mbps at 100 ms RTT)
-	// while only costing RAM for bytes actually in flight (idle streams use ~0).
-	defaultWindow = 512 * 1024
-	winUpdateGrip = defaultWindow / 2 // send a WINDOW_UPDATE once half is consumed
+	// defaultWindow is the fallback initial per-stream receive window when the
+	// session Config does not set one. It caps the bandwidth-delay product a
+	// single stream can fill while only costing RAM for bytes actually in flight
+	// (idle streams use ~0). The engine raises this per performance profile; the
+	// WINDOW_UPDATE threshold is derived as window/2 per stream.
+	defaultWindow = 2 * 1024 * 1024
 )
 
 // header is the fixed 10-byte frame header.

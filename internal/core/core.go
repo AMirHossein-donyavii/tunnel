@@ -25,7 +25,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.7.0"
+var CoreVersion = "1.8.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -71,6 +71,12 @@ func Run(path string) error {
 		go serveHealth(ctx, cfg, eng, log)
 	}
 
+	// Last-resort auto-recovery for long-running stability: if the tunnel comes
+	// up and later stays down past the recovery window, exit so systemd restarts
+	// from a clean slate. It never fires before the tunnel has been healthy at
+	// least once, so an unreachable peer can't cause a restart loop.
+	go watchdog(ctx, eng, log)
+
 	// Run the engine; on a termination signal, give it a brief window to clean
 	// up and then force-exit so stop/restart/delete are always fast.
 	done := make(chan error, 1)
@@ -93,6 +99,47 @@ func Run(path string) error {
 type engine interface {
 	Run(context.Context) error
 	Snapshot() any
+	// Healthy reports whether the tunnel currently has at least one live link.
+	Healthy() bool
+}
+
+// RecoveryTimeout is how long the tunnel may stay down (after having been up)
+// before the watchdog forces a restart. It is well above a normal reconnect
+// (heartbeat/keepalive cycle a dead link within ~25s), so it only ever catches
+// a genuine wedge; during a real peer outage it merely restarts every ~2 min,
+// which is benign and stays under systemd's start-rate limit.
+const RecoveryTimeout = 120 * time.Second
+
+// watchdog exits the process if the tunnel wedges (up, then down past the
+// recovery window). systemd's Restart=always then brings it back cleanly.
+func watchdog(ctx context.Context, eng engine, log *logx.Logger) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	everUp := false
+	var downSince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if eng.Healthy() {
+				everUp = true
+				downSince = time.Time{}
+				continue
+			}
+			if !everUp {
+				continue // never came up yet: keep waiting, don't restart-loop
+			}
+			if downSince.IsZero() {
+				downSince = time.Now()
+				continue
+			}
+			if time.Since(downSince) >= RecoveryTimeout {
+				log.Error("tunnel down for %s after being healthy — exiting for a clean restart", RecoveryTimeout)
+				os.Exit(1)
+			}
+		}
+	}
 }
 
 // newLogger returns a logger writing to both the per-tunnel rotating file and

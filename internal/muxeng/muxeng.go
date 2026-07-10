@@ -81,6 +81,7 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		KeepAlive:        time.Duration(orDefault(cfg.HeartbeatInterval, 10)) * time.Second,
 		KeepAliveTimeout: time.Duration(orDefault(cfg.HeartbeatTimeout, 25)) * time.Second,
 		AcceptBacklog:    512,
+		Window:           streamWindow(cfg.Profile),
 	}
 	if e.isEntry {
 		for _, spec := range cfg.Forwards {
@@ -356,6 +357,10 @@ type Stats struct {
 	RTTms         int64  `json:"rtt_ms"`
 }
 
+// Healthy reports whether the tunnel currently has at least one live session.
+// The core watchdog uses it to detect a wedged tunnel and force a clean restart.
+func (e *Engine) Healthy() bool { return e.set.count() > 0 }
+
 // Snapshot returns current counters (as any, for the shared engine interface).
 func (e *Engine) Snapshot() any {
 	return Stats{
@@ -374,6 +379,21 @@ func orDefault(v, def int) int {
 		return def
 	}
 	return v
+}
+
+// streamWindow sizes the per-stream receive window from the performance profile.
+// Larger windows lift single-stream throughput on high-BDP (long-distance)
+// links; the cost is RAM per in-flight stream, so the tiny-VPS profile stays
+// small. Both servers should run the same profile so the two directions match.
+func streamWindow(profile string) int {
+	switch profile {
+	case config.ProfileFast:
+		return 4 * 1024 * 1024
+	case config.ProfileResource:
+		return 512 * 1024
+	default: // balance
+		return 2 * 1024 * 1024
+	}
 }
 
 func sleepCtx(ctx context.Context, b *time.Duration) bool {

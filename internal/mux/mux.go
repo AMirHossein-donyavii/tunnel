@@ -41,6 +41,11 @@ type Config struct {
 	KeepAliveTimeout time.Duration
 	// AcceptBacklog bounds queued inbound streams before SYNs are RST'd.
 	AcceptBacklog int
+	// Window is the initial per-stream receive window in bytes (0 = default). It
+	// caps the bandwidth-delay product a single stream can fill; both ends should
+	// use the same value. Larger raises single-stream throughput on high-BDP
+	// links at the cost of RAM per in-flight (unconsumed) stream.
+	Window int
 }
 
 // DefaultConfig returns sane defaults.

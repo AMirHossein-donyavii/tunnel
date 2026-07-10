@@ -10,8 +10,22 @@ import (
 func baseL3() *config.Config {
 	return &config.Config{
 		Name:      "vpn1",
+		Role:      config.RoleIran, // forwards live on the entry side only
 		Engine:    config.EngineTUN,
 		PeerTunIP: "10.10.10.2",
+	}
+}
+
+func TestPlanDisabledOnForeign(t *testing.T) {
+	c := baseL3()
+	c.Role = config.RoleKharej
+	c.Forwards = []string{"443"}
+	rules, err := Plan(c)
+	if err != nil || rules != nil {
+		t.Fatalf("foreign side must plan no rules; got %v %v", rules, err)
+	}
+	if Enabled(c) {
+		t.Fatal("Enabled must be false on the foreign side")
 	}
 }
 
@@ -120,5 +134,14 @@ func TestRulesForSpecs(t *testing.T) {
 		if joined[i] != want[i] {
 			t.Errorf("rule %d:\n got  %q\n want %q", i, joined[i], want[i])
 		}
+	}
+}
+
+func TestMSSClampRule(t *testing.T) {
+	ir := mssClampRule("emergency-tun", "et:vpn1")
+	got := ir.table + " " + ir.chain + " " + strings.Join(ir.args, " ")
+	want := "mangle FORWARD -o emergency-tun -p tcp --tcp-flags SYN,RST SYN -m comment --comment et:vpn1 -j TCPMSS --clamp-mss-to-pmtu"
+	if got != want {
+		t.Fatalf("\n got  %q\n want %q", got, want)
 	}
 }
