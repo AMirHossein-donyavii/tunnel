@@ -120,6 +120,9 @@ func (c *icmpConn) Read(b []byte) (int, error) {
 	for {
 		n, _, err := c.pc.ReadFrom(buf)
 		if err != nil {
+			if isTransientReadErr(err) {
+				continue // transient under load: skip, don't cycle the link
+			}
 			return 0, err
 		}
 		data, ok := parseEcho(c.proto, buf[:n], c.id, true)
@@ -157,8 +160,13 @@ func (l *icmpLinkListener) route() {
 	for {
 		n, src, err := l.pc.ReadFrom(buf)
 		if err != nil {
-			l.Close()
-			return
+			// Shared listener socket: survive a transient error rather than
+			// stranding every link until a manual restart (see udp/spf route).
+			if isClosed(l.closed) || !isTransientReadErr(err) {
+				l.Close()
+				return
+			}
+			continue
 		}
 		data, id, ok := parseEchoRequest(l.proto, buf[:n])
 		if !ok {
@@ -227,34 +235,17 @@ type icmpFlow struct {
 	firstMsg []byte
 	seq      uint32
 
-	dmu       sync.Mutex
-	deadline  time.Time
+	dg        deadlineGate
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
 func (f *icmpFlow) Read(b []byte) (int, error) {
-	f.dmu.Lock()
-	dl := f.deadline
-	f.dmu.Unlock()
-	var timeout <-chan time.Time
-	if !dl.IsZero() {
-		d := time.Until(dl)
-		if d <= 0 {
-			return 0, timeoutErr{}
-		}
-		t := time.NewTimer(d)
-		defer t.Stop()
-		timeout = t.C
+	pkt, err := f.dg.wait(f.in, f.closed)
+	if err != nil {
+		return 0, err
 	}
-	select {
-	case pkt := <-f.in:
-		return copy(b, pkt), nil
-	case <-timeout:
-		return 0, timeoutErr{}
-	case <-f.closed:
-		return 0, net.ErrClosed
-	}
+	return copy(b, pkt), nil
 }
 
 func (f *icmpFlow) Write(b []byte) (int, error) {
@@ -272,9 +263,7 @@ func (f *icmpFlow) Write(b []byte) (int, error) {
 }
 
 func (f *icmpFlow) SetReadDeadline(t time.Time) error {
-	f.dmu.Lock()
-	f.deadline = t
-	f.dmu.Unlock()
+	f.dg.set(t)
 	return nil
 }
 func (f *icmpFlow) Close() error {

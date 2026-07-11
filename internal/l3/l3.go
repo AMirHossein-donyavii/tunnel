@@ -283,18 +283,35 @@ func (e *Engine) queueReader(ctx context.Context, q queue, ch chan<- []byte) {
 	}
 }
 
-// clientQueue keeps a link dialed for its queue and pumps, reconnecting on loss.
+// engineLabel is "SPF" or "TUN" for logs (SPF is the TUN data plane + spoofing).
+func (e *Engine) engineLabel() string {
+	if e.cfg.IsSPF() {
+		return "SPF"
+	}
+	return "TUN"
+}
+
+// clientQueue keeps a link dialed for its queue and pumps, reconnecting on loss
+// with exponential backoff. It counts consecutive failed attempts for the log so
+// a persistent problem is visible without spamming a line per packet.
 func (e *Engine) clientQueue(ctx context.Context, q queue, ch <-chan []byte, id int) {
 	backoff := time.Second
+	attempt := 0
 	for ctx.Err() == nil {
 		lk, err := e.ldialer.DialLink(ctx)
 		if err != nil {
-			e.log.Warn("queue %d connect (%s): %v", id, config.TunModeName(e.mode), err)
+			attempt++
+			e.log.Warn("%s queue %d: reconnect attempt %d failed: %v (retrying in %s)",
+				e.engineLabel(), id, attempt, err, backoff.Round(time.Second))
 			if !sleepCtx(ctx, &backoff) {
 				return
 			}
 			continue
 		}
+		if attempt > 0 {
+			e.log.Info("%s queue %d: reconnected after %d attempt(s)", e.engineLabel(), id, attempt)
+		}
+		attempt = 0
 		backoff = time.Second
 		e.pump(ctx, q, ch, lk, id)
 		atomic.AddUint64(&e.stats.reconnects, 1)
@@ -484,8 +501,10 @@ func (e *Engine) heartbeatMonitor(ctx context.Context, cancel context.CancelFunc
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if time.Since(time.Unix(lastRecv.Load(), 0)) > e.hbTimeout {
-				e.log.Warn("queue %d: heartbeat timeout, cycling link", id)
+			age := time.Since(time.Unix(lastRecv.Load(), 0))
+			if age > e.hbTimeout {
+				e.log.Warn("%s connection lost on queue %d: heartbeat timeout after %s of silence (limit %s) — cycling link",
+					e.engineLabel(), id, age.Round(time.Second), e.hbTimeout)
 				cancel()
 				return
 			}

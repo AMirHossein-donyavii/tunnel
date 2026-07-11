@@ -81,14 +81,20 @@ func newUDPListener(port, sndbuf, rcvbuf int, cipher string) (*udpLinkListener, 
 	return l, nil
 }
 
-// route reads every inbound datagram and dispatches it to its flow.
+// route reads every inbound datagram and dispatches it to its flow. A transient
+// read error (e.g. ENOBUFS under load) is skipped rather than fatal — this is
+// the single shared listener socket, so tearing it down would strand every link
+// until a manual restart.
 func (l *udpLinkListener) route() {
 	buf := make([]byte, 64*1024)
 	for {
 		n, src, err := l.pc.ReadFromUDP(buf)
 		if err != nil {
-			l.Close()
-			return
+			if isClosed(l.closed) || !isTransientReadErr(err) {
+				l.Close()
+				return
+			}
+			continue
 		}
 		key := src.String()
 		l.mu.Lock()
@@ -157,44 +163,24 @@ type udpFlow struct {
 	in       chan []byte
 	firstMsg []byte
 
-	dmu      sync.Mutex
-	deadline time.Time
+	dg deadlineGate
 
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
 func (f *udpFlow) Read(b []byte) (int, error) {
-	f.dmu.Lock()
-	dl := f.deadline
-	f.dmu.Unlock()
-	var timer *time.Timer
-	var timeout <-chan time.Time
-	if !dl.IsZero() {
-		d := time.Until(dl)
-		if d <= 0 {
-			return 0, timeoutErr{}
-		}
-		timer = time.NewTimer(d)
-		timeout = timer.C
-		defer timer.Stop()
+	pkt, err := f.dg.wait(f.in, f.closed)
+	if err != nil {
+		return 0, err
 	}
-	select {
-	case pkt := <-f.in:
-		return copy(b, pkt), nil
-	case <-timeout:
-		return 0, timeoutErr{}
-	case <-f.closed:
-		return 0, net.ErrClosed
-	}
+	return copy(b, pkt), nil
 }
 
 func (f *udpFlow) Write(b []byte) (int, error) { return f.pc.WriteToUDP(b, f.src) }
 
 func (f *udpFlow) SetReadDeadline(t time.Time) error {
-	f.dmu.Lock()
-	f.deadline = t
-	f.dmu.Unlock()
+	f.dg.set(t)
 	return nil
 }
 

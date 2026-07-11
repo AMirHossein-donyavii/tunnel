@@ -4,6 +4,45 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.8.1] — 2026-07-11
+
+Fixes the SPF/datagram long-run disconnect that required a manual Iran-side
+restart, makes shutdown clean, and improves disconnect diagnostics.
+
+### Fixed
+- **Root cause of the SPF TCP multi-hour disconnect.** The datagram listeners
+  (SPF, UDP, ICMP) serve every queue from a single shared raw socket, and any
+  error from that socket's read — including a *transient* `ENOBUFS` (kernel
+  receive buffer briefly overflowing under load, which the busier SPF **TCP**
+  profile hits hardest) or `EINTR` — tore the whole socket down permanently.
+  Every link was then stranded, producing endless "heartbeat timeout, cycling
+  link" until the Iran (listener) service was restarted by hand. The listeners
+  now distinguish transient read errors (skip the packet, keep serving) from
+  real closure (stop), so a momentary overload no longer kills the tunnel.
+- **Stalled reader could hang until link teardown.** The channel-backed flows
+  captured their read deadline once at entry, so a deadline set *after* a read
+  had already blocked (exactly what the pump does to cycle a dead link) never
+  woke it — a reader could hang, holding its queue slot and starving reconnects.
+  Read deadlines now interrupt an in-progress read (`deadlineGate`), matching
+  real `net.Conn` semantics. This also removes the reliance on force-closing the
+  link to unblock readers, so **shutdown/restart is clean** and no longer trips
+  the "shutdown exceeded 3s — forcing exit" watchdog.
+- **Dialer no longer cycles the link on a transient read error.** SPF and ICMP
+  client reads skip `ENOBUFS`/`EINTR` instead of failing the link, cutting
+  needless reconnect churn under load.
+
+### Diagnostics
+- Richer disconnect logging (no per-packet spam): heartbeat timeouts now read
+  `SPF connection lost on queue N: heartbeat timeout after 27s of silence
+  (limit 25s) — cycling link`, and reconnects log the attempt number and a
+  `reconnected after N attempt(s)` on recovery.
+
+### Notes
+- The SPF raw-socket data path remains Linux + `CAP_NET_RAW` and is not
+  runtime-verified in CI; the fixes are exercised through the UDP carrier, which
+  shares the identical listener/flow/deadline code, plus unit tests for the
+  transient-error classification and the deadline gate.
+
 ## [1.8.0] — 2026-07-10
 
 Makes the VPN listen port an Iran-only concept, hardens long-running stability

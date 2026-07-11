@@ -154,6 +154,9 @@ func (c *spfConn) Read(b []byte) (int, error) {
 	for {
 		h, p, _, err := c.rc.ReadFrom(buf)
 		if err != nil {
+			if isTransientReadErr(err) {
+				continue // ENOBUFS/EINTR under load: skip, don't cycle the link
+			}
 			return 0, err
 		}
 		if !h.Src.Equal(c.spoofDst) { // strict point-to-point source filter
@@ -196,8 +199,16 @@ func (l *spfLinkListener) route() {
 	for {
 		h, p, _, err := l.rc.ReadFrom(buf)
 		if err != nil {
-			l.Close()
-			return
+			// The listener serves every queue from this ONE raw socket. A
+			// transient error (ENOBUFS when the kernel receive buffer overflows
+			// under load — more likely on the busier TCP profile — or EINTR) must
+			// NOT tear it down, or every link is stranded until a manual Iran
+			// restart. Only stop on real closure/shutdown.
+			if isClosed(l.closed) || !isTransientReadErr(err) {
+				l.Close()
+				return
+			}
+			continue
 		}
 		if !h.Src.Equal(l.spoofDst) {
 			continue
@@ -265,34 +276,17 @@ type spfFlow struct {
 	firstMsg []byte
 	seq      uint32
 
-	dmu       sync.Mutex
-	deadline  time.Time
+	dg        deadlineGate
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
 func (f *spfFlow) Read(b []byte) (int, error) {
-	f.dmu.Lock()
-	dl := f.deadline
-	f.dmu.Unlock()
-	var timeout <-chan time.Time
-	if !dl.IsZero() {
-		d := time.Until(dl)
-		if d <= 0 {
-			return 0, timeoutErr{}
-		}
-		t := time.NewTimer(d)
-		defer t.Stop()
-		timeout = t.C
+	pkt, err := f.dg.wait(f.in, f.closed)
+	if err != nil {
+		return 0, err
 	}
-	select {
-	case pkt := <-f.in:
-		return copy(b, pkt), nil
-	case <-timeout:
-		return 0, timeoutErr{}
-	case <-f.closed:
-		return 0, net.ErrClosed
-	}
+	return copy(b, pkt), nil
 }
 
 func (f *spfFlow) Write(b []byte) (int, error) {
@@ -308,9 +302,7 @@ func (f *spfFlow) Write(b []byte) (int, error) {
 }
 
 func (f *spfFlow) SetReadDeadline(t time.Time) error {
-	f.dmu.Lock()
-	f.deadline = t
-	f.dmu.Unlock()
+	f.dg.set(t)
 	return nil
 }
 func (f *spfFlow) Close() error {
