@@ -16,13 +16,19 @@ type sessionSet struct {
 	rr   uint64
 }
 
-func (s *sessionSet) add(sess *mux.Session) {
+// add registers a session and returns the new live-session count (under the
+// lock, so the 0->1 transition can be detected race-free by the caller).
+func (s *sessionSet) add(sess *mux.Session) int {
 	s.mu.Lock()
 	s.list = append(s.list, sess)
+	n := len(s.list)
 	s.mu.Unlock()
+	return n
 }
 
-func (s *sessionSet) remove(sess *mux.Session) {
+// remove unregisters a session and returns the remaining count (race-free, so
+// the 1->0 transition can be detected by the caller).
+func (s *sessionSet) remove(sess *mux.Session) int {
 	s.mu.Lock()
 	for i, x := range s.list {
 		if x == sess {
@@ -30,7 +36,9 @@ func (s *sessionSet) remove(sess *mux.Session) {
 			break
 		}
 	}
+	n := len(s.list)
 	s.mu.Unlock()
+	return n
 }
 
 // pick returns the next live session round-robin, or nil if none are available.

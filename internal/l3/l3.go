@@ -62,8 +62,22 @@ type Engine struct {
 	}
 }
 
+// safeDatagramMTU is the largest inner MTU that leaves room for the AEAD +
+// L4/IP wrapper to fit a ~1400-byte path (the Iranian underlays SPF/ICMP/UDP
+// carriers target). A larger inner packet becomes a DF datagram that blackholes
+// with no PMTUD across the tunnel.
+const safeDatagramMTU = 1320
+
 // New builds a TUN engine from validated config.
 func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
+	// Datagram carriers (udp/icmp/bip and every SPF profile) wrap each inner
+	// packet in one carrier datagram, so the inner MTU must leave header room.
+	// The reliable tcp carrier re-segments and is unaffected.
+	if datagramCarrier(cfg) && cfg.MTU > safeDatagramMTU {
+		log.Warn("mtu %d is too high for a datagram carrier — wrapped packets would exceed a ~1400-byte path and blackhole; clamping to %d (set mtu=%d to silence)",
+			cfg.MTU, safeDatagramMTU, safeDatagramMTU)
+		cfg.MTU = safeDatagramMTU
+	}
 	e := &Engine{
 		cfg:         cfg,
 		log:         log,
@@ -71,11 +85,13 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		mode:        cfg.TunMode,
 		queues:      cfg.Pool,
 		isDialer:    cfg.IsDialer(),
-		// Defaults tuned for throughput without wasting RAM: a 64-packet batch
-		// fills the ~60 KiB TCP frame (fewer frames/syscalls), and a 1024-deep
-		// per-queue channel absorbs bursts. The 2 ms flush still bounds latency.
+		// A 64-packet batch fills the ~60 KiB TCP frame (fewer frames/syscalls).
+		// The per-queue channel is a STANDING QUEUE whose depth adds latency under
+		// load (latency ≈ depth / drain-rate; the 2 ms flush only bounds batch
+		// assembly, not this queue), so it is sized modestly by profile instead of
+		// a fixed 1024 — enough to absorb bursts without becoming a bufferbloat sink.
 		batchSize:   orDefault(cfg.BatchSize, 64),
-		channelSize: orDefault(cfg.ChannelSize, 1024),
+		channelSize: orDefault(cfg.ChannelSize, channelDefault(cfg.Profile)),
 		pktLen:      cfg.MTU + 4,
 		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, 10)) * time.Second,
 		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, 25)) * time.Second,
@@ -86,6 +102,12 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 	}
 	if e.mode == "" {
 		e.mode = config.TunModeTCP
+	}
+	// TUN queue count is TunQueues if set, else Pool. It MUST match on both
+	// servers: the kernel fans flows across all queues, and a queue with no peer
+	// link drops every flow hashed to it.
+	if cfg.TunQueues > 0 {
+		e.queues = cfg.TunQueues
 	}
 	if e.queues < 1 {
 		e.queues = 1
@@ -261,7 +283,7 @@ func ipOnly(cidr string) string {
 // queueReader is the single goroutine allowed to block on a TUN queue's Read.
 // It lives for the whole run; packets are dropped only if the channel is full
 // (i.e. the link is down), which is harmless for L3 (upper layers retransmit).
-func (e *Engine) queueReader(ctx context.Context, q queue, ch chan<- []byte) {
+func (e *Engine) queueReader(ctx context.Context, q queue, ch chan []byte) {
 	for {
 		bp := e.pool.Get().(*[]byte)
 		n, err := q.Read((*bp)[:e.pktLen])
@@ -278,7 +300,21 @@ func (e *Engine) queueReader(ctx context.Context, q queue, ch chan<- []byte) {
 		case <-ctx.Done():
 			return
 		default:
-			// Link down / consumer slow: drop rather than block the reader.
+			// Queue full (link down / consumer slow). Drop the OLDEST packet and
+			// enqueue the newest so the far end gets the freshest data — stale
+			// buffered packets only add latency. Safe: this channel has exactly
+			// one producer (here) and one consumer (tunToLink).
+			select {
+			case <-ch: // evict head
+			default:
+			}
+			select {
+			case ch <- pkt:
+			case <-ctx.Done():
+				return
+			default:
+				// Consumer drained it in between; dropping the newest is fine.
+			}
 		}
 	}
 }
@@ -325,6 +361,7 @@ func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txChans []ch
 		free <- i
 	}
 	var wg sync.WaitGroup
+	var lastMismatchWarn atomic.Int64
 	for ctx.Err() == nil {
 		lk, err := e.llistener.AcceptLink()
 		if err != nil {
@@ -338,7 +375,16 @@ func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txChans []ch
 		select {
 		case slot = <-free:
 		default:
-			_ = lk.Close() // all queues occupied
+			// No free queue slot: the peer opened more links than this host has
+			// queues — a pool/tun_queues MISMATCH. The excess link is dropped and
+			// its flows would blackhole. Warn (rate-limited: the dialer hot-
+			// reconnects, so this fires continuously otherwise).
+			_ = lk.Close()
+			if now := e.nowSec(); now-lastMismatchWarn.Load() >= 30 {
+				lastMismatchWarn.Store(now)
+				e.log.Error("%s: peer opened more links than pool=%d queues here — set the SAME pool/tun_queues on BOTH servers or flows will be dropped",
+					e.engineLabel(), e.queues)
+			}
 			continue
 		}
 		wg.Add(1)
@@ -550,6 +596,30 @@ func orDefault(v, def int) int {
 		return def
 	}
 	return v
+}
+
+// datagramCarrier reports whether the config uses a datagram-based L3 carrier
+// (any SPF profile, or a TUN mode other than the reliable tcp stream).
+func datagramCarrier(cfg *config.Config) bool {
+	if cfg.IsSPF() {
+		return true
+	}
+	return cfg.TunMode != "" && cfg.TunMode != config.TunModeTCP
+}
+
+// channelDefault sizes the per-queue TX channel by profile. Shallow queues keep
+// latency low (they are a standing queue when the carrier is the bottleneck);
+// they are deep enough to absorb short bursts, and a full queue is just an early
+// congestion signal the inner protocol already handles.
+func channelDefault(profile string) int {
+	switch profile {
+	case config.ProfileFast:
+		return 512
+	case config.ProfileResource:
+		return 128
+	default: // balance
+		return 256
+	}
 }
 
 func sleepCtx(ctx context.Context, b *time.Duration) bool {

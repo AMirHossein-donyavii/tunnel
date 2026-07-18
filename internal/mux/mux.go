@@ -135,6 +135,9 @@ func (s *Session) IsClosed() bool {
 // Done returns a channel closed when the session is torn down.
 func (s *Session) Done() <-chan struct{} { return s.closeCh }
 
+// RemoteAddr returns the peer address of the underlying link (for logging).
+func (s *Session) RemoteAddr() net.Addr { return s.conn.RemoteAddr() }
+
 // OpenStream opens a new outbound stream. dest is an optional destination hint
 // carried in the SYN (e.g. the remote port for reverse forwarding). hi requests
 // high-priority scheduling.

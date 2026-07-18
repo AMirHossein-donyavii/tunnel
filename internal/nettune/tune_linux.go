@@ -36,9 +36,10 @@ func Apply(c net.Conn, o Options) {
 		if o.RcvBuf > 0 {
 			_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, o.RcvBuf)
 		}
-		if o.QuickAck {
-			_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-		}
+		// Note: TCP_QUICKACK is intentionally NOT set — it is a one-shot flag on
+		// Linux that reverts to delayed-ACK after the next segment, so setting it
+		// once at connect is a no-op. TCP_NODELAY (above) is the effective
+		// latency knob and applies for the connection's lifetime.
 		if o.UserTimeout > 0 {
 			// TCP_USER_TIMEOUT: fail fast on unacked data (stalled peers).
 			_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, ut)
@@ -57,5 +58,5 @@ func Apply(c net.Conn, o Options) {
 
 // TuneConn is the legacy buffer-only entry point (used by the L3 engine).
 func TuneConn(c net.Conn, sndbuf, rcvbuf int) {
-	Apply(c, Options{SndBuf: sndbuf, RcvBuf: rcvbuf, QuickAck: true, BBR: true, Keepalive: 30 * time.Second, UserTimeout: 20 * time.Second})
+	Apply(c, Options{SndBuf: sndbuf, RcvBuf: rcvbuf, BBR: true, Keepalive: 30 * time.Second, UserTimeout: 20 * time.Second})
 }

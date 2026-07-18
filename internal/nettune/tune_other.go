@@ -4,7 +4,7 @@ package nettune
 
 import "net"
 
-// Apply on non-Linux only sets TCP_NODELAY and keepalive (the buffer/QUICKACK/
+// Apply on non-Linux only sets TCP_NODELAY and keepalive (the buffer/
 // USER_TIMEOUT/BBR options are Linux-specific). Production runs on Linux; this
 // keeps other OSes building and lightly tuned.
 func Apply(c net.Conn, o Options) {

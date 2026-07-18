@@ -28,7 +28,9 @@ peer_tun_ip = "10.10.10.2" # the other server's tunnel address
 tun_iface = "emergency-tun"
 mtu = 1380
 
-pool = 4                   # links == TUN queues; keep ≈ CPU cores
+pool = 4                   # links == TUN queues — MUST be IDENTICAL on both servers
+                           # (a mismatch blackholes flows hashed to the extra queues).
+                           # tun_queues = 4        # optional: decouple queue count from pool
 workers = 0                # 0 = auto (cgroup-aware)
 cipher = "chacha20-poly1305"   # AEAD; keys auto-negotiated (ephemeral X25519)
 

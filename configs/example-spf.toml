@@ -38,7 +38,7 @@ peer_tun_ip = "10.10.10.1"
 tun_iface = "emergency-tun"
 mtu = 1280                       # a little lower for ICMP/IP overhead
 
-pool = 4
+pool = 4                        # links == TUN queues — MUST be IDENTICAL on both servers
 workers = 0
 cipher = "chacha20-poly1305"
 health_port = 9090

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,7 @@ var bufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b 
 type target struct {
 	remote int
 	pp     bool
+	hi     bool // open user streams high-priority (low-latency @ll forwards)
 }
 
 // Engine runs one multiplexed tunnel.
@@ -44,6 +46,7 @@ type Engine struct {
 	cipher   string
 	isDialer bool
 	isEntry  bool
+	exitHost string // where the exit dials forwarded services (default 127.0.0.1)
 	dialer   transport.Dialer
 	listener transport.Listener
 	tune     nettune.Options
@@ -59,6 +62,7 @@ type Engine struct {
 		rxBytes       uint64
 		txBytes       uint64
 		sessionErrs   uint64
+		forwardsUp    int64 // client-facing ports currently bound (entry side)
 	}
 }
 
@@ -74,6 +78,7 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		cipher:   cfg.Cipher,
 		isDialer: cfg.IsDialer(),
 		isEntry:  cfg.IsEntry(),
+		exitHost: orDefaultStr(cfg.ExitHost, "127.0.0.1"),
 		tune:     nettune.LinkOptions(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf),
 		routes:   map[int]target{},
 	}
@@ -90,7 +95,7 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 				return nil, err
 			}
 			for p := f.ListenStart; p <= f.ListenEnd; p++ {
-				e.routes[p] = target{remote: f.RemoteFor(p), pp: f.ProxyProto}
+				e.routes[p] = target{remote: f.RemoteFor(p), pp: f.ProxyProto, hi: f.LowLatency}
 			}
 		}
 	}
@@ -197,8 +202,17 @@ func (e *Engine) acceptSessions(ctx context.Context) {
 // serveSession registers a session and either serves inbound streams (exit) or
 // holds it available for the user handlers (entry) until it dies.
 func (e *Engine) serveSession(ctx context.Context, sess *mux.Session) {
-	e.set.add(sess)
-	defer func() { e.set.remove(sess); sess.Close() }()
+	// Log the tunnel-up transition so operators get the same "connected" signal
+	// the TUN engine prints — its absence made a working mux tunnel look dead.
+	if e.set.add(sess) == 1 {
+		e.log.Info("mux tunnel connected: session up (role=%s peer=%s)", e.cfg.Role, sess.RemoteAddr())
+	}
+	defer func() {
+		if e.set.remove(sess) == 0 {
+			e.log.Warn("mux tunnel disconnected — all sessions down, reconnecting…")
+		}
+		sess.Close()
+	}()
 
 	if e.isEntry {
 		// Entry opens streams on demand; the session's own keepalive detects
@@ -230,9 +244,10 @@ func (e *Engine) serveExitStream(st *mux.Stream) {
 	remote := int(binary.BigEndian.Uint16(dest[:2]))
 	pp := dest[2:]
 
-	local, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", remote), dialLocalTO)
+	target := net.JoinHostPort(e.exitHost, strconv.Itoa(remote))
+	local, err := net.DialTimeout("tcp", target, dialLocalTO)
 	if err != nil {
-		e.sessionErr("dial local 127.0.0.1:%d: %v", remote, err)
+		e.sessionErr("dial exit service %s: %v", target, err)
 		_ = st.Close()
 		return
 	}
@@ -255,14 +270,35 @@ func (e *Engine) serveExitStream(st *mux.Stream) {
 // ---- entry side -------------------------------------------------------------
 
 func (e *Engine) serveForward(ctx context.Context, port int) {
+	// Binding the client-facing port can transiently fail (a restart TIME_WAIT
+	// race, or the port briefly held by the previous instance). Retry with
+	// backoff instead of giving up permanently, so the forward self-heals without
+	// a daemon restart. A permanently-taken port keeps logging until freed.
 	lc := net.ListenConfig{}
-	ln, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		e.log.Error("cannot listen on forwarded port %d: %v", port, err)
-		return
+	var ln net.Listener
+	backoff := time.Second
+	warned := false
+	for {
+		var err error
+		ln, err = lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if !warned {
+			e.log.Error("cannot bind VPN/listen port %d yet (%v) — clients cannot connect until it is free; retrying", port, err)
+			warned = true
+		}
+		if !sleepCtx(ctx, &backoff) {
+			return
+		}
 	}
 	t := e.routes[port]
-	e.log.Info("mux forwarding tcp/%d -> remote tcp/%d (proxy_protocol=%v)", port, t.remote, t.pp)
+	atomic.AddInt64(&e.stats.forwardsUp, 1)
+	defer atomic.AddInt64(&e.stats.forwardsUp, -1)
+	e.log.Info("mux forwarding tcp/%d -> exit tcp/%d (proxy_protocol=%v)", port, t.remote, t.pp)
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	for {
 		uc, err := ln.Accept()
@@ -297,7 +333,7 @@ func (e *Engine) handleUser(ctx context.Context, uc net.Conn, t target) {
 			attempt--
 			continue
 		}
-		st, err := sess.OpenStream(dest, false)
+		st, err := sess.OpenStream(dest, t.hi)
 		if err != nil {
 			continue // session died; try another
 		}
@@ -348,13 +384,15 @@ func (e *Engine) sessionErr(f string, a ...any) {
 
 // Stats is a point-in-time snapshot.
 type Stats struct {
-	Sessions      int    `json:"sessions"`
-	ActiveStreams int64  `json:"active_streams"`
-	TotalStreams  uint64 `json:"total_streams"`
-	RxBytes       uint64 `json:"rx_bytes"`
-	TxBytes       uint64 `json:"tx_bytes"`
-	SessionErrors uint64 `json:"session_errors"`
-	RTTms         int64  `json:"rtt_ms"`
+	Sessions           int    `json:"sessions"`
+	ActiveStreams      int64  `json:"active_streams"`
+	TotalStreams       uint64 `json:"total_streams"`
+	RxBytes            uint64 `json:"rx_bytes"`
+	TxBytes            uint64 `json:"tx_bytes"`
+	SessionErrors      uint64 `json:"session_errors"`
+	RTTms              int64  `json:"rtt_ms"`
+	ForwardsConfigured int    `json:"forwards_configured"` // entry: VPN/listen ports configured
+	ForwardsUp         int64  `json:"forwards_up"`         // entry: of those, currently bound
 }
 
 // Healthy reports whether the tunnel currently has at least one live session.
@@ -364,18 +402,27 @@ func (e *Engine) Healthy() bool { return e.set.count() > 0 }
 // Snapshot returns current counters (as any, for the shared engine interface).
 func (e *Engine) Snapshot() any {
 	return Stats{
-		Sessions:      e.set.count(),
-		ActiveStreams: atomic.LoadInt64(&e.stats.activeStreams),
-		TotalStreams:  atomic.LoadUint64(&e.stats.totalStreams),
-		RxBytes:       atomic.LoadUint64(&e.stats.rxBytes),
-		TxBytes:       atomic.LoadUint64(&e.stats.txBytes),
-		SessionErrors: atomic.LoadUint64(&e.stats.sessionErrs),
-		RTTms:         e.set.bestRTT().Milliseconds(),
+		Sessions:           e.set.count(),
+		ActiveStreams:      atomic.LoadInt64(&e.stats.activeStreams),
+		TotalStreams:       atomic.LoadUint64(&e.stats.totalStreams),
+		RxBytes:            atomic.LoadUint64(&e.stats.rxBytes),
+		TxBytes:            atomic.LoadUint64(&e.stats.txBytes),
+		SessionErrors:      atomic.LoadUint64(&e.stats.sessionErrs),
+		RTTms:              e.set.bestRTT().Milliseconds(),
+		ForwardsConfigured: len(e.routes),
+		ForwardsUp:         atomic.LoadInt64(&e.stats.forwardsUp),
 	}
 }
 
 func orDefault(v, def int) int {
 	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+func orDefaultStr(v, def string) string {
+	if v == "" {
 		return def
 	}
 	return v

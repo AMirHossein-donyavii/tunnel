@@ -68,12 +68,22 @@ func (st *Stream) ID() uint32 { return st.id }
 
 // ---- receive ----------------------------------------------------------------
 
-// deliver is called by the session reader with a fresh DATA payload.
+// deliver is called by the session reader with a fresh DATA payload. It enforces
+// a hard receive-buffer ceiling as defense-in-depth: a conformant peer never
+// sends more than its flow-control window (≤ the largest profile window, 4 MiB),
+// so this only trips on a peer that ignores flow control — in which case the
+// stream is reset to reclaim memory rather than buffering without bound.
 func (st *Stream) deliver(data []byte) {
 	st.rmu.Lock()
 	st.rbuf = append(st.rbuf, data...)
+	over := len(st.rbuf) > maxRecvBuffer
 	st.rcond.Signal()
 	st.rmu.Unlock()
+	if over {
+		st.setErr(ErrStreamReset)
+		_ = st.s.queue(outFrame{typ: frameRST, id: st.id}, true)
+		st.s.removeStream(st.id)
+	}
 }
 
 func (st *Stream) remoteFIN() {

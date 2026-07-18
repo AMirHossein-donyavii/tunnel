@@ -37,6 +37,11 @@ const (
 	// (idle streams use ~0). The engine raises this per performance profile; the
 	// WINDOW_UPDATE threshold is derived as window/2 per stream.
 	defaultWindow = 2 * 1024 * 1024
+	// maxRecvBuffer is the hard per-stream receive-buffer ceiling. It is set well
+	// above the largest profile window (fast = 4 MiB) so a conformant, in-window
+	// peer never reaches it; it only bounds memory against a peer that ignores
+	// flow control (the receiver appends delivered data before the app reads it).
+	maxRecvBuffer = 16 * 1024 * 1024
 )
 
 // header is the fixed 10-byte frame header.

@@ -55,6 +55,12 @@ type Config struct {
 	MTU        int    `toml:"mtu"`
 	Workers    int    `toml:"workers"` // 0 = auto
 	Pool       int    `toml:"pool"`
+	// TunQueues sets the number of TUN queues / carrier links for the L3 engines
+	// (0 = use Pool). It MUST be identical on both servers: the kernel steers
+	// flows across all queues, so a queue without a peer link silently blackholes
+	// every flow hashed to it. Decoupled from Pool only so the mux session count
+	// and the TUN queue count can differ if ever needed.
+	TunQueues  int    `toml:"tun_queues"`
 	Cipher     string `toml:"cipher"`
 	HealthPort int    `toml:"health_port"`
 	Profile    string `toml:"profile"`
@@ -74,6 +80,11 @@ type Config struct {
 	ChannelSize       int `toml:"channel_size"`       // per-queue queue depth; 0 = auto
 	SoSndbuf          int `toml:"so_sndbuf"`          // bytes; 0 = OS default
 	SoRcvbuf          int `toml:"so_rcvbuf"`          // bytes; 0 = OS default
+
+	// ExitHost is where the exit (Kharej) dials forwarded services (mux engine).
+	// Default 127.0.0.1; set to the address the local service binds if it is not
+	// on loopback (mirrors the TUN engine's peer_tun_ip reachability).
+	ExitHost string `toml:"exit_host"`
 
 	// ProxyProtocol is the default; individual forwards may override with "@pp".
 	ProxyProtocol bool `toml:"proxy_protocol"`
@@ -95,11 +106,12 @@ func Defaults() Config {
 		TunIface:      "emergency-tun",
 		MTU:           1380,
 		Workers:       0,
-		Pool:          8,
+		Pool:          4, // MUST match on both servers for TUN/SPF (see TunQueues)
 		Cipher:        "chacha20-poly1305",
 		HealthPort:    9090, // local stats endpoint (kept off the tunnel port)
 		Profile:       ProfileBalance,
 		LogLevel:      "info",
+		ExitHost:      "127.0.0.1",
 		ProxyProtocol: false,
 
 		// TCP Reverse Tunnel (multiplexed) is the primary, recommended engine.
@@ -194,6 +206,21 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("peer is required on the dialing side (role=%s mode=%s)", c.Role, c.Mode)
 	}
 
+	// Heartbeat: compare EFFECTIVE values (after the runtime defaults of 10s/25s),
+	// so setting only the interval (e.g. 30) can't leave the timeout defaulted to
+	// 25 ≤ 30 and tear links down before the first heartbeat arrives. Applies to
+	// every engine (mux keepalive and L3 heartbeat share these fields).
+	ei, et := c.HeartbeatInterval, c.HeartbeatTimeout
+	if ei <= 0 {
+		ei = 10
+	}
+	if et <= 0 {
+		et = 25
+	}
+	if et <= ei {
+		return fmt.Errorf("heartbeat_timeout (effective %ds) must be greater than heartbeat_interval (effective %ds)", et, ei)
+	}
+
 	// Port forwarding (the client-facing VPN/service port) belongs ONLY to the
 	// Iran (entry) server, for every engine. The Foreign server just carries the
 	// tunnel; it never binds client ports or installs NAT.
@@ -268,9 +295,7 @@ func (c *Config) validateTUN() error {
 			return fmt.Errorf("tun_ip6 must be an IPv6 address with prefix, e.g. fd00::1/64 (got %q)", c.TunIP6)
 		}
 	}
-	if c.HeartbeatTimeout > 0 && c.HeartbeatInterval > 0 && c.HeartbeatTimeout <= c.HeartbeatInterval {
-		return fmt.Errorf("heartbeat_timeout (%d) must be greater than heartbeat_interval (%d)", c.HeartbeatTimeout, c.HeartbeatInterval)
-	}
+	// (Heartbeat interval/timeout ordering is validated centrally in Validate.)
 	// Port forwarding is optional for the L3 engines, but when present each spec
 	// must parse and needs a peer_tun_ip to DNAT toward across the tunnel.
 	if len(c.Forwards) > 0 {
@@ -334,28 +359,35 @@ type Forward struct {
 	ListenEnd   int  // last local port (== ListenStart for single/mapping)
 	RemoteBase  int  // remote port for ListenStart; offsets follow for ranges
 	ProxyProto  bool // emit PROXY protocol v2 to the exit-side service
+	LowLatency  bool // open as a high-priority mux stream (gaming/interactive)
 	Raw         string
 }
 
-// ParseForward parses one forward spec. defProxy is the global default applied
-// unless the spec carries an explicit "@pp" suffix.
+// ParseForward parses one forward spec. Flags are "@"-separated suffixes and may
+// be combined, e.g. "443@pp@ll". defProxy is the global proxy-protocol default,
+// overridable per spec with @pp / @nopp; @ll marks the port low-latency.
 func ParseForward(spec string, defProxy bool) (Forward, error) {
 	raw := spec
 	pp := defProxy
+	ll := false
 	spec = strings.TrimSpace(spec)
 	if i := strings.Index(spec, "@"); i >= 0 {
-		flag := strings.ToLower(strings.TrimSpace(spec[i+1:]))
+		flagsPart := spec[i+1:]
 		spec = strings.TrimSpace(spec[:i])
-		switch flag {
-		case "pp", "proxy", "proxyproto":
-			pp = true
-		case "nopp", "noproxy":
-			pp = false
-		default:
-			return Forward{}, fmt.Errorf("unknown flag %q (use @pp or @nopp)", flag)
+		for _, flag := range strings.Split(flagsPart, "@") {
+			switch strings.ToLower(strings.TrimSpace(flag)) {
+			case "pp", "proxy", "proxyproto":
+				pp = true
+			case "nopp", "noproxy":
+				pp = false
+			case "ll", "lowlatency", "gaming":
+				ll = true
+			default:
+				return Forward{}, fmt.Errorf("unknown flag %q (use @pp, @nopp or @ll)", flag)
+			}
 		}
 	}
-	f := Forward{ProxyProto: pp, Raw: raw}
+	f := Forward{ProxyProto: pp, LowLatency: ll, Raw: raw}
 	switch {
 	case strings.Contains(spec, "="): // mapping local=remote
 		parts := strings.SplitN(spec, "=", 2)

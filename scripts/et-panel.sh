@@ -240,13 +240,15 @@ create_tunnel() {
     fi
 
     local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health
-    local tun_ip="" peer_tun_ip="" forwards_toml="[]" proxy="false"
+    local tun_ip="" peer_tun_ip="" forwards_toml="[]" proxy="false" exit_host="127.0.0.1"
 
     tunnel_port="$(ask_port "Tunnel port (server <-> server link — SAME on both servers)" "1234")"
     mtu="$(ask_int "MTU" "1380" 576 9000)"
     profile="$(ask_oneof "Performance profile (fast=throughput | balance | resource=low RAM)" "balance" "fast balance resource")"
     workers="$(ask_int "CPU workers (0 = auto-detect)" "0" 0 256)"
-    pool="$(ask_int "Tunnel links / sessions" "4" 1 1024)"
+    echo -e "  ${C_Y}Tunnel links MUST be identical on BOTH servers for TUN/SPF${C_RESET} (a mismatch"
+    echo -e "  ${C_C}silently drops traffic). Keep this the same value on Iran and Foreign.${C_RESET}"
+    pool="$(ask_int "Tunnel links / sessions (SAME on both servers)" "4" 1 1024)"
     health="$(ask_port "Health/stats port (local only, != tunnel port)" "9090")"
 
     echo -e "  Encryption: ${C_G}1)${C_RESET} chacha20-poly1305 (fast on ARM/mobile)   ${C_G}2)${C_RESET} aes-256-gcm (fast with AES-NI)"
@@ -305,7 +307,7 @@ create_tunnel() {
             echo; echo -e "  ${C_BOLD}VPN Listen Port${C_RESET}"
             echo -e "  ${C_C}This is the VPN/service port that your VPN clients connect to. It is only"
             echo -e "  required on the Iran server. Common choices are ports like 443.${C_RESET}"
-            echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET} for PROXY protocol)"
+            echo -e "  Formats: ${C_C}443${C_RESET}  ${C_C}443,8443${C_RESET}  ${C_C}200-300${C_RESET}  ${C_C}8000=9000${C_RESET}  (append ${C_C}@pp${C_RESET}=PROXY proto, ${C_C}@ll${C_RESET}=low-latency/gaming)"
             local flist
             while true; do
                 flist="$(ask_req "VPN data port(s)" "443")"
@@ -314,12 +316,16 @@ create_tunnel() {
                 echo -e "  ${C_R}At least one VPN/listen port is required.${C_RESET}"
             done
             yesno "Enable PROXY protocol v2 by default?" "n" && proxy="true"
+        elif [ "$role" = "kharej" ]; then
+            echo; echo -e "  ${C_C}The exit dials your VPN/service on 127.0.0.1 by default. If the service on"
+            echo -e "  THIS server listens on a different address (not loopback), set it here.${C_RESET}"
+            exit_host="$(ask "Exit service host" "127.0.0.1")"
         fi
     fi
 
     write_config "$name" "$role" "$engine" "$transport" "$mode" "$peer" "$tunnel_port" \
         "$tun_mode" "$spf_profile" "$spoof_src" "$spoof_dst" "$tun_ip" "$peer_tun_ip" \
-        "$iface" "$mtu" "$workers" "$pool" "$cipher" "$health" "$profile" "$proxy" "$forwards_toml"
+        "$iface" "$mtu" "$workers" "$pool" "$cipher" "$health" "$profile" "$proxy" "$forwards_toml" "$exit_host"
 
     echo; echo -e "  ${C_C}Validating configuration...${C_RESET}"
     if ! "$CORE" validate --config "${CONF_DIR}/${name}.toml"; then
@@ -356,7 +362,8 @@ write_config() {
     local name="$1" role="$2" engine="$3" transport="$4" mode="$5" peer="$6" tunnel="$7" \
           tun_mode="$8" spf_profile="$9" spoof_src="${10}" spoof_dst="${11}" tun_ip="${12}" \
           peer_tun_ip="${13}" iface="${14}" mtu="${15}" workers="${16}" pool="${17}" \
-          cipher="${18}" health="${19}" profile="${20}" proxy="${21}" forwards="${22}"
+          cipher="${18}" health="${19}" profile="${20}" proxy="${21}" forwards="${22}" \
+          exit_host="${23}"
     install -d -m 0750 "$CONF_DIR"
     umask 077
     {
@@ -394,6 +401,7 @@ write_config() {
             [ "$forwards" != "[]" ] && echo "forwards = $forwards"
         else
             echo "proxy_protocol = $proxy"
+            [ -n "$exit_host" ] && [ "$exit_host" != "127.0.0.1" ] && echo "exit_host = \"$exit_host\""
             echo "forwards = $forwards"
         fi
     } > "${CONF_DIR}/${name}.toml"

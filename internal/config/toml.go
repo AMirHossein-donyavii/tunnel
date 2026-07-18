@@ -70,6 +70,8 @@ func assign(c *Config, key, val string) error {
 		c.LogLevel = unquote(val)
 	case "engine":
 		c.Engine = unquote(val)
+	case "exit_host":
+		c.ExitHost = unquote(val)
 	case "heartbeat_interval":
 		return intField(val, &c.HeartbeatInterval)
 	case "heartbeat_timeout":
@@ -92,6 +94,8 @@ func assign(c *Config, key, val string) error {
 		return intField(val, &c.Workers)
 	case "pool":
 		return intField(val, &c.Pool)
+	case "tun_queues":
+		return intField(val, &c.TunQueues)
 	case "health_port":
 		return intField(val, &c.HealthPort)
 	case "proxy_protocol":
@@ -242,6 +246,9 @@ func (c *Config) Marshal() string {
 	kb("proxy_protocol", c.ProxyProtocol)
 
 	if c.UsesL3() {
+		if c.TunQueues > 0 {
+			ki("tun_queues", c.TunQueues)
+		}
 		ki("heartbeat_interval", c.HeartbeatInterval)
 		ki("heartbeat_timeout", c.HeartbeatTimeout)
 		if c.BatchSize > 0 {
@@ -256,6 +263,10 @@ func (c *Config) Marshal() string {
 		if c.SoRcvbuf > 0 {
 			ki("so_rcvbuf", c.SoRcvbuf)
 		}
+	}
+
+	if c.Engine == EngineMux && c.ExitHost != "" && c.ExitHost != "127.0.0.1" {
+		kv("exit_host", c.ExitHost)
 	}
 
 	b.WriteString("forwards = [")

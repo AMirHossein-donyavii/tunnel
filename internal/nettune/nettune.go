@@ -12,20 +12,30 @@ type Options struct {
 	RcvBuf      int           // SO_RCVBUF bytes
 	UserTimeout time.Duration // TCP_USER_TIMEOUT: drop link if unacked this long
 	Keepalive   time.Duration // TCP keepalive idle/interval
-	QuickAck    bool          // TCP_QUICKACK: disable delayed ACKs (lower latency)
 	BBR         bool          // request BBR congestion control
 }
 
-// LinkOptions builds recommended options for a tunnel link from the profile,
-// with explicit buffer overrides.
+// LinkOptions builds recommended options for a TUNNEL LINK (the TCP carrier
+// used by the mux engine and the L3 tcp carrier). Datagram carriers size their
+// sockets directly from BufSizes and are unaffected by this function.
+//
+// SndBuf is deliberately left at 0 (kernel autotuning) unless the operator sets
+// an explicit override. Pinning SO_SNDBUF to a large fixed value turns the
+// socket send buffer into a multi-megabyte standing FIFO: under any carrier
+// congestion the kernel accepts megabytes of app data and drains them slowly,
+// so latency-sensitive packets (and mux's high-priority frames) sit behind
+// seconds of already-buffered bytes — classic bufferbloat, and the direct cause
+// of the ~10 s tunnelled ping. Linux tcp_wmem autotuning tracks the BDP, so BBR
+// still gets at least a bandwidth-delay-product of buffer (no throughput loss)
+// without the standing queue. The receive buffer keeps its profile size — a
+// large RcvBuf does not cause sender-side bufferbloat.
 func LinkOptions(profile string, sndOverride, rcvOverride int) Options {
-	snd, rcv := BufSizes(profile, sndOverride, rcvOverride)
+	_, rcv := BufSizes(profile, 0, rcvOverride)
 	o := Options{
-		SndBuf:      snd,
+		SndBuf:      sndOverride, // 0 => kernel autotune; only an explicit override pins it
 		RcvBuf:      rcv,
 		UserTimeout: 20 * time.Second,
 		Keepalive:   15 * time.Second,
-		QuickAck:    true,
 		BBR:         true,
 	}
 	if profile == "resource" {

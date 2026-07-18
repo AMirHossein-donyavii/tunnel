@@ -19,7 +19,7 @@ tunnel_port = 1234         # TUNNEL port: server <-> server link (open this in f
 mtu = 1380
 
 workers = 0                # 0 = auto (honours cgroup CPU quota)
-pool = 4                   # tunnel links/sessions kept ready (mux carries many streams each)
+pool = 4                   # tunnel links/sessions — MUST be identical on both servers
 cipher = "chacha20-poly1305"   # AEAD; keys auto-negotiated (ephemeral X25519, no PSK)   # or "aes-256-gcm"
 
 health_port = 9090         # localhost health/stats endpoint (0 to disable; must != tunnel port)
@@ -32,11 +32,17 @@ heartbeat_timeout = 25
 
 proxy_protocol = false     # default; override per forward with @pp / @nopp
 
+# exit_host — where the EXIT (Kharej) dials the local service. Default 127.0.0.1;
+# set it only on the Kharej config if the service binds a non-loopback address.
+# exit_host = "127.0.0.1"
+
 # VPN configuration / data port(s) — users connect here (entry side only):
 #   "443"         listen 443  -> remote 443    (the common VPN/data port)
 #   "443,8443"    two ports (comma separated)
 #   "200-300"     port range
 #   "8000=9000"   listen 8000 -> remote 9000
 #   "443@pp"      enable PROXY protocol v2 for this entry
+#   "27015@ll"    low-latency (gaming/interactive) — high-priority streams
+#   "443@pp@ll"   flags combine
 # Note: forwarded ports must differ from the tunnel port (1234).
 forwards = ["443", "8443=8443"]

@@ -4,6 +4,65 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] — 2026-07-19
+
+Fixes the "mux can't connect" report and the TUN ~10 s ping / ~50% loss, then
+balances throughput and cuts latency across every protocol. Root-caused with a
+multi-agent code audit (27 findings, adversarially verified).
+
+### Fixed — mux "cannot connect"
+The mux link path is byte-for-byte the same as tun(tcp), so a real link failure
+was impossible where tun connected. The actual causes:
+- **No "connected" log.** mux printed nothing on session establishment (tun
+  prints `Tunnel connected successfully`), so a working tunnel looked dead in
+  `journalctl`. It now logs `mux tunnel connected: session up …` on the 0→1
+  session transition and `mux tunnel disconnected …` on 1→0, on both ends.
+- **Silent forward-bind failure.** The Iran VPN/listen port is bound in-process;
+  if it was busy, clients got connection-refused while sessions still showed up.
+  `serveForward` now **retries with backoff** (self-heals a restart race) and
+  surfaces `forwards_configured` / `forwards_up` in `/stats`.
+- **Exit hard-dialed `127.0.0.1`.** If the Kharej service isn't on loopback,
+  every stream failed. New **`exit_host`** config (default `127.0.0.1`) points
+  the exit at the address the service actually binds.
+
+### Fixed — TUN ~10 s latency / ~50% loss
+- **Dead-queue blackhole.** The default `pool` was **8** while the panel/examples
+  use **4**; the kernel fans TUN flows across all queues, so a mismatch left some
+  queues with no peer link, silently dropping every flow hashed to them. Default
+  is now **4** (matches everything), a **rate-limited error** fires when a peer
+  opens more links than there are queues, and an optional **`tun_queues`** field
+  decouples the count if needed. **Both servers must use the same value.**
+- **Carrier bufferbloat (the 10 s ping).** The TCP carrier pinned `SO_SNDBUF` to
+  1–4 MiB, a standing FIFO that buffers seconds of data under congestion and
+  defeats priority scheduling. The carrier now uses **kernel send-buffer
+  autotuning** (tracks BDP → no throughput loss, no standing queue). Scoped to
+  the TCP carriers; datagram carriers are unchanged.
+- **Shallower queues + drop-head.** Per-queue channel depth is now profile-based
+  (fast 512 / balance 256 / resource 128, was a fixed 1024), and a full queue now
+  **drops the oldest** packet and keeps the newest (freshest data, lower latency).
+
+### Added — throughput balance & latency
+- **`@ll` low-latency forward flag** (e.g. `443@ll`, combinable: `443@pp@ll`) —
+  opens the user's mux streams **high-priority** in both directions, so gaming/
+  interactive traffic isn't stuck behind bulk transfers. Flags now combine.
+- **Datagram MTU guard.** SPF/udp/icmp carriers clamp the inner MTU to **1320**
+  (with a warning) so a wrapped packet can't exceed a ~1400-byte path and
+  blackhole. The tcp carrier keeps MTU 1380.
+- **Mux receive-buffer ceiling** (16 MiB/stream) — defense-in-depth so a peer
+  ignoring flow control can't grow memory without bound; the stream resets.
+- **Removed the no-op one-shot `TCP_QUICKACK`** (it reverts after one segment on
+  Linux; `TCP_NODELAY` is the real latency knob and stays). **Heartbeat
+  validation** now compares *effective* values, so setting only the interval
+  can't leave the timeout defaulted below it and cause false timeouts.
+
+### Notes
+- **Upgrade both servers together** (or set `pool` explicitly on both first): a
+  1.8.x peer defaults `pool` to 8, so upgrading only one end creates the 4-vs-8
+  mismatch this release warns about.
+- The TUN/SPF data-plane fixes are analyzed + unit-tested here; validate latency/
+  loss on a real Iran↔Kharej pair (iperf3 both directions + ping on the same
+  queue). mux (the default) is verified end-to-end, including the reconnect path.
+
 ## [1.8.1] — 2026-07-11
 
 Fixes the SPF/datagram long-run disconnect that required a manual Iran-side

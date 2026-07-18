@@ -263,6 +263,48 @@ func TestDefaultsAreSane(t *testing.T) {
 	if len(d.TunIface) > 15 {
 		t.Errorf("interface name %q exceeds the 15-char kernel limit", d.TunIface)
 	}
+	// Pool default must match the panel/examples (4) so a hand-written peer that
+	// omits `pool` does not silently mismatch and blackhole TUN flows.
+	if d.Pool != 4 {
+		t.Errorf("default pool should be 4 (matches panel/examples), got %d", d.Pool)
+	}
+	if d.ExitHost != "127.0.0.1" {
+		t.Errorf("default exit_host should be 127.0.0.1, got %q", d.ExitHost)
+	}
+}
+
+func TestValidateHeartbeatEffective(t *testing.T) {
+	// interval set high with timeout left at 0 (defaults to 25) must be rejected —
+	// otherwise effective timeout 25 <= interval 30 tears links down immediately.
+	c := baseTUN()
+	c.HeartbeatInterval = 30
+	c.HeartbeatTimeout = 0
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: effective heartbeat_timeout(25) <= interval(30)")
+	}
+	// The defaults (10/25) are valid.
+	c = baseTUN()
+	c.HeartbeatInterval, c.HeartbeatTimeout = 0, 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default heartbeat should be valid: %v", err)
+	}
+	// A sane explicit pair is valid.
+	c = baseTUN()
+	c.HeartbeatInterval, c.HeartbeatTimeout = 30, 75
+	if err := c.Validate(); err != nil {
+		t.Fatalf("30/75 heartbeat should be valid: %v", err)
+	}
+	// Applies to the mux engine too (shares the fields).
+	m := baseTUN()
+	m.Engine = EngineMux
+	m.TunIP, m.PeerTunIP = "", ""
+	m.Role = RoleIran
+	m.Peer = ""
+	m.Forwards = []string{"443"}
+	m.HeartbeatInterval, m.HeartbeatTimeout = 40, 20
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected error: mux heartbeat 20 <= 40")
+	}
 }
 
 func TestValidateRejectsUnknownEngine(t *testing.T) {
@@ -289,21 +331,28 @@ func TestForwardParsing(t *testing.T) {
 	cases := map[string]struct {
 		start, end, remote int
 		pp                 bool
+		ll                 bool
 	}{
-		"2096":       {2096, 2096, 2096, false},
-		"8000=9000":  {8000, 8000, 9000, false},
-		"200-203":    {200, 203, 200, false},
-		"2096@pp":    {2096, 2096, 2096, true},
-		"8000=9000@pp": {8000, 8000, 9000, true},
+		"2096":         {2096, 2096, 2096, false, false},
+		"8000=9000":    {8000, 8000, 9000, false, false},
+		"200-203":      {200, 203, 200, false, false},
+		"2096@pp":      {2096, 2096, 2096, true, false},
+		"8000=9000@pp": {8000, 8000, 9000, true, false},
+		"27015@ll":     {27015, 27015, 27015, false, true}, // gaming/interactive
+		"443@pp@ll":    {443, 443, 443, true, true},        // combined flags
+		"443@ll@pp":    {443, 443, 443, true, true},        // order-independent
 	}
 	for spec, want := range cases {
 		f, err := ParseForward(spec, false)
 		if err != nil {
 			t.Fatalf("%s: %v", spec, err)
 		}
-		if f.ListenStart != want.start || f.ListenEnd != want.end || f.RemoteBase != want.remote || f.ProxyProto != want.pp {
+		if f.ListenStart != want.start || f.ListenEnd != want.end || f.RemoteBase != want.remote || f.ProxyProto != want.pp || f.LowLatency != want.ll {
 			t.Errorf("%s: got %+v want %+v", spec, f, want)
 		}
+	}
+	if _, err := ParseForward("443@bogus", false); err == nil {
+		t.Error("expected error for unknown flag")
 	}
 }
 
