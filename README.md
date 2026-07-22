@@ -165,8 +165,49 @@ curl -s http://127.0.0.1:9090/stats              # live counters
 | `8000=9000`  | listen 8000 → remote 9000                 |
 | `2096@pp`    | enable PROXY protocol v2 for this entry   |
 | `2096@nopp`  | disable PROXY protocol for this entry     |
+| `27015@ll`   | low-latency (gaming/interactive) stream   |
 
-`proxy_protocol` sets the default; per-entry `@pp`/`@nopp` overrides it.
+`proxy_protocol` sets the default; per-entry `@pp`/`@nopp` overrides it. Flags
+combine: `443@pp@ll`.
+
+## Multiple tunnels on one server
+
+A server can host several independent tunnels at once (e.g. one per client, or
+one per protocol). Everything a tunnel binds or names is host-global, so the
+wizard **allocates non-conflicting defaults automatically**: the first tunnel
+gets the historical values, and each additional tunnel steps to the next free
+port, interface and subnet.
+
+| Resource        | Tunnel 1        | Tunnel 2         | Tunnel 3         |
+|-----------------|-----------------|------------------|------------------|
+| `tunnel_port`   | `1234`          | `1235`           | `1236`           |
+| `health_port`   | `9090`          | `9091`           | `9092`           |
+| `tun_iface`     | `emergency-tun` | `emergency-tun2` | `emergency-tun3` |
+| tunnel subnet   | `10.10.10.0/24` | `10.10.20.0/24`  | `10.10.30.0/24`  |
+| SPF spoof pair  | `…4.29/…222.4`  | `…4.30/…222.5`   | `…4.31/…222.6`   |
+
+Rules enforced at creation (`et-core check-conflicts`, run by the panel):
+
+- `tunnel_port` — two listeners cannot share one; two dialers cannot aim at the
+  same peer *and* port.
+- `health_port`, client-facing **forward ports** — must be unique per tunnel.
+- `tun_iface` — must be unique: a duplicate name makes the second tunnel attach
+  to the **same** TUN device and steal its packets.
+- tunnel **subnet** — must not overlap another tunnel's.
+- SPF **`spoof_dst_ip`** — must be unique: every SPF listener sees a copy of all
+  matching raw packets and tells tunnels apart by the peer's spoofed source.
+
+The **same logical tunnel must use the same `tunnel_port` and mirrored tunnel
+IPs on both servers** — the wizard prints the values to copy to the peer. Useful
+commands:
+
+```sh
+et-core suggest-defaults --dir /etc/emergency-tunnel --role iran   # next free values
+et-core check-conflicts  --config /etc/emergency-tunnel/x.toml     # clash report
+```
+
+Existing single-tunnel deployments are unaffected: defaults, configs and the
+on-the-wire protocol are unchanged.
 
 ## Security model
 

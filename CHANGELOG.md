@@ -4,6 +4,53 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] — 2026-07-22
+
+Multiple independent tunnels per server. Creating a second tunnel no longer
+reuses the first one's ports, interface or subnet, and clashing configurations
+are refused before they can fail at runtime.
+
+### Added
+- **Auto-allocated, non-conflicting defaults.** The wizard now asks the core for
+  values that collide with nothing already on the host. The first tunnel on a
+  server still gets the historical defaults exactly; each additional tunnel steps
+  to the next free value:
+
+  | Resource       | Tunnel 1        | Tunnel 2         | Tunnel 3         |
+  |----------------|-----------------|------------------|------------------|
+  | `tunnel_port`  | `1234`          | `1235`           | `1236`           |
+  | `health_port`  | `9090`          | `9091`           | `9092`           |
+  | `tun_iface`    | `emergency-tun` | `emergency-tun2` | `emergency-tun3` |
+  | tunnel subnet  | `10.10.10.0/24` | `10.10.20.0/24`  | `10.10.30.0/24`  |
+  | SPF spoof pair | `…4.29/…222.4`  | `…4.30/…222.5`   | `…4.31/…222.6`   |
+
+- **Cross-tunnel conflict detection.** `FindConflicts` reports every host-global
+  resource a new tunnel would take from an existing one, with an actionable
+  message naming the other tunnel. Covered: `tunnel_port` (two listeners can't
+  bind one; two dialers can't share peer+port), `health_port`, `tun_iface`,
+  overlapping tunnel subnets, client-facing forward ports, and SPF `spoof_dst_ip`.
+- **New commands:** `et-core suggest-defaults [--dir D] [--role R] [--format sh|json]`
+  and `et-core check-conflicts --config F [--dir D]`.
+- **Panel integration:** the wizard pre-fills the allocated values, states which
+  ones must match on the peer server, and **refuses to start a conflicting
+  tunnel** (config kept for editing). Status and edit views surface conflicts for
+  tunnels that already overlapped.
+
+### Why these specifically
+- A duplicate `tun_iface` does **not** error — Linux attaches the second tunnel
+  as another queue on the **same** TUN device, silently stealing its packets.
+- Every SPF listener receives a copy of all matching raw packets and distinguishes
+  tunnels only by the peer's spoofed source, so two SPF tunnels sharing
+  `spoof_dst_ip` cross-talk. Distinct pairs isolate them with no wire change.
+
+### Compatibility
+- **No breaking changes.** Defaults on a fresh host, existing configs, and the
+  on-the-wire protocol are unchanged — pinned by tests. Configs written by older
+  versions load, validate and are correctly accounted for by the allocator.
+- The conflict check runs at **creation** time, never from `ExecStartPre`, so an
+  already-installed tunnel can never be blocked from starting by a pre-existing
+  overlap.
+
 ## [1.9.0] — 2026-07-19
 
 Fixes the "mux can't connect" report and the TUN ~10 s ping / ~50% loss, then

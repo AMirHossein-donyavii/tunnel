@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -460,6 +461,51 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
 	}
 	return &c, nil
+}
+
+// LoadRelaxed parses a config WITHOUT validating it. It is used to take stock of
+// the tunnels already present on a host (see ScanDir): a peer's config, a config
+// for the other role, or one that is currently invalid must still contribute its
+// used ports/interfaces/subnets so a new tunnel does not collide with it.
+func LoadRelaxed(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	c := Defaults()
+	if err := unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	if c.Engine == EngineL3 { // normalise the deprecated alias
+		c.Engine = EngineTUN
+	}
+	if strings.TrimSpace(c.Name) == "" { // fall back to the file name
+		c.Name = strings.TrimSuffix(filepath.Base(path), ".toml")
+	}
+	return &c, nil
+}
+
+// ScanDir returns every tunnel config in dir (relaxed-parsed), sorted by name.
+// Unreadable or unparseable files are skipped rather than failing the scan — the
+// caller's job is conflict avoidance, not validating someone else's file.
+func ScanDir(dir string) []*Config {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []*Config
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".toml") {
+			continue
+		}
+		c, err := LoadRelaxed(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // Save writes the config as TOML with secure (0600) permissions.

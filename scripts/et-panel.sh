@@ -242,14 +242,31 @@ create_tunnel() {
     local iface="emergency-tun" mtu profile workers pool cipher tunnel_port health
     local tun_ip="" peer_tun_ip="" forwards_toml="[]" proxy="false" exit_host="127.0.0.1"
 
-    tunnel_port="$(ask_port "Tunnel port (server <-> server link — SAME on both servers)" "1234")"
+    # Defaults that do not collide with the tunnels already on this host. On a
+    # fresh server these are the historical values (1234 / 9090 / emergency-tun /
+    # 10.10.10.x); each additional tunnel automatically steps to a free port,
+    # interface and subnet (10.10.20.x, 10.10.30.x, ...).
+    local ET_TUNNEL_PORT=1234 ET_HEALTH_PORT=9090 ET_TUN_IFACE="emergency-tun"
+    local ET_TUN_IP="" ET_PEER_TUN_IP="" ET_SPOOF_SRC="" ET_SPOOF_DST="" ET_SUBNET=""
+    if [ -x "$CORE" ]; then
+        eval "$("$CORE" suggest-defaults --dir "$CONF_DIR" --role "$role" --format sh 2>/dev/null)" || true
+    fi
+    local existing_count; existing_count="$(list_tunnels | wc -l | tr -d ' ')"
+    if [ "${existing_count:-0}" -gt 0 ]; then
+        echo; echo -e "  ${C_C}${existing_count} tunnel(s) already exist on this server — defaults below were"
+        echo -e "  chosen so the new tunnel does not conflict (port ${ET_TUNNEL_PORT}, ${ET_SUBNET}).${C_RESET}"
+    fi
+
+    echo -e "  ${C_Y}The tunnel port must be the SAME on both servers${C_RESET} — note this value and"
+    echo -e "  ${C_C}use it when you create the matching tunnel on the other server.${C_RESET}"
+    tunnel_port="$(ask_port "Tunnel port (server <-> server link — SAME on both servers)" "$ET_TUNNEL_PORT")"
     mtu="$(ask_int "MTU" "1380" 576 9000)"
     profile="$(ask_oneof "Performance profile (fast=throughput | balance | resource=low RAM)" "balance" "fast balance resource")"
     workers="$(ask_int "CPU workers (0 = auto-detect)" "0" 0 256)"
     echo -e "  ${C_Y}Tunnel links MUST be identical on BOTH servers for TUN/SPF${C_RESET} (a mismatch"
     echo -e "  ${C_C}silently drops traffic). Keep this the same value on Iran and Foreign.${C_RESET}"
     pool="$(ask_int "Tunnel links / sessions (SAME on both servers)" "4" 1 1024)"
-    health="$(ask_port "Health/stats port (local only, != tunnel port)" "9090")"
+    health="$(ask_port "Health/stats port (local only, != tunnel port)" "$ET_HEALTH_PORT")"
 
     echo -e "  Encryption: ${C_G}1)${C_RESET} chacha20-poly1305 (fast on ARM/mobile)   ${C_G}2)${C_RESET} aes-256-gcm (fast with AES-NI)"
     [ "$(ask_choice "Select" "1" 2)" = "2" ] && cipher="aes-256-gcm" || cipher="chacha20-poly1305"
@@ -257,13 +274,13 @@ create_tunnel() {
     echo -e "  ${C_Y}Security:${C_RESET} restrict the tunnel port (${tunnel_port}) to the peer's IP in your firewall."
 
     if [ "$engine" = "tun" ] || [ "$engine" = "spf" ]; then
-        echo; echo -e "  ${C_C}Creates a private virtual network (default 10.10.10.0/24) between the two"
-        echo -e "  servers: Iran uses 10.10.10.1, Foreign uses 10.10.10.2. All IP traffic flows"
+        echo; echo -e "  ${C_C}Creates a private virtual network (${ET_SUBNET}) between the two servers:"
+        echo -e "  Iran uses ${ET_SUBNET%.*}.1, Foreign uses ${ET_SUBNET%.*}.2. All IP traffic flows"
         echo -e "  through it via the assigned tunnel IPs.${C_RESET}"
-        iface="$(ask_name "Tunnel interface name" "emergency-tun")"
+        echo -e "  ${C_Y}Use the SAME subnet on both servers${C_RESET} (mirrored .1/.2)."
+        iface="$(ask_name "Tunnel interface name" "$ET_TUN_IFACE")"
         local def_ip def_peer
-        if [ "$role" = "iran" ]; then def_ip="10.10.10.1/24"; def_peer="10.10.10.2"
-        else def_ip="10.10.10.2/24"; def_peer="10.10.10.1"; fi
+        def_ip="$ET_TUN_IP"; def_peer="$ET_PEER_TUN_IP"
         tun_ip="$(ask_ipcidr "This host's tunnel IP (CIDR)" "$def_ip")"
         # Peer tunnel IP must be inside the same subnet and differ from ours.
         while true; do
@@ -273,11 +290,12 @@ create_tunnel() {
         done
         if [ "$engine" = "spf" ]; then
             echo; echo -e "  ${C_C}SPF source-IP spoofing (point-to-point between YOUR two servers only)."
-            echo -e "  These two values are REVERSED on the other server.${C_RESET}"
-            # Role-based defaults (editable). Iran and Foreign mirror each other.
+            echo -e "  These two values are REVERSED on the other server. Each SPF tunnel on a"
+            echo -e "  server needs its OWN pair — the listeners tell each other apart by them.${C_RESET}"
+            # Role-based defaults, stepped per tunnel so two SPF tunnels on one
+            # host never claim the same spoof_dst_ip (they would cross-talk).
             local def_ssrc def_sdst
-            if [ "$role" = "iran" ]; then def_ssrc="195.62.4.29"; def_sdst="5.34.222.4"
-            else def_ssrc="5.34.222.4"; def_sdst="195.62.4.29"; fi
+            def_ssrc="$ET_SPOOF_SRC"; def_sdst="$ET_SPOOF_DST"
             spoof_src="$(ask_ip "spoof_src_ip (source written on outgoing packets)" "$def_ssrc")"
             while true; do
                 spoof_dst="$(ask_ip "spoof_dst_ip (expected source of the peer's packets)" "$def_sdst")"
@@ -331,6 +349,18 @@ create_tunnel() {
     if ! "$CORE" validate --config "${CONF_DIR}/${name}.toml"; then
         echo -e "  ${C_R}Validation failed. Config saved but not started.${C_RESET}"; pause; return
     fi
+
+    # Refuse to start a tunnel that would take a port, interface, subnet or
+    # client port already owned by another tunnel on this server.
+    if ! "$CORE" check-conflicts --config "${CONF_DIR}/${name}.toml" --dir "$CONF_DIR" >/dev/null 2>/tmp/et-conflicts.$$; then
+        echo -e "  ${C_R}✗ This tunnel conflicts with an existing tunnel on this server:${C_RESET}"
+        sed 's/^/    /' /tmp/et-conflicts.$$ 2>/dev/null
+        rm -f /tmp/et-conflicts.$$
+        echo -e "  ${C_Y}Config saved but NOT started.${C_RESET} Edit it (menu 7) to use free values,"
+        echo -e "  ${C_C}or delete it (menu 8) and re-create — defaults are chosen to avoid clashes.${C_RESET}"
+        pause; return
+    fi
+    rm -f /tmp/et-conflicts.$$
 
     # TUN/SPF port forwarding needs kernel IPv4 forwarding enabled + persisted.
     if { [ "$engine" = "tun" ] || [ "$engine" = "spf" ]; } && [ "$forwards_toml" != "[]" ]; then
@@ -443,7 +473,22 @@ show_status() {
         local hp; hp="$(grep -E '^health_port' "${CONF_DIR}/${name}.toml" | grep -o '[0-9]*')"
         [ -n "$hp" ] && echo -e "\n  ${C_BOLD}Live stats:${C_RESET}" && curl -fsS --max-time 2 "http://127.0.0.1:${hp}/stats" 2>/dev/null | sed 's/^/    /'
     fi
+    show_conflicts "$name"
     pause
+}
+
+# show_conflicts reports any host-global resource this tunnel shares with another
+# tunnel on the server (ports, TUN device, subnet, client ports, SPF spoof pair).
+show_conflicts() {
+    local name="$1" out
+    [ -x "$CORE" ] || return 0
+    if out="$("$CORE" check-conflicts --config "${CONF_DIR}/${name}.toml" --dir "$CONF_DIR" 2>&1 >/dev/null)"; then
+        return 0
+    fi
+    [ -z "$out" ] && return 0
+    echo -e "\n  ${C_R}${C_BOLD}Resource conflicts with other tunnels on this server:${C_RESET}"
+    echo "$out" | sed 's/^/    /'
+    echo -e "  ${C_Y}Fix by editing this tunnel (menu 7) to use free values.${C_RESET}"
 }
 
 view_logs() {
@@ -459,6 +504,9 @@ edit_config() {
     banner; local name; name="$(pick_tunnel)" || { pause; return; }
     "${EDITOR:-nano}" "${CONF_DIR}/${name}.toml"
     if "$CORE" validate --config "${CONF_DIR}/${name}.toml"; then
+        # An edit can introduce a clash with another tunnel — surface it, but let
+        # the operator decide (their edit may be intentional/staged).
+        show_conflicts "$name"
         yesno "Restart tunnel to apply changes?" "y" && systemctl restart "${SVC_PREFIX}${name}"
     else
         echo -e "  ${C_R}Config invalid — not restarted.${C_RESET}"
