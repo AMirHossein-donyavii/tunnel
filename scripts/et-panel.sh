@@ -128,6 +128,41 @@ valid_ipv4() { # ip -> returns 0 if a valid dotted-quad
     done
     return 0
 }
+ip_to_int() { # a.b.c.d -> 32-bit integer
+    local a b c d; IFS=. read -r a b c d <<< "$1"
+    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+ip_in_subnet() { # ip cidr -> 0 when ip lies inside cidr (any prefix length)
+    local ip="$1" cidr="$2" net prefix mask
+    net="${cidr%/*}"; prefix="${cidr#*/}"
+    [ "$net" != "$cidr" ] || return 1               # cidr must carry a prefix
+    valid_ipv4 "$ip" && valid_ipv4 "$net" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] && [ "$prefix" -ge 0 ] && [ "$prefix" -le 32 ] || return 1
+    [ "$prefix" -eq 0 ] && return 0
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    [ $(( $(ip_to_int "$ip") & mask )) -eq $(( $(ip_to_int "$net") & mask )) ]
+}
+
+subnet_of() { # ip/prefix -> network/prefix (e.g. 10.10.20.2/24 -> 10.10.20.0/24)
+    local cidr="$1" ip prefix mask netint
+    ip="${cidr%/*}"; prefix="${cidr#*/}"
+    valid_ipv4 "$ip" && [[ "$prefix" =~ ^[0-9]+$ ]] || { echo "$cidr"; return; }
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    netint=$(( $(ip_to_int "$ip") & mask ))
+    echo "$(( (netint >> 24) & 255 )).$(( (netint >> 16) & 255 )).$(( (netint >> 8) & 255 )).$(( netint & 255 ))/${prefix}"
+}
+
+mirror_peer_ip() { # this host's ip/prefix -> the conventional peer address
+    local ip="${1%/*}" base last
+    base="${ip%.*}"; last="${ip##*.}"
+    case "$last" in
+        1) echo "${base}.2" ;;
+        2) echo "${base}.1" ;;
+        *) echo "${base}.1" ;;
+    esac
+}
+
 ask_ipcidr() { # prompt [default] — IPv4/prefix, e.g. 10.10.10.1/24
     local v ip prefix
     while true; do
@@ -274,20 +309,39 @@ create_tunnel() {
     echo -e "  ${C_Y}Security:${C_RESET} restrict the tunnel port (${tunnel_port}) to the peer's IP in your firewall."
 
     if [ "$engine" = "tun" ] || [ "$engine" = "spf" ]; then
-        echo; echo -e "  ${C_C}Creates a private virtual network (${ET_SUBNET}) between the two servers:"
-        echo -e "  Iran uses ${ET_SUBNET%.*}.1, Foreign uses ${ET_SUBNET%.*}.2. All IP traffic flows"
-        echo -e "  through it via the assigned tunnel IPs.${C_RESET}"
-        echo -e "  ${C_Y}Use the SAME subnet on both servers${C_RESET} (mirrored .1/.2)."
+        echo; echo -e "  ${C_C}Creates a private virtual network between the two servers. The suggested"
+        echo -e "  subnet below is free on THIS server (${ET_SUBNET}).${C_RESET}"
+        echo -e "  ${C_Y}Both servers must use the SAME subnet for the same tunnel${C_RESET} (mirrored .1/.2:"
+        echo -e "  ${C_C}Iran .1, Foreign .2). If the OTHER server already has this tunnel, enter ITS"
+        echo -e "  subnet here — e.g. type 10.10.20.2/24 to join an existing 10.10.20.0/24 tunnel.${C_RESET}"
         iface="$(ask_name "Tunnel interface name" "$ET_TUN_IFACE")"
         local def_ip def_peer
-        def_ip="$ET_TUN_IP"; def_peer="$ET_PEER_TUN_IP"
+        def_ip="$ET_TUN_IP"
         tun_ip="$(ask_ipcidr "This host's tunnel IP (CIDR)" "$def_ip")"
-        # Peer tunnel IP must be inside the same subnet and differ from ours.
+        # Derive the peer default from what was ACTUALLY entered, so overriding the
+        # subnet (to match a tunnel that already exists on the other server) never
+        # leaves a stale default pointing at a different network.
+        def_peer="$(mirror_peer_ip "$tun_ip")"
+        # The peer address must be a different host inside the SAME subnet. A
+        # "/prefix" suffix is accepted and trimmed, since the previous prompt asks
+        # for CIDR and typing it here too is the natural thing to do.
         while true; do
-            peer_tun_ip="$(ask "Peer's tunnel IP" "$def_peer")"
-            if valid_ipv4 "$peer_tun_ip" && [ "$peer_tun_ip" != "${tun_ip%/*}" ]; then break; fi
-            echo -e "  ${C_R}Enter a valid IP in the tunnel subnet, different from ${tun_ip%/*}.${C_RESET}"
+            peer_tun_ip="$(ask "Peer's tunnel IP (same subnet; /prefix optional)" "$def_peer")"
+            peer_tun_ip="${peer_tun_ip%/*}"
+            if ! valid_ipv4 "$peer_tun_ip"; then
+                echo -e "  ${C_R}Not a valid IPv4 address: ${peer_tun_ip}${C_RESET}"; continue
+            fi
+            if [ "$peer_tun_ip" = "${tun_ip%/*}" ]; then
+                echo -e "  ${C_R}The peer's IP must differ from this host's (${tun_ip%/*}).${C_RESET}"; continue
+            fi
+            if ! ip_in_subnet "$peer_tun_ip" "$tun_ip"; then
+                echo -e "  ${C_R}${peer_tun_ip} is outside this tunnel's subnet ($(subnet_of "$tun_ip")).${C_RESET}"
+                echo -e "  ${C_C}Both ends must share one subnet — e.g. ${tun_ip%/*} here and ${def_peer} there.${C_RESET}"
+                continue
+            fi
+            break
         done
+        echo -e "  ${C_G}Tunnel network:${C_RESET} $(subnet_of "$tun_ip")  (this host ${tun_ip%/*}, peer ${peer_tun_ip})"
         if [ "$engine" = "spf" ]; then
             echo; echo -e "  ${C_C}SPF source-IP spoofing (point-to-point between YOUR two servers only)."
             echo -e "  These two values are REVERSED on the other server. Each SPF tunnel on a"

@@ -4,6 +4,42 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.10.1] — 2026-07-22
+
+Fixes TUN/SPF peer-IP validation, which rejected valid input and blocked
+creating a tunnel on a server that has none while the peer already has several.
+
+### Fixed
+- **Peer tunnel IP no longer rejects a `/prefix`.** The previous prompt asks for
+  CIDR (`This host's tunnel IP (CIDR)`), so typing `10.10.20.1/24` for the peer
+  was the natural next step — but the check required a bare dotted-quad and
+  refused it. A `/prefix` is now accepted and trimmed (the config schema needs a
+  bare address, so this normalisation is required, not cosmetic).
+- **The peer default is now derived from the address actually entered.** It used
+  to be computed *before* the local IP was typed, from this host's free-subnet
+  suggestion. On a server with no tunnels that suggestion is `10.10.10.x`, so
+  overriding the local IP to `10.10.20.2/24` (to join a tunnel that already
+  exists on the other server) left the peer default pointing at a different
+  network — the reported failure. It now mirrors the entered address
+  (`10.10.20.2/24` → `10.10.20.1`).
+- **Subnet membership is actually validated.** The error message claimed "in the
+  tunnel subnet" while the code only checked "is an IP" and "differs from ours".
+  Real prefix-aware checking is now performed (any prefix length, not just /24),
+  and each rejection says precisely what is wrong — bad address, same as this
+  host, or outside the tunnel's subnet (which is named).
+
+### Improved
+- The TUN/SPF step states that the suggested subnet is merely what is free *on
+  this server*, and that joining a tunnel the peer already has is done by
+  entering that tunnel's subnet — with a worked example.
+- After both addresses are accepted the wizard confirms the resulting network,
+  e.g. `Tunnel network: 10.10.20.0/24 (this host 10.10.20.2, peer 10.10.20.1)`.
+
+### Compatibility
+Unchanged defaults, configs and wire protocol. Tunnel 1 still defaults to
+`10.10.10.1/.2`; genuinely invalid input (wrong subnet, malformed address, same
+address on both ends) is still rejected, by the wizard and the core.
+
 ## [1.10.0] — 2026-07-22
 
 Multiple independent tunnels per server. Creating a second tunnel no longer
