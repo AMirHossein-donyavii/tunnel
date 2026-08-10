@@ -14,6 +14,7 @@
 #   --from-source    build from Go source instead of downloading
 #   --force          reinstall even if already at the target version
 #   --no-tune        skip host network tuning (BBR/fq/buffers)
+#   --allow-downgrade  permit installing an older version than the one present
 #   --uninstall      remove the tunnel (configs are kept unless you confirm)
 #
 # Environment overrides: ET_SOURCE, ET_REPO_SLUG, ET_BASE_URL, ET_CHANNEL,
@@ -44,6 +45,7 @@ ET_FROM_SOURCE="${ET_FROM_SOURCE:-0}"
 ET_ALLOW_INSECURE="${ET_ALLOW_INSECURE:-0}"
 ET_FORCE="${ET_FORCE:-0}"
 ET_NO_TUNE="${ET_NO_TUNE:-0}"
+ET_ALLOW_DOWNGRADE="${ET_ALLOW_DOWNGRADE:-0}"
 ET_REPO="${ET_REPO:-https://github.com/${ET_REPO_SLUG}.git}"
 ET_GO_VERSION="${ET_GO_VERSION:-1.22.5}"
 
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
         --from-source) ET_FROM_SOURCE=1; shift ;;
         --force)       ET_FORCE=1; shift ;;
         --no-tune)     ET_NO_TUNE=1; shift ;;
+        --allow-downgrade) ET_ALLOW_DOWNGRADE=1; shift ;;
         --uninstall)   DO_UNINSTALL=1; shift ;;
         -h|--help)     sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -301,6 +304,18 @@ install_files() {
     local prev; prev="$(installed_version)"
     if [ -n "$prev" ] && [ "$prev" = "$VERSION" ] && [ "$ET_FORCE" != "1" ]; then
         info "v${VERSION} is already installed (--force to reinstall)"
+    fi
+
+    # Going backwards is never routine. The release host can regress — a stale
+    # checkout republishes an old version over a newer one — and an update run
+    # would then walk every server back without a word. It also breaks the
+    # tunnel outright across the v2/v3 wire boundary (2.0.0+ speaks v3), because
+    # the two ends stop understanding each other's handshake.
+    if [ -n "$prev" ] && is_semver "$prev" && is_semver "$VERSION" \
+       && ver_gt "$prev" "$VERSION" && [ "$ET_ALLOW_DOWNGRADE" != "1" ]; then
+        warn "installed v${prev} is newer than v${VERSION} offered by ${SOURCE_USED}"
+        [ "$SOURCE_USED" = "host" ] && info "the release host is serving an older build than this server runs"
+        die "refusing to downgrade — pass --allow-downgrade to override (and upgrade BOTH ends together)"
     fi
 
     install -d -m 0755 "$PREFIX" "$LIB_DIR" "${LIB_DIR}/state"

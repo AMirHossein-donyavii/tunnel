@@ -58,6 +58,15 @@ done
 
 # Ship the panel and unit alongside the binaries so the installer fetches one set.
 cp scripts/et-panel.sh "${RELDIR}/et-panel.sh"
+# Stamp the panel the same way the core is stamped. Without this, building an
+# explicit version out of a tree whose VERSION says something else ships a
+# console that reports the tree's version — and every consistency check
+# downstream (installer verify, the panel's own header) then fires on a release
+# that is actually fine.
+sed -i.bak -E "s|^SCRIPT_VERSION=\".*\"|SCRIPT_VERSION=\"${VERSION}\"|" "${RELDIR}/et-panel.sh"
+rm -f "${RELDIR}/et-panel.sh.bak"
+grep -q "^SCRIPT_VERSION=\"${VERSION}\"$" "${RELDIR}/et-panel.sh" \
+    || { echo "could not stamp SCRIPT_VERSION into et-panel.sh" >&2; exit 1; }
 cp scripts/uninstall.sh "${RELDIR}/uninstall.sh"
 cp systemd/emergency-tunnel@.service "${RELDIR}/emergency-tunnel@.service"
 
