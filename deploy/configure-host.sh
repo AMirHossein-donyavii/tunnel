@@ -4,7 +4,7 @@
 # your domain into install.sh so users can install with a single clean command.
 #
 # Usage:
-#   deploy/configure-host.sh <domain> [version]
+#   deploy/configure-host.sh <domain> [version] [--allow-downgrade]
 #
 # Example:
 #   deploy/configure-host.sh dl.example.com 1.2.0
@@ -17,18 +17,42 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-DOMAIN="${1:-}"
-VERSION="${2:-$(cat VERSION 2>/dev/null || echo 0.0.0)}"
+DOMAIN=""
+VERSION=""
+ALLOW_DOWNGRADE=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *) if [ -z "$DOMAIN" ]; then DOMAIN="$1"; else VERSION="$1"; fi; shift ;;
+    esac
+done
+VERSION="${VERSION:-$(cat VERSION 2>/dev/null || echo 0.0.0)}"
 VERSION="${VERSION#v}"
 
 C_G='\033[0;32m'; C_Y='\033[1;33m'; C_C='\033[0;36m'; C_R='\033[0;31m'; C_0='\033[0m'
 die() { echo -e "${C_R}error: $*${C_0}" >&2; exit 1; }
 
-[ -n "$DOMAIN" ] || die "usage: deploy/configure-host.sh <domain> [version]"
+[ -n "$DOMAIN" ] || die "usage: deploy/configure-host.sh <domain> [version] [--allow-downgrade]"
 case "$DOMAIN" in http*://*) die "pass a bare domain (dl.example.com), not a URL";; esac
 command -v go >/dev/null || die "Go toolchain required to build the release"
 
 BASE_URL="https://${DOMAIN}"
+
+# A stale checkout builds an old version perfectly happily, and the resulting
+# tree overwrites `stable` — publishing it downgrades every user in one step.
+# Ask the host what it is serving today and refuse to go backwards. The usual
+# cause is a `git pull` that failed (auth, conflict) in a script that kept going.
+LIVE="$(curl -fsSL --max-time 15 "${BASE_URL}/stable" 2>/dev/null | tr -d '[:space:]' || true)"
+if [ -n "$LIVE" ] && [ "$LIVE" != "$VERSION" ] \
+   && [ "$(printf '%s\n%s\n' "$LIVE" "$VERSION" | sort -V | tail -n1)" = "$LIVE" ]; then
+    echo -e "${C_Y}==> ${DOMAIN} is serving v${LIVE}; this checkout builds v${VERSION}${C_0}" >&2
+    if [ "$ALLOW_DOWNGRADE" != "1" ]; then
+        echo -e "    ${C_Y}$(git log -1 --format='HEAD is %h %s' 2>/dev/null || echo 'not a git checkout')${C_0}" >&2
+        die "refusing to stage a downgrade — 'git pull' first, or pass --allow-downgrade if you mean it"
+    fi
+    echo -e "    ${C_Y}--allow-downgrade given; continuing${C_0}" >&2
+fi
 
 echo -e "${C_C}==> Building release v${VERSION}${C_0}"
 SIGN_ARGS=()

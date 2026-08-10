@@ -79,6 +79,18 @@ curl -fsSL https://dl.example.com/install.sh | bash
 ```
 
 ### Publishing a new version later
+
+On the host itself, one command that stops at the first failure:
+```bash
+deploy/publish.sh dl.example.com          # pull → build+bake → copy → verify
+```
+Run the steps by hand only if you need to; each one is fatal in `publish.sh` for
+a reason. A `git pull` that fails on authentication leaves the old checkout in
+place, and the build that follows succeeds — at the old version — staging a
+downgrade nobody notices until users are on it. `configure-host.sh` now also asks
+the live host what it serves and refuses to build backwards over it
+(`--allow-downgrade` if you really mean to roll back).
+
 ```bash
 deploy/configure-host.sh dl.example.com 1.3.0      # builds + bakes the host URL
 rsync -av ./release/ root@dl.example.com:/var/www/emergency-tunnel/
