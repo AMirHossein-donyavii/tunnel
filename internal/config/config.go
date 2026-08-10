@@ -139,10 +139,11 @@ func Defaults() Config {
 
 // Engine identifiers.
 const (
-	EngineMux = "mux" // TCP Reverse Tunnel (multiplexed streams over few links)
-	EngineTUN = "tun" // virtual network interface (L3, all IP protocols)
-	EngineSPF = "spf" // TUN + IPX-style encapsulation with source-IP spoofing
-	EngineL3  = "l3"  // deprecated alias for EngineTUN (normalised on load)
+	EngineMux    = "mux"    // TCP Reverse Tunnel (multiplexed streams over few links)
+	EngineDirect = "direct" // one tunnel connection per user connection
+	EngineTUN    = "tun"    // virtual network interface (L3, all IP protocols)
+	EngineSPF    = "spf"    // TUN + IPX-style encapsulation with source-IP spoofing
+	EngineL3     = "l3"     // deprecated alias for EngineTUN (normalised on load)
 )
 
 // IsTUN reports whether the config selects the TUN engine (accepts the "l3" alias).
@@ -211,8 +212,9 @@ func (c *Config) Validate() error {
 	if c.HealthPort != 0 && c.HealthPort == c.TunnelPort {
 		return fmt.Errorf("health_port (%d) must differ from the tunnel_port", c.HealthPort)
 	}
-	if c.Engine != EngineMux && !c.IsTUN() && !c.IsSPF() {
-		return fmt.Errorf("engine must be %q (TCP Reverse), %q (TUN) or %q (SPF), got %q", EngineMux, EngineTUN, EngineSPF, c.Engine)
+	if c.Engine != EngineMux && c.Engine != EngineDirect && !c.IsTUN() && !c.IsSPF() {
+		return fmt.Errorf("engine must be %q (multiplexed), %q (per-connection), %q (TUN) or %q (SPF), got %q",
+			EngineMux, EngineDirect, EngineTUN, EngineSPF, c.Engine)
 	}
 	// The dialer side needs to know where to connect.
 	if c.dialerSide() && strings.TrimSpace(c.Peer) == "" {

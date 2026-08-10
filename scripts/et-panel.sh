@@ -332,10 +332,9 @@ optimise() {
 
     case "$section" in
       basic)
-        # Multiplexed reverse tunnel. On a stream carrier the MTU is irrelevant
-        # and the core's adaptive frame budget handles sizing; the reliable-UDP
-        # carrier does need one, because it segments the stream itself.
-        cfg_set engine mux
+        # The caller picks mux or direct; on a stream carrier the MTU is
+        # irrelevant and the core's adaptive frame budget handles sizing, but the
+        # reliable-UDP carrier needs one because it segments the stream itself.
         [ "$proto" = "udp" ] && cfg_set mtu 1400
         ;;
       tun)
@@ -360,6 +359,9 @@ optimise() {
         cfg_set batch_size 8                  # small frames: less serialisation delay
         cfg_set heartbeat_interval 2          # notice a dead path in ~8 s
         cfg_set heartbeat_timeout 8
+        # Tells the core (and the reliable-UDP ARQ, if this ever runs over it)
+        # to favour latency: shorter timers, shallower windows, gentler backoff.
+        cfg_set low_latency true
         cfg_set profile balance
         ;;
       spf)
@@ -413,24 +415,28 @@ common_endpoint() {
 
 section_basic() {
     banner
-    title "Basic — multiplexed reverse tunnel"
-    note "Many user connections share a few long-lived encrypted links, so a new"
-    note "connection costs one frame instead of a full handshake."
+    title "Basic — reverse tunnel to a service port"
+    note "Users connect to a port on the Iran server; traffic comes out on the"
+    note "Foreign server. Choose the carrier that survives your path."
     echo
-    item 1 "TCPMUX" "raw TCP carrier — fastest, use unless something blocks it"
-    item 2 "WSMUX"  "WebSocket/HTTP — passes CDNs and reverse proxies"
-    item 3 "UDP"    "reliable UDP (ARQ) — for paths that throttle or block TCP"
+    item 1 "TCPMUX" "TCP, multiplexed — fastest; one frame per new connection"
+    item 2 "TCP"    "TCP, one connection per user — plainest traffic shape"
+    item 3 "WSMUX"  "WebSocket, multiplexed — passes CDNs and reverse proxies"
+    item 4 "WS"     "WebSocket, one connection per user"
+    item 5 "UDP"    "reliable UDP (ARQ) — for paths that throttle or block TCP"
     echo
-    note "TCP and TCPMUX are the same thing here: this engine is always"
-    note "multiplexed, which strictly beats one socket per connection."
-    note "UDP carries the same reliable stream over an ARQ of its own, so it"
-    note "keeps ordering and congestion control where plain UDP has neither."
-    local c; c="$(ask_choice "Protocol" "1" 1 2 3)"
+    note "Multiplexed carriers reuse one authenticated connection for everything,"
+    note "which removes a handshake per user connection — measurably faster on a"
+    note "long path. The unmultiplexed variants trade that for a more ordinary"
+    note "per-connection traffic shape."
+    local c; c="$(ask_choice "Protocol" "1" 1 2 3 4 5)"
     cfg_reset
     case "$c" in
-        1) optimise basic tcpmux; cfg_set transport tcp ;;
-        2) optimise basic wsmux;  cfg_set transport ws ;;
-        3) optimise basic udp;    cfg_set transport udp ;;
+        1) optimise basic tcpmux; cfg_set engine mux;    cfg_set transport tcp ;;
+        2) optimise basic tcp;    cfg_set engine direct; cfg_set transport tcp ;;
+        3) optimise basic wsmux;  cfg_set engine mux;    cfg_set transport ws ;;
+        4) optimise basic ws;     cfg_set engine direct; cfg_set transport ws ;;
+        5) optimise basic udp;    cfg_set engine mux;    cfg_set transport udp ;;
     esac
     cfg_set name "$(ask_name "Tunnel name" "basic$(tunnel_count)")"
     common_endpoint
@@ -466,12 +472,21 @@ section_tun() {
 section_gaming() {
     banner
     title "Gaming — latency-first tunnel"
-    note "Tuned the opposite way to the others: shallow queues and small frames,"
-    note "so a late packet is dropped rather than delivered stale. Carried over"
-    note "UDP because a lost carrier segment must not stall every other flow."
     echo
-    note "Game, voice and interactive traffic is detected automatically by the"
-    note "core's packet scheduler and served ahead of downloads on the same link."
+    item 1 "UDP tunnel"  "encrypted TUN over UDP, tuned for latency over bulk"
+    item 2 "WireGuard"   "kernel WireGuard — lowest overhead available"
+    echo
+    note "Both prioritise responsiveness over throughput. The UDP tunnel is part"
+    note "of this platform and shows up in the dashboard; WireGuard runs in the"
+    note "kernel, which costs less CPU per packet than anything in userspace can."
+    local c; c="$(ask_choice "Method" "1" 1 2)"
+    case "$c" in
+        1) gaming_udp ;;
+        2) gaming_wireguard ;;
+    esac
+}
+
+gaming_udp() {
     cfg_reset
     optimise gaming udp
     cfg_set name "$(ask_name "Tunnel name" "game$(tunnel_count)")"
@@ -479,6 +494,121 @@ section_gaming() {
     tun_addressing
     forwards_prompt
     finish_tunnel
+}
+
+# ---- WireGuard ---------------------------------------------------------------
+# WireGuard is not reimplemented here: the kernel module is faster than any
+# userspace tunnel and is already present on every modern distribution. The
+# panel does what a management system should — generate keys, allocate a
+# conflict-free subnet and port, write the interface config, and hand over the
+# exact peer block for the other server.
+WG_DIR="/etc/wireguard"
+
+wg_available() {
+    have wg || { pkg_install_wg; }
+    have wg
+}
+pkg_install_wg() {
+    note "Installing wireguard-tools…"
+    if   have apt-get; then DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools >/dev/null 2>&1
+    elif have dnf;     then dnf install -y -q wireguard-tools >/dev/null 2>&1
+    elif have yum;     then yum install -y -q wireguard-tools >/dev/null 2>&1
+    elif have pacman;  then pacman -Sy --noconfirm --needed wireguard-tools >/dev/null 2>&1
+    elif have apk;     then apk add --no-cache wireguard-tools >/dev/null 2>&1
+    fi
+    modprobe wireguard >/dev/null 2>&1
+}
+
+next_free_wg_subnet() {
+    local n=100 taken
+    taken="$(grep -hoE '10\.10\.[0-9]+\.' "$WG_DIR"/*.conf 2>/dev/null | cut -d. -f3 | sort -un)"
+    while grep -qx "$n" <<<"$taken"; do n=$((n+10)); [ "$n" -gt 250 ] && n=$((RANDOM%250)); done
+    printf '%s' "$n"
+}
+next_free_wg_iface() {
+    local i=0
+    while [ -f "${WG_DIR}/wg${i}.conf" ] || ip link show "wg${i}" >/dev/null 2>&1; do i=$((i+1)); done
+    printf 'wg%s' "$i"
+}
+
+gaming_wireguard() {
+    banner; title "Gaming — WireGuard"
+    if ! wg_available; then
+        bad "wireguard-tools could not be installed on this system."
+        note "Install it manually, then re-run: apt install wireguard-tools"
+        pause; return
+    fi
+    if ! modprobe wireguard >/dev/null 2>&1 && [ ! -d /sys/module/wireguard ]; then
+        warn "The kernel WireGuard module is not loaded."
+        note "On most VPS kernels it is built in; on a container it may be unavailable."
+    fi
+    install -d -m 0700 "$WG_DIR"
+
+    local role iface port subnet myip peerip priv pub
+    role="$(role_prompt)"
+    iface="$(next_free_wg_iface)"
+    port="$(ask_port "WireGuard UDP port ${GRY}(same on both servers)${R}" "$(next_free_port 51820)")"
+    subnet="$(next_free_wg_subnet)"
+    if [ "$role" = "iran" ]; then myip="10.10.${subnet}.1"; peerip="10.10.${subnet}.2"
+    else                          myip="10.10.${subnet}.2"; peerip="10.10.${subnet}.1"; fi
+    myip="$(ask "This server's tunnel IP" "${myip}")"
+    peerip="$(ask "Peer's tunnel IP" "${peerip}")"
+
+    priv="$(wg genkey)"; pub="$(printf '%s' "$priv" | wg pubkey)"
+    local peerpub peerep=""
+    echo
+    note "Run this same option on the OTHER server first if you have not yet —"
+    note "you need its public key to finish here."
+    peerpub="$(ask "Peer's public key ${GRY}(leave blank to fill in later)${R}" "")"
+    [ "$role" = "kharej" ] && peerep="$(ask_ip "Iran server public IP")"
+
+    # MTU: 1420 is the standard WireGuard value on a 1500-byte path (20 IPv4 +
+    # 8 UDP + 32 WireGuard + 8 = 1432 of headroom); lower it only if the path
+    # fragments.
+    local mtu; mtu="$(ask "MTU" "1420")"
+
+    umask 077
+    {
+        echo "# Emergency Tunnel — WireGuard, generated by et v${SCRIPT_VERSION}"
+        echo "[Interface]"
+        echo "PrivateKey = ${priv}"
+        echo "Address    = ${myip}/24"
+        echo "ListenPort = ${port}"
+        echo "MTU        = ${mtu}"
+        echo
+        echo "[Peer]"
+        [ -n "$peerpub" ] && echo "PublicKey  = ${peerpub}" || echo "# PublicKey = <paste the peer's public key, then: systemctl restart wg-quick@${iface}>"
+        echo "AllowedIPs = ${peerip}/32"
+        [ -n "$peerep" ] && echo "Endpoint   = ${peerep}:${port}"
+        # A keepalive is what holds a NAT mapping open; without it the first
+        # packet after an idle period is lost and the game stutters on return.
+        echo "PersistentKeepalive = 25"
+    } > "${WG_DIR}/${iface}.conf"
+    chmod 0600 "${WG_DIR}/${iface}.conf"
+
+    echo; title "Created ${iface}"
+    kv "Config"      "${WG_DIR}/${iface}.conf"
+    kv "This server" "${myip}/24  (port ${port})"
+    kv "Peer"        "${peerip}"
+    kv "Public key"  "${pub}"
+    echo
+    note "Give the PUBLIC KEY above to the other server when it asks for one."
+
+    if [ -n "$peerpub" ]; then
+        systemctl enable --now "wg-quick@${iface}" >/dev/null 2>&1
+        sleep 1
+        if systemctl is-active --quiet "wg-quick@${iface}"; then
+            ok "${iface} is up"
+            wg show "${iface}" 2>/dev/null | sed 's/^/    /'
+        else
+            bad "wg-quick@${iface} did not start"
+            systemctl --no-pager status "wg-quick@${iface}" 2>/dev/null | sed -n '1,8p' | sed 's/^/    /'
+        fi
+    else
+        warn "Not started: the peer's public key is still missing."
+        note "Add it to ${WG_DIR}/${iface}.conf, then: systemctl enable --now wg-quick@${iface}"
+    fi
+    pause
 }
 
 section_spf() {
@@ -588,9 +718,9 @@ new_tunnel_menu() {
     while :; do
         banner
         title "Create a tunnel"
-        item 1 "Basic"  "multiplexed reverse tunnel — TCPMUX, WSMUX"
+        item 1 "Basic"  "service-port tunnel — TCP, TCPMUX, WS, WSMUX, UDP"
         item 2 "TUN"    "private subnet between servers — TCP, UDP, ICMP, BIP"
-        item 3 "Gaming" "latency-first UDP tunnel for games and voice"
+        item 3 "Gaming" "latency-first — UDP tunnel or kernel WireGuard"
         item 4 "SPF"    "spoofed-source carrier — ICMP, TCP (beta)"
         item 0 "Back"   ""
         echo

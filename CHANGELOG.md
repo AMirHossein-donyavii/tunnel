@@ -4,6 +4,63 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026-08-10
+
+Version 2. The create-tunnel flow is four categories, and every protocol listed
+under them now exists in the core.
+
+### The four sections
+
+| Section | Protocols | Backed by |
+|---------|-----------|-----------|
+| **Basic** | TCPMUX · TCP · WSMUX · WS · UDP | mux/direct engine over the tcp, ws and reliable-udp transports |
+| **TUN** | TCP · UDP · ICMP · BIP | the L3 engine's four carriers |
+| **Gaming** | UDP tunnel · WireGuard | latency-tuned L3-over-UDP, and kernel WireGuard |
+| **SPF** | ICMP · TCP | raw-socket spoofed carriers |
+
+### Added
+- **Non-multiplexed engine (`engine = "direct"`)**, so Basic's TCP and WS are
+  genuinely distinct from TCPMUX and WSMUX rather than aliases. One tunnel
+  connection carries one user connection. It is slower than the multiplexed
+  engine — a new connection costs a handshake instead of a frame — and it is the
+  right pick when a per-connection traffic shape matters more than that, or when
+  a handful of long-lived flows would gain nothing from a second multiplexing
+  layer. The exit parks a pool of pre-authenticated connections at the entry, so
+  a user still pays no handshake at connect time.
+- **WireGuard in the Gaming section.** The kernel implementation is driven
+  rather than reimplemented: nothing in userspace matches it per packet. The
+  panel generates the keypair, allocates a conflict-free subnet, port and
+  interface, writes `/etc/wireguard/wgN.conf` with a 25 s keepalive and MTU
+  1420, prints the public key for the other server, and starts
+  `wg-quick@wgN` once the peer key is in. `wireguard-tools` is installed
+  automatically where a package manager is available.
+
+### Changed
+- Basic offers all five protocols; the section header explains what
+  multiplexing buys and costs so the choice is informed rather than arbitrary.
+- Gaming tunnels now set `low_latency = true`, which the reliable-UDP ARQ reads
+  to shorten its timers, shallow its windows and back off more gently.
+- `et-core validate` resolves the transport for the direct engine too.
+
+### Verified
+Eight tunnels created back to back through the wizard — TCPMUX, TCP, WSMUX, WS,
+UDP, TUN/ICMP, TUN/BIP, Gaming/UDP — all valid, with unique ports (1234-1241),
+unique subnets (10.10.10/20/30) and unique interfaces (et0-et2). Full Go suite
+green including the ARQ's loss-recovery and the direct engine's wire format.
+
+### Still not implemented
+- **SPF BIP.** SPF offers `icmp` and `tcp`. Spoofing an IPv6 source is not the
+  same problem as IPv4: `IP_HDRINCL` has no IPv6 equivalent that lets a raw
+  socket set the source address, so it needs `IPV6_PKTINFO` and the kernel still
+  validates the address against the interface. That is a different mechanism
+  from the existing IPv4 path, not an extra case in it.
+- High-traffic and long-term stability runs, which need two real servers on a
+  real path rather than a namespace pair.
+
+### Compatibility
+Existing configurations are untouched and keep working; the console migrates
+pre-2.0 pinned values in place on first run.
+
 ## [1.14.0] — 2026-08-10
 
 Reliable UDP in the core, so the Basic section's UDP protocol is real rather

@@ -92,7 +92,7 @@ func cmdValidate(args []string) {
 	// and validate is the ExecStartPre gate — so resolve the transport here too.
 	// Without this a config naming an unbuilt transport passed validation and
 	// then crash-looped the service at runtime with a much less obvious error.
-	if cfg.Engine == config.EngineMux {
+	if cfg.Engine == config.EngineMux || cfg.Engine == config.EngineDirect {
 		tr, terr := transport.Get(cfg.Transport)
 		if terr != nil {
 			fmt.Fprintf(os.Stderr, "invalid: %v\n", terr)
