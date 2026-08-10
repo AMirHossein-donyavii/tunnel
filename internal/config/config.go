@@ -49,13 +49,13 @@ type Config struct {
 	Encapsulation string `toml:"encapsulation"` // SPF: "ipx"
 	SpoofSrcIP    string `toml:"spoof_src_ip"`  // SPF: spoofed source IP for our packets
 	SpoofDstIP    string `toml:"spoof_dst_ip"`  // SPF: peer's spoofed source (inbound filter)
-	TunIP      string `toml:"tun_ip"`      // TUN engine: this host's tunnel address (CIDR)
-	TunIP6     string `toml:"tun_ip6"`     // TUN engine: optional IPv6 tunnel address (CIDR)
-	PeerTunIP  string `toml:"peer_tun_ip"` // TUN engine: peer's tunnel address (for routing/logs)
-	TunIface   string `toml:"tun_iface"`
-	MTU        int    `toml:"mtu"`
-	Workers    int    `toml:"workers"` // 0 = auto
-	Pool       int    `toml:"pool"`
+	TunIP         string `toml:"tun_ip"`        // TUN engine: this host's tunnel address (CIDR)
+	TunIP6        string `toml:"tun_ip6"`       // TUN engine: optional IPv6 tunnel address (CIDR)
+	PeerTunIP     string `toml:"peer_tun_ip"`   // TUN engine: peer's tunnel address (for routing/logs)
+	TunIface      string `toml:"tun_iface"`
+	MTU           int    `toml:"mtu"`
+	Workers       int    `toml:"workers"` // 0 = auto
+	Pool          int    `toml:"pool"`
 	// TunQueues sets the number of TUN queues / carrier links for the L3 engines
 	// (0 = use Pool). It MUST be identical on both servers: the kernel steers
 	// flows across all queues, so a queue without a peer link silently blackholes
@@ -81,6 +81,13 @@ type Config struct {
 	ChannelSize       int `toml:"channel_size"`       // per-queue queue depth; 0 = auto
 	SoSndbuf          int `toml:"so_sndbuf"`          // bytes; 0 = OS default
 	SoRcvbuf          int `toml:"so_rcvbuf"`          // bytes; 0 = OS default
+
+	// WSPath / WSHost shape the WebSocket transport's HTTP upgrade. The path
+	// must match on both servers; a non-default one also makes the listener
+	// answer 404 to anything else, so a probe sees an ordinary web server.
+	// WSHost sets the Host header — set it to the CDN hostname when fronting.
+	WSPath string `toml:"ws_path"`
+	WSHost string `toml:"ws_host"`
 
 	// ExitHost is where the exit (Kharej) dials forwarded services (mux engine).
 	// Default 127.0.0.1; set to the address the local service binds if it is not

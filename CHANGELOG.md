@@ -4,6 +4,73 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.13.0] — 2026-08-10
+
+A new WebSocket transport, and a ground-up rewrite of the installer and the `et`
+console around four protocol sections.
+
+### Added
+- **WebSocket transport (`transport = "ws"`).** The link opens with an ordinary
+  HTTP/1.1 Upgrade and then carries binary WebSocket frames, so it traverses
+  CDNs and reverse proxies (Cloudflare, nginx, Caddy) and survives middleboxes
+  that reject unrecognised TCP payloads. Client frames are masked per RFC 6455,
+  control frames are handled, and a request to the wrong `ws_path` gets a plain
+  404 so a probe sees an ordinary web server. Measured 1606 Mbit/s end to end.
+  New options: `ws_path`, `ws_host`.
+- **`et` v2.0 — a rewritten console** organised in four sections:
+  **Basic** (TCPMUX, WSMUX), **TUN** (TCP/UDP/ICMP/BIP), **Gaming**
+  (latency-first UDP), **SPF** (ICMP/TCP). Plus a live dashboard with CPU,
+  memory and per-tunnel link/RTT, statistics from the core's `/stats`, health
+  checks that ping the peer and report loss, and `--list/--status/--migrate/--tune`
+  for scripting.
+- **An optimiser that derives every performance parameter from the machine.**
+  Cipher follows AES-NI (`aes-256-gcm` with, `chacha20-poly1305` without —
+  roughly a 3× difference either way), the memory profile follows RAM, link
+  count follows core count, and MTU follows the carrier (1400 on a stream
+  carrier, 1320 where a datagram must leave header room). A fresh install needs
+  no hand-tuning.
+- **Host tuning is applied, not just advised**: BBR, `fq`, `tcp_rmem`/`tcp_wmem`
+  ceilings, `tcp_slow_start_after_idle=0` and friends are written to
+  `/etc/sysctl.d/99-emergency-tunnel.conf` (delete the file to revert).
+- **Conflict-free multi-tunnel allocation.** Ports, health ports, `10.10.N.0/24`
+  subnets and interface names are all allocated from what is actually free, so
+  six tunnels created back to back never collide.
+
+### Fixed
+- **`et-core validate` accepted a transport the binary does not carry.** It is
+  the `ExecStartPre` gate, so a config naming an unbuilt transport passed
+  validation and then crash-looped the service with a much less obvious error.
+- **The old panel leaked its role menu into the configuration.** `role_prompt`
+  printed to stdout while being captured with `$(...)`, so the menu text landed
+  inside `role = "…"` and the generated config was invalid. (Found by testing
+  the wizard end to end; the rewrite prints prompts to stderr.)
+- **The console span forever on stdin EOF.** A closed pipe made every menu read
+  return its default in a tight loop. EOF now exits cleanly.
+- **The installer aborted where `systemctl` exists but is not running**
+  (containers, chroots, image builds) because `set -e` caught the failure.
+
+### Improved
+- Installer resolves releases from the release host with an automatic fallback
+  to GitHub, installs binaries via a temporary name and rename (a half-written
+  download can never replace a working binary), reports what it preserved, and
+  runs migration plus a restart of running tunnels on upgrade.
+- Migration removes values older panels pinned into every config — the 10s/25s
+  heartbeats, `so_sndbuf`, `channel_size = 1024` — all of which now block better
+  core defaults. Identity (name, ports, subnet, interface) is never touched and
+  the original is kept in `/usr/local/lib/emergency-tunnel/state`.
+
+### Not included
+- **Basic/UDP and Gaming/WireGuard are not offered**, because the core has no
+  UDP transport (it needs a reliability layer) and no WireGuard implementation.
+  Menu entries that generate configs the core cannot run would be worse than
+  their absence. The Gaming section is a real latency-first tuning of the UDP
+  **TUN** carrier, not a separate protocol.
+- **SPF has no BIP profile** — SPF supports `icmp` and `tcp` only.
+
+### Compatibility
+Wire protocol unchanged (v3). Existing configurations keep working; the console
+migrates them in place on first run and on upgrade.
+
 ## [1.12.0] — 2026-08-10
 
 Audit and upgrade of the **TCP Reverse (`mux`)** protocol, which 1.11.0 left

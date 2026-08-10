@@ -26,6 +26,7 @@ import (
 	// Register transports. TCP is production; the rest register experimental
 	// placeholders from the transport package's init.
 	_ "github.com/emergency-tunnel/et/internal/transport/tcp"
+	_ "github.com/emergency-tunnel/et/internal/transport/ws"
 )
 
 func main() {
@@ -81,9 +82,25 @@ func cmdValidate(args []string) {
 		fmt.Fprintln(os.Stderr, "validate: --config is required")
 		os.Exit(2)
 	}
-	if _, err := config.Load(*cfgPath); err != nil {
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid: %v\n", err)
 		os.Exit(1)
+	}
+	// The schema check cannot know which transports this build actually carries,
+	// and validate is the ExecStartPre gate — so resolve the transport here too.
+	// Without this a config naming an unbuilt transport passed validation and
+	// then crash-looped the service at runtime with a much less obvious error.
+	if cfg.Engine == config.EngineMux {
+		tr, terr := transport.Get(cfg.Transport)
+		if terr != nil {
+			fmt.Fprintf(os.Stderr, "invalid: %v\n", terr)
+			os.Exit(1)
+		}
+		if tr.Experimental() {
+			fmt.Fprintf(os.Stderr, "invalid: transport %q is experimental and not implemented in this build\n", cfg.Transport)
+			os.Exit(1)
+		}
 	}
 	fmt.Println("ok")
 }
