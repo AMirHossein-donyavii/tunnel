@@ -4,6 +4,57 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.14.0] — 2026-08-10
+
+Reliable UDP in the core, so the Basic section's UDP protocol is real rather
+than absent.
+
+### Added
+- **Reliable UDP transport (`transport = "udp"`).** UDP alone gives no
+  ordering, no retransmission and no congestion control, and the crypto and mux
+  layers both require a reliable byte stream. Rather than weakening those, this
+  supplies the guarantees underneath them — a selective-repeat ARQ with:
+  cumulative `una` plus an explicit ACK list (one loss does not stall everything
+  behind it), Jacobson/Karels RTT estimation driving the RTO, fast retransmit
+  after 3 later ACKs, TCP-style slow start and congestion avoidance, and flow
+  control against the peer's advertised window. Presented as a `net.Conn`, so
+  every layer above it is unchanged.
+  Unit-tested for in-order delivery, complete recovery at 5/15/30% packet loss,
+  congestion-window growth, peer-window enforcement, and dead-path detection.
+- `low_latency` config option: switches the ARQ to shorter timers, shallower
+  windows and gentler backoff. The Gaming section sets it.
+- Basic → UDP in the console.
+
+### Fixed
+- **The reliable-UDP `Write` had no backpressure.** It accepted data at memory
+  speed while the wire moved at cwnd per round trip, so half a gigabyte piled up
+  in three seconds, overflowed the UDP socket buffer, and the resulting loss
+  collapsed the congestion window — a tunnel that reported 1481 Mbit/s while
+  actually carrying 8. The send queue is now bounded and `Write` blocks, which
+  is the backpressure the mux above expects. Real throughput measured
+  106 Mbit/s on loopback with the queue bounded at ~5 MB.
+- Slow start never ran: `ssthresh` started at 2, dropping straight into
+  congestion avoidance, which opens the window about one segment per RTT.
+
+### Performance note
+The reliable-UDP carrier is slower than raw TCP on a fast path (106 Mbit/s vs
+~1600 on loopback) — a userspace ARQ pays a syscall and a scheduler hop per
+segment where the kernel does not. That is the expected trade, and the reason to
+choose it is a path that throttles or blocks long-lived TCP, not raw speed on a
+path where TCP already works.
+
+### Still missing from the requested design
+- **WireGuard** is not implemented. Integrating it properly means driving the
+  kernel's WireGuard (key management, `wg`/netlink, interface and peer setup) —
+  a self-contained piece of work that did not fit alongside the ARQ.
+- **SPF BIP** (spoofed ICMPv6) is not implemented; SPF still offers `icmp` and
+  `tcp`.
+- **Basic → plain TCP** (one socket per user connection, unmultiplexed) is not
+  offered, because the multiplexed carrier is strictly better on the same wire.
+
+### Compatibility
+Wire protocol unchanged for existing transports. Configurations are untouched.
+
 ## [1.13.0] — 2026-08-10
 
 A new WebSocket transport, and a ground-up rewrite of the installer and the `et`

@@ -269,7 +269,7 @@ write_config() {
         echo
         local k
         for k in name role engine transport mode peer tunnel_port \
-                 ws_path ws_host \
+                 ws_path ws_host low_latency \
                  tun_mode spf_profile encapsulation spoof_src_ip spoof_dst_ip \
                  tun_ip tun_ip6 peer_tun_ip tun_iface mtu tun_queues \
                  workers pool cipher profile health_port log_level \
@@ -280,7 +280,7 @@ write_config() {
                 # numeric / boolean / array — emitted bare
                 tunnel_port|mtu|workers|pool|health_port|tun_queues|\
                 heartbeat_interval|heartbeat_timeout|batch_size|channel_size|\
-                so_sndbuf|so_rcvbuf|proxy_protocol|forwards)
+                so_sndbuf|so_rcvbuf|proxy_protocol|forwards|low_latency)
                     echo "$k = ${CFG[$k]}" ;;
                 *)  echo "$k = \"${CFG[$k]}\"" ;;
             esac
@@ -332,9 +332,11 @@ optimise() {
 
     case "$section" in
       basic)
-        # Multiplexed reverse tunnel. The carrier is a reliable stream, so MTU
-        # is irrelevant and the core's adaptive frame budget handles sizing.
+        # Multiplexed reverse tunnel. On a stream carrier the MTU is irrelevant
+        # and the core's adaptive frame budget handles sizing; the reliable-UDP
+        # carrier does need one, because it segments the stream itself.
         cfg_set engine mux
+        [ "$proto" = "udp" ] && cfg_set mtu 1400
         ;;
       tun)
         cfg_set engine tun
@@ -417,14 +419,18 @@ section_basic() {
     echo
     item 1 "TCPMUX" "raw TCP carrier — fastest, use unless something blocks it"
     item 2 "WSMUX"  "WebSocket/HTTP — passes CDNs and reverse proxies"
+    item 3 "UDP"    "reliable UDP (ARQ) — for paths that throttle or block TCP"
     echo
     note "TCP and TCPMUX are the same thing here: this engine is always"
     note "multiplexed, which strictly beats one socket per connection."
-    local c; c="$(ask_choice "Protocol" "1" 1 2)"
+    note "UDP carries the same reliable stream over an ARQ of its own, so it"
+    note "keeps ordering and congestion control where plain UDP has neither."
+    local c; c="$(ask_choice "Protocol" "1" 1 2 3)"
     cfg_reset
     case "$c" in
         1) optimise basic tcpmux; cfg_set transport tcp ;;
         2) optimise basic wsmux;  cfg_set transport ws ;;
+        3) optimise basic udp;    cfg_set transport udp ;;
     esac
     cfg_set name "$(ask_name "Tunnel name" "basic$(tunnel_count)")"
     common_endpoint

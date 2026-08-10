@@ -82,6 +82,11 @@ type Config struct {
 	SoSndbuf          int `toml:"so_sndbuf"`          // bytes; 0 = OS default
 	SoRcvbuf          int `toml:"so_rcvbuf"`          // bytes; 0 = OS default
 
+	// LowLatency switches latency-sensitive protocols (currently the reliable
+	// UDP transport) into their latency-first mode: shorter timers, shallower
+	// windows and gentler congestion backoff. The Gaming section sets it.
+	LowLatency bool `toml:"low_latency"`
+
 	// WSPath / WSHost shape the WebSocket transport's HTTP upgrade. The path
 	// must match on both servers; a non-default one also makes the listener
 	// answer 404 to anything else, so a probe sees an ordinary web server.
