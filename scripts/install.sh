@@ -10,6 +10,7 @@
 #   --version <v>    install an exact version instead of the channel head
 #   --channel <c>    stable | beta                     (default: stable)
 #   --base-url <u>   release host root                 (default below)
+#   --source <s>     host | github | source | auto     (default: auto)
 #   --from-source    build from Go source instead of downloading
 #   --force          reinstall even if already at the target version
 #   --no-tune        skip host network tuning (BBR/fq/buffers)
@@ -17,6 +18,12 @@
 #
 # Environment overrides: ET_SOURCE, ET_REPO_SLUG, ET_BASE_URL, ET_CHANNEL,
 # ET_VERSION, ET_PUBKEY, ET_FROM_SOURCE, ET_ALLOW_INSECURE, ET_FORCE, ET_NO_TUNE
+#
+# Where the build comes from (auto): the release host first, then GitHub
+# Releases. Whichever answers, its version is compared against the VERSION file
+# on the default branch — if the branch is newer, the installer builds that from
+# source. An unreleased fix therefore still reaches you through `et` → Update;
+# it never silently reinstalls the last published binary.
 #
 # Upgrades are safe: configurations in /etc/emergency-tunnel are never
 # rewritten by the installer, running tunnels are restarted onto the new core,
@@ -57,7 +64,7 @@ while [ $# -gt 0 ]; do
         --force)       ET_FORCE=1; shift ;;
         --no-tune)     ET_NO_TUNE=1; shift ;;
         --uninstall)   DO_UNINSTALL=1; shift ;;
-        -h|--help)     sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)     sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -146,6 +153,21 @@ install_deps() {
 }
 
 # ---- version + source resolution -------------------------------------------
+is_semver() { printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$'; }
+
+# ver_gt A B — true when A is strictly newer than B.
+ver_gt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# The version of the sources on the default branch. This is the authority for
+# "what is the newest Emergency Tunnel", independently of whether a release has
+# been cut for it — an unreleased commit must never leave `et` stuck on an old
+# binary with no way forward.
+branch_version() {
+    dl_str "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/VERSION" 2>/dev/null | tr -d '[:space:]'
+}
+
 # resolve_from <host|github> — sets VERSION and REL_URL, or fails.
 resolve_from() {
     case "$1" in
@@ -160,24 +182,44 @@ resolve_from() {
         REL_URL="https://github.com/${ET_REPO_SLUG}/releases/download/v${VERSION}" ;;
     esac
     [ -n "${VERSION:-}" ] || return 1
-    printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$' || return 1
+    is_semver "$VERSION" || return 1
     SOURCE_USED="$1"
     return 0
+}
+
+# prefer_branch_source switches an otherwise-resolved install over to a source
+# build when the default branch carries a newer version than any published
+# release. Without this, an update run silently reinstalls the last released
+# binary and the user sees nothing change.
+prefer_branch_source() {
+    [ -n "$ET_VERSION" ] && return 0   # an exact version was requested — honour it
+    local bv; bv="$(branch_version)" || return 0
+    [ -n "$bv" ] && is_semver "$bv" || return 0
+    if [ -z "${VERSION:-}" ] || ver_gt "$bv" "$VERSION"; then
+        if [ -n "${VERSION:-}" ]; then
+            warn "newest release is v${VERSION}, but the sources are at v${bv} — building from source"
+        else
+            warn "no published release reachable — building v${bv} from source"
+        fi
+        VERSION="$bv"; RESOLVED_FROM="$SOURCE_USED"; SOURCE_USED="source"
+    fi
 }
 
 resolve_version() {
     step "Release"
     case "$ET_SOURCE" in
         host|github) resolve_from "$ET_SOURCE" || die "cannot resolve a version from '${ET_SOURCE}'" ;;
+        source)      VERSION="${ET_VERSION:-}"; SOURCE_USED="source" ;;
         auto)
             if resolve_from host; then :
+            elif warn "release host unreachable — falling back to GitHub Releases"; resolve_from github; then :
             else
-                warn "release host unreachable — falling back to GitHub Releases"
-                resolve_from github || die "cannot resolve a version from either source"
-            fi ;;
-        *) die "unknown ET_SOURCE '${ET_SOURCE}' (host|github|auto)" ;;
+                VERSION=""; SOURCE_USED="source"
+            fi
+            prefer_branch_source ;;
+        *) die "unknown ET_SOURCE '${ET_SOURCE}' (host|github|source|auto)" ;;
     esac
-    ok "v${VERSION} (source: ${SOURCE_USED})"
+    [ "$SOURCE_USED" = "source" ] || ok "v${VERSION} (source: ${SOURCE_USED})"
 }
 
 installed_version() { [ -f "${LIB_DIR}/VERSION" ] && cat "${LIB_DIR}/VERSION" || echo ""; }
@@ -234,15 +276,23 @@ build_from_source() {
     if [ -f ./go.mod ] && grep -q emergency-tunnel ./go.mod 2>/dev/null; then
         src="$(pwd)"; info "using the current checkout"
     else
+        info "cloning ${ET_REPO}"
         git clone --depth 1 "$ET_REPO" "$src" >/dev/null 2>&1 || die "git clone failed"
     fi
+    # The tree being compiled is the authority on its own version — trust it over
+    # anything guessed earlier, so the stamped core and the recorded VERSION can
+    # never disagree. An explicit --version still wins.
+    if [ -z "$ET_VERSION" ] && [ -r "${src}/VERSION" ]; then
+        VERSION="$(tr -d '[:space:]' < "${src}/VERSION")"
+    fi
+    is_semver "${VERSION:-}" || VERSION="dev"
     ( cd "$src" && CGO_ENABLED=0 "$GO_BIN" build -trimpath \
-        -ldflags "-s -w -X github.com/emergency-tunnel/et/internal/core.CoreVersion=${VERSION:-dev}" \
+        -ldflags "-s -w -X github.com/emergency-tunnel/et/internal/core.CoreVersion=${VERSION}" \
         -o "${TMP}/et-core-linux-${ARCH}" ./cmd/et-core ) || die "build failed"
     CORE_BIN="${TMP}/et-core-linux-${ARCH}"
     cp "$src/scripts/et-panel.sh" "$src/scripts/uninstall.sh" "${TMP}/"
     cp "$src/systemd/emergency-tunnel@.service" "${TMP}/"
-    ok "built v${VERSION:-dev}"
+    ok "built v${VERSION}"
 }
 
 # ---- install ---------------------------------------------------------------
@@ -266,7 +316,10 @@ install_files() {
     install -m 0644 "${TMP}/emergency-tunnel@.service" "${UNIT_DIR}/emergency-tunnel@.service"
     echo "$VERSION" > "${LIB_DIR}/VERSION"
 
-    if [ "$SOURCE_USED" = "host" ]; then echo "${ET_BASE_URL}/install.sh" > "${LIB_DIR}/UPDATE_URL"
+    # Keep updating from wherever this install came from. A source build that
+    # only happened because the release was stale still belongs to its host.
+    if [ "$SOURCE_USED" = "host" ] || [ "${RESOLVED_FROM:-}" = "host" ]; then
+        echo "${ET_BASE_URL}/install.sh" > "${LIB_DIR}/UPDATE_URL"
     else echo "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/scripts/install.sh" > "${LIB_DIR}/UPDATE_URL"; fi
 
     # systemctl can be present but non-functional (containers, chroots, images
@@ -334,11 +387,11 @@ main() {
     detect
     install_deps
     if [ "$ET_FROM_SOURCE" = "1" ]; then
-        VERSION="${ET_VERSION:-dev}"; SOURCE_USED="source"; build_from_source
+        VERSION="${ET_VERSION:-}"; SOURCE_USED="source"
     else
         resolve_version
-        download_release
     fi
+    if [ "$SOURCE_USED" = "source" ]; then build_from_source; else download_release; fi
     install_files
     tune_host
     migrate_and_restart

@@ -4,6 +4,23 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] — 2026-08-10
+
+### Fixed
+
+- **Updating actually updates.** The installer resolved a version only from the
+  release host or GitHub Releases, so when the sources moved ahead of the last
+  published release, `et` → Update reinstalled the old binary and nothing
+  appeared to change. It now compares whichever release it found against the
+  `VERSION` file on the default branch and builds from source when the branch is
+  newer. An unreleased fix reaches the server through the normal update path.
+- `--from-source` stamped the core version as `dev` instead of reading the
+  cloned tree's `VERSION`, so a source install under-reported itself and the
+  post-install verification warned about a version mismatch.
+- Added `--source source` for an explicit source build, and kept the update URL
+  pointing at the release host when a host install falls through to a source
+  build.
+
 ## [2.0.0] — 2026-08-10
 
 Version 2. The create-tunnel flow is four categories, and every protocol listed

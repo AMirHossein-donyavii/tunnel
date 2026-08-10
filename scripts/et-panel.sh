@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 CORE="/usr/local/bin/et-core"
 CONF_DIR="/etc/emergency-tunnel"
 LOG_DIR="/var/log/emergency-tunnel"
