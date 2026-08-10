@@ -1,4 +1,5 @@
-package l3
+// Package netq holds queueing primitives shared by the tunnel's data planes.
+package netq
 
 import "time"
 
@@ -26,11 +27,11 @@ import "time"
 // The adaptive budget reaches the small-frame latency on a slow link without
 // imposing its syscall cost on a fast one.
 const (
-	// targetFrameTime is how long one frame may occupy the link.
-	targetFrameTime = 4 * time.Millisecond
-	// minFrameBudget keeps a frame large enough to hold a full-size packet plus
+	// TargetFrameTime is how long one frame may occupy the link.
+	TargetFrameTime = 4 * time.Millisecond
+	// MinBudget keeps a frame large enough to hold a full-size packet plus
 	// framing however slow the link is.
-	minFrameBudget = 4 * 1024
+	MinBudget = 4 * 1024
 	// busySample is how much blocked-write time is enough to estimate the drain
 	// rate. Small, so the budget reacts within a few frames of congestion
 	// starting rather than waiting out a fixed window.
@@ -40,8 +41,8 @@ const (
 	budgetWindow = 200 * time.Millisecond
 )
 
-// frameBudget derives the frame size that keeps one frame's wire time near
-// targetFrameTime.
+// Budget derives the frame size that keeps one frame's wire time near
+// TargetFrameTime.
 //
 // The rate is measured from how long writes actually *block*, not from
 // throughput over wall-clock time. That distinction matters: throughput over
@@ -51,7 +52,7 @@ const (
 // which is exactly, and only, when frame size affects latency.
 //
 // It is used by a single writer goroutine and needs no locking.
-type frameBudget struct {
+type Budget struct {
 	max     int
 	cur     int
 	bytes   int
@@ -60,17 +61,18 @@ type frameBudget struct {
 	nowFunc func() time.Time
 }
 
-func newFrameBudget(max int) *frameBudget {
-	b := &frameBudget{max: max, cur: max, nowFunc: time.Now}
+// New returns a Budget that never exceeds max bytes per frame.
+func New(max int) *Budget {
+	b := &Budget{max: max, cur: max, nowFunc: time.Now}
 	b.since = b.nowFunc()
 	return b
 }
 
 // size is the current per-frame byte budget.
-func (b *frameBudget) size() int { return b.cur }
+func (b *Budget) Size() int { return b.cur }
 
 // add records a frame of n bytes whose write blocked for the given duration.
-func (b *frameBudget) add(n int, blocked time.Duration) {
+func (b *Budget) Add(n int, blocked time.Duration) {
 	b.bytes += n
 	b.busy += blocked
 	now := b.nowFunc()
@@ -80,10 +82,10 @@ func (b *frameBudget) add(n int, blocked time.Duration) {
 
 	if b.busy >= busySample {
 		rate := float64(b.bytes) / b.busy.Seconds() // bytes per second
-		want := int(rate * targetFrameTime.Seconds())
+		want := int(rate * TargetFrameTime.Seconds())
 		switch {
-		case want < minFrameBudget:
-			want = minFrameBudget
+		case want < MinBudget:
+			want = MinBudget
 		case want > b.max:
 			want = b.max
 		}

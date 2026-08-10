@@ -393,6 +393,11 @@ type Stats struct {
 	RTTms              int64  `json:"rtt_ms"`
 	ForwardsConfigured int    `json:"forwards_configured"` // entry: VPN/listen ports configured
 	ForwardsUp         int64  `json:"forwards_up"`         // entry: of those, currently bound
+	// QueuedBytes / PeakQueuedBytes show the egress scheduler's backlog. Sitting
+	// near the budget means the carrier is the bottleneck and streams are being
+	// backpressured — the intended behaviour, not a fault.
+	QueuedBytes     int `json:"queued_bytes"`
+	PeakQueuedBytes int `json:"peak_queued_bytes"`
 }
 
 // Healthy reports whether the tunnel currently has at least one live session.
@@ -401,6 +406,7 @@ func (e *Engine) Healthy() bool { return e.set.count() > 0 }
 
 // Snapshot returns current counters (as any, for the shared engine interface).
 func (e *Engine) Snapshot() any {
+	queued, peak := e.set.queued()
 	return Stats{
 		Sessions:           e.set.count(),
 		ActiveStreams:      atomic.LoadInt64(&e.stats.activeStreams),
@@ -411,6 +417,8 @@ func (e *Engine) Snapshot() any {
 		RTTms:              e.set.bestRTT().Milliseconds(),
 		ForwardsConfigured: len(e.routes),
 		ForwardsUp:         atomic.LoadInt64(&e.stats.forwardsUp),
+		QueuedBytes:        queued,
+		PeakQueuedBytes:    peak,
 	}
 }
 

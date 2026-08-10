@@ -31,7 +31,6 @@ func pipeWithDelay(d time.Duration) (net.Conn, net.Conn) {
 	return delayConn{c1, d}, delayConn{c2, d}
 }
 
-
 // --- mux: new connection = one stream on an existing session -----------------
 
 func benchMuxSetup(b *testing.B, rtt time.Duration) {

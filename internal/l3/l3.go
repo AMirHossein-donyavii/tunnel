@@ -28,6 +28,7 @@ import (
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/firewall"
 	"github.com/emergency-tunnel/et/internal/logx"
+	"github.com/emergency-tunnel/et/internal/netq"
 	"github.com/emergency-tunnel/et/internal/nettune"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
 	"github.com/emergency-tunnel/et/internal/transport"
@@ -464,7 +465,7 @@ func (e *Engine) tunToLink(ctx context.Context, tq *txQueue, lk link, ps *pumpSt
 	maxFrame := lk.MaxFrame()
 	batch := make([]byte, 0, maxFrame)
 	pending := 0
-	budget := newFrameBudget(maxFrame)
+	budget := netq.New(maxFrame)
 
 	hb := time.NewTicker(e.hbInterval)
 	defer hb.Stop()
@@ -482,7 +483,7 @@ func (e *Engine) tunToLink(ctx context.Context, tq *txQueue, lk link, ps *pumpSt
 		atomic.AddUint64(&e.stats.txBytes, uint64(n))
 		// How long the write blocked is the tunnel's only direct measurement of
 		// what the carrier can actually absorb.
-		budget.add(n, time.Since(start))
+		budget.Add(n, time.Since(start))
 		batch = batch[:0]
 		pending = 0
 		return true
@@ -493,7 +494,7 @@ func (e *Engine) tunToLink(ctx context.Context, tq *txQueue, lk link, ps *pumpSt
 	// still allowed through on an empty batch, so the budget can never wedge a
 	// packet (see the oversize guard below for the genuinely-too-big case).
 	room := func(n int) bool {
-		limit := budget.size()
+		limit := budget.Size()
 		if len(batch) == 0 && limit < n+2 {
 			limit = maxFrame
 		}

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/emergency-tunnel/et/internal/netq"
 )
 
 var (
@@ -67,8 +69,10 @@ type Session struct {
 
 	accept chan *Stream
 
-	writeHi   chan outFrame
-	writeNorm chan outFrame
+	wq *writeQueue
+
+	// rxBuffered is the total delivered-but-unread bytes across all streams.
+	rxBuffered atomic.Int64
 
 	pingMu  sync.Mutex
 	pings   map[uint32]chan struct{}
@@ -90,15 +94,14 @@ func newSession(conn net.Conn, client bool, cfg Config) *Session {
 		cfg.AcceptBacklog = 256
 	}
 	s := &Session{
-		conn:      conn,
-		client:    client,
-		cfg:       cfg,
-		streams:   make(map[uint32]*Stream),
-		accept:    make(chan *Stream, cfg.AcceptBacklog),
-		writeHi:   make(chan outFrame, 256),
-		writeNorm: make(chan outFrame, 1024),
-		pings:     make(map[uint32]chan struct{}),
-		closeCh:   make(chan struct{}),
+		conn:    conn,
+		client:  client,
+		cfg:     cfg,
+		streams: make(map[uint32]*Stream),
+		accept:  make(chan *Stream, cfg.AcceptBacklog),
+		wq:      newWriteQueue(),
+		pings:   make(map[uint32]chan struct{}),
+		closeCh: make(chan struct{}),
 	}
 	s.nextID = 1
 	if !client {
@@ -114,6 +117,12 @@ func newSession(conn net.Conn, client bool, cfg Config) *Session {
 
 // LastRTT returns the most recent measured round-trip time (0 if none yet).
 func (s *Session) LastRTT() time.Duration { return time.Duration(atomic.LoadInt64(&s.lastRTT)) }
+
+// QueuedBytes reports the DATA bytes currently waiting in the egress scheduler
+// and the peak seen. A queue that sits near its budget means the carrier is the
+// bottleneck and streams are being backpressured — which is the intended
+// behaviour, not a fault.
+func (s *Session) QueuedBytes() (cur, peak int) { return s.wq.snapshot() }
 
 // NumStreams returns the number of currently open streams.
 func (s *Session) NumStreams() int {
@@ -222,10 +231,7 @@ func (s *Session) closeWithErr(cause error) error {
 		}
 		s.mu.Unlock()
 		// Best-effort GOAWAY so the peer stops opening streams.
-		select {
-		case s.writeHi <- outFrame{typ: frameGoAway}:
-		default:
-		}
+		s.wq.putCtrl(outFrame{typ: frameGoAway})
 		close(s.closeCh)
 		for _, st := range streams {
 			st.setErr(s.err)
@@ -244,20 +250,61 @@ func (s *Session) errOrClosed() error {
 	return ErrSessionClosed
 }
 
-// queue enqueues a frame for the writer, respecting session shutdown.
-func (s *Session) queue(f outFrame, hi bool) error {
-	ch := s.writeNorm
-	if hi {
-		ch = s.writeHi
+// accountRecv adjusts the session-wide receive accounting and tears the session
+// down if a peer has pushed past the ceiling that per-stream flow control is
+// supposed to keep it under.
+func (s *Session) accountRecv(delta int) {
+	if s.rxBuffered.Add(int64(delta)) > maxSessionRecvBuffer {
+		s.closeWithErr(errors.New("mux: peer exceeded the session receive buffer ceiling"))
 	}
-	select {
-	case ch <- f:
+}
+
+// orderedWithData reports whether a frame must stay behind the stream's already
+// queued DATA. Only FIN does: it closes the sequence, so letting it overtake
+// buffered data would truncate the stream at the receiver. SYN has the opposite
+// requirement (it must arrive first, which the control class guarantees), and
+// RST is an abort whose whole purpose is to overtake.
+func orderedWithData(typ uint8) bool { return typ == frameData || typ == frameFIN }
+
+// queue enqueues a frame for the writer, respecting session shutdown.
+//
+// Control frames are admitted immediately. DATA frames are admitted only while
+// the egress byte budget allows, and otherwise block here — which propagates
+// backpressure through Stream.Write to whoever is feeding the stream, instead
+// of letting an unbounded backlog build in front of every other stream.
+func (s *Session) queue(f outFrame, hi bool) error {
+	if f.typ == frameWinUp {
+		s.wq.putWinUp(f.id, f.ctl)
 		return nil
-	case <-s.closeCh:
-		if f.pooled {
-			putBuf(f.data)
+	}
+	if !orderedWithData(f.typ) {
+		if !s.wq.putCtrl(f) {
+			if f.pooled {
+				putBuf(f.data)
+			}
+			return s.errOrClosed()
 		}
-		return s.errOrClosed()
+		return nil
+	}
+	for {
+		accepted, closed := s.wq.tryPutData(f, hi)
+		if accepted {
+			return nil
+		}
+		if closed {
+			if f.pooled {
+				putBuf(f.data)
+			}
+			return s.errOrClosed()
+		}
+		select {
+		case <-s.wq.space:
+		case <-s.closeCh:
+			if f.pooled {
+				putBuf(f.data)
+			}
+			return s.errOrClosed()
+		}
 	}
 }
 
@@ -265,6 +312,15 @@ func (s *Session) removeStream(id uint32) {
 	s.mu.Lock()
 	delete(s.streams, id)
 	s.mu.Unlock()
+}
+
+// resetStream removes a stream AND discards whatever it still has queued. Used
+// on the abort paths (RST sent or received), where the queued bytes will never
+// be wanted and would otherwise hold the shared egress budget until the writer
+// drained them.
+func (s *Session) resetStream(id uint32) {
+	s.removeStream(id)
+	s.wq.drop(id)
 }
 
 func (s *Session) getStream(id uint32) *Stream {
@@ -280,55 +336,56 @@ func (s *Session) getStream(id uint32) *Stream {
 // single Write. This yields adaptive batching for free: light load writes one
 // frame (low latency), heavy load packs many frames per syscall (throughput).
 func (s *Session) sendLoop() {
+	// The writer owns the queue's lifetime: it drains whatever is left after the
+	// session closes (so a GOAWAY still reaches the peer) and then releases every
+	// remaining frame's pooled buffer.
+	defer s.wq.close()
 	scratch := make([]byte, 0, writeBatch+maxFrame)
+	// How much may be coalesced into one write follows the link's measured drain
+	// rate. A batch is indivisible once handed to the socket, so on a slow link a
+	// large one is pure head-of-line blocking for whatever the scheduler picks
+	// next — including the control frames the peer is waiting on.
+	budget := netq.New(writeBatch)
 	for {
 		f, ok := s.takeBlocking()
 		if !ok {
 			return
 		}
 		scratch = appendFrame(scratch[:0], f)
-		for len(scratch) < writeBatch {
-			f2, ok := s.takeNonBlocking()
+		limit := budget.Size()
+		for len(scratch) < limit {
+			f2, ok := s.wq.take()
 			if !ok {
 				break
 			}
 			scratch = appendFrame(scratch, f2)
 		}
+		n := len(scratch)
+		start := time.Now()
 		if _, err := s.conn.Write(scratch); err != nil {
 			s.closeWithErr(err)
 			return
 		}
+		budget.Add(n, time.Since(start))
 	}
 }
 
+// takeBlocking returns the next frame, waiting for one if the queue is empty.
 func (s *Session) takeBlocking() (outFrame, bool) {
-	// Prefer the high-priority queue.
-	select {
-	case f := <-s.writeHi:
-		return f, true
-	default:
-	}
-	select {
-	case f := <-s.writeHi:
-		return f, true
-	case f := <-s.writeNorm:
-		return f, true
-	case <-s.closeCh:
-		return outFrame{}, false
-	}
-}
-
-func (s *Session) takeNonBlocking() (outFrame, bool) {
-	select {
-	case f := <-s.writeHi:
-		return f, true
-	default:
-	}
-	select {
-	case f := <-s.writeNorm:
-		return f, true
-	default:
-		return outFrame{}, false
+	for {
+		if f, ok := s.wq.take(); ok {
+			return f, true
+		}
+		select {
+		case <-s.wq.ready:
+		case <-s.closeCh:
+			// Drain whatever is still queued so a GOAWAY written during shutdown
+			// still reaches the peer.
+			if f, ok := s.wq.take(); ok {
+				return f, true
+			}
+			return outFrame{}, false
+		}
 	}
 }
 
@@ -404,7 +461,7 @@ func (s *Session) recvLoop() {
 		case frameRST:
 			if st := s.getStream(id); st != nil {
 				st.setErr(ErrStreamReset)
-				s.removeStream(id)
+				s.resetStream(id)
 			}
 		case framePing:
 			var payload [8]byte

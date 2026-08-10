@@ -47,6 +47,13 @@ const (
 	// (idle streams use ~0). The engine raises this per performance profile; the
 	// WINDOW_UPDATE threshold is derived as window/2 per stream.
 	defaultWindow = 2 * 1024 * 1024
+	// maxSessionRecvBuffer bounds the receive data buffered across ALL streams of
+	// a session. Per-stream flow control already bounds a conformant peer, and
+	// maxRecvBuffer bounds a single misbehaving stream — but neither bounds the
+	// product: a peer that ignores flow control across hundreds of streams could
+	// still drive this host out of memory. Exceeding it means the peer is not
+	// speaking the protocol, so the session is torn down.
+	maxSessionRecvBuffer = 64 * 1024 * 1024
 	// maxRecvBuffer is the hard per-stream receive-buffer ceiling. It is set well
 	// above the largest profile window (fast = 4 MiB) so a conformant, in-window
 	// peer never reaches it; it only bounds memory against a peer that ignores

@@ -2,6 +2,7 @@ package muxeng
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emergency-tunnel/et/internal/mux"
@@ -13,7 +14,12 @@ import (
 type sessionSet struct {
 	mu   sync.RWMutex
 	list []*mux.Session
-	rr   uint64
+	// rr is advanced by pick, which holds only a READ lock so that many
+	// concurrent user connections can select a session in parallel. That makes
+	// the counter shared mutable state under a shared lock, so it must be
+	// atomic — incrementing it directly was a genuine data race on every busy
+	// entry-side tunnel.
+	rr atomic.Uint64
 }
 
 // add registers a session and returns the new live-session count (under the
@@ -50,13 +56,26 @@ func (s *sessionSet) pick() *mux.Session {
 		return nil
 	}
 	for i := 0; i < n; i++ {
-		s.rr++
-		cand := s.list[int(s.rr)%n]
+		cand := s.list[int(s.rr.Add(1)%uint64(n))]
 		if !cand.IsClosed() {
 			return cand
 		}
 	}
 	return nil
+}
+
+// queued sums the egress backlog across live sessions.
+func (s *sessionSet) queued() (cur, peak int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, x := range s.list {
+		c, p := x.QueuedBytes()
+		cur += c
+		if p > peak {
+			peak = p
+		}
+	}
+	return cur, peak
 }
 
 func (s *sessionSet) count() int {

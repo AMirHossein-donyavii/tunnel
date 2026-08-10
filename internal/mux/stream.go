@@ -79,10 +79,11 @@ func (st *Stream) deliver(data []byte) {
 	over := len(st.rbuf) > maxRecvBuffer
 	st.rcond.Signal()
 	st.rmu.Unlock()
+	st.s.accountRecv(len(data))
 	if over {
 		st.setErr(ErrStreamReset)
+		st.s.resetStream(st.id)
 		_ = st.s.queue(outFrame{typ: frameRST, id: st.id}, true)
-		st.s.removeStream(st.id)
 	}
 }
 
@@ -111,6 +112,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 	}
 	n := copy(p, st.rbuf)
 	st.rbuf = st.rbuf[n:]
+	st.s.accountRecv(-n)
 	if len(st.rbuf) == 0 {
 		st.rbuf = nil // release backing array
 	}

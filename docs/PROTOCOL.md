@@ -110,6 +110,39 @@ reconnects with backoff. The `/stats` endpoint reports live sessions, stream
 counts, byte counters, and the best current RTT — so degradation is visible
 before users notice.
 
+### The egress scheduler
+
+Every stream on a session shares one carrier link, so the order frames leave in
+*is* the quality-of-service policy. A plain FIFO makes two things go wrong at
+once: the queue grows until it hides seconds of latency, and one bulk stream's
+backlog sits in front of every other stream's data.
+
+The writer therefore runs a scheduler with four rules:
+
+| Class | Served | Why |
+|-------|--------|-----|
+| Window-update credit | first, coalesced per stream | it is what unblocks the peer's sender; delaying it costs throughput in the *other* direction |
+| Control (SYN/RST/PING/GOAWAY) | next | tiny, and a new stream's setup should not queue behind bulk |
+| `@ll` streams | next, round-robin | low-latency forwards (gaming, SSH) |
+| Bulk streams | last, round-robin | fair share between transfers |
+
+Two properties matter beyond the ordering:
+
+- **The DATA classes are bounded by bytes (256 KiB), not frame count.** Past the
+  budget `Stream.Write` blocks, which stops draining the user's socket and
+  applies TCP backpressure to the user. For a reliable stream this is strictly
+  better than dropping — the opposite of the TUN data plane, where the kernel
+  hands us packets whether we want them or not and CoDel must drop instead.
+- **Window-update credit is accumulated, not queued.** Credit is additive, so
+  coalescing is exact, and it means a window update can never be dropped for
+  lack of queue space. Losing one is not a hiccup: it strands that stream's
+  sender permanently.
+
+`FIN` travels on its stream's DATA queue rather than the control class. It
+consumes sequence space, so overtaking buffered data would truncate the stream —
+a test drives 1 MiB followed by an immediate `Close()` and fails if any byte is
+lost.
+
 ### Resource profile
 
 A handful of sessions replace hundreds of sockets: far fewer file descriptors,

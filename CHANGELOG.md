@@ -4,6 +4,74 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.12.0] — 2026-08-10
+
+Audit and upgrade of the **TCP Reverse (`mux`)** protocol, which 1.11.0 left
+largely untouched while the TUN data plane was rebuilt. It is the default and
+recommended engine, and it had the same class of problem the TUN path did:
+an unbounded, strictly first-come-first-served egress queue.
+
+### Fixed
+- **Data race in session selection.** `sessionSet.pick()` advanced its
+  round-robin cursor while holding only a *read* lock, so every concurrent user
+  connection on the entry side raced on it — confirmed by the race detector, and
+  the entry side calls it once per connection. The cursor is now atomic, and a
+  regression test drives it from 16 goroutines. Symptoms would have been uneven
+  session selection; under Go's memory model it was undefined behaviour.
+- **No session-wide receive bound.** Per-stream flow control bounds a
+  conformant peer and the per-stream ceiling bounds one misbehaving stream, but
+  neither bounded the product — a peer ignoring flow control across hundreds of
+  streams could drive the host out of memory. The session now tracks total
+  buffered receive bytes and tears down a peer that exceeds the ceiling.
+
+### Improved — the mux egress scheduler
+The writer's two channels (256 control frames + 1024 data frames) could hold
+~16 MB of DATA, which on a 20 Mbit link is six seconds of standing queue. Being
+channels, they were also strictly FIFO, so one bulk stream's backlog sat in
+front of every other stream's data. Both are replaced by a real scheduler:
+
+- **Byte-bounded egress (256 KiB).** Past the budget `Stream.Write` blocks,
+  which stops draining the user's socket and pushes back via TCP. Backpressure,
+  not dropping, is the right answer for a reliable stream — the opposite of the
+  L3 path, where the kernel hands us packets regardless and CoDel must drop.
+- **Per-stream round-robin.** N active streams each get ~1/N of the link rather
+  than whoever queued first taking all of it. Streams from `@ll` forwards keep
+  their own higher-priority rotation.
+- **Coalesced, lossless window updates.** Credit is accumulated per stream
+  instead of queued as individual frames, so a burst of small reads cannot flood
+  the control class and — the point — a window update can never be dropped for
+  lack of queue space. Losing one does not cause a hiccup, it strands the peer's
+  sender forever.
+- **FIN is ordered with its stream's data**, not treated as a control frame.
+  A test drives 1 MiB followed by an immediate `Close()`; routing FIN through
+  the control class loses 20% of the payload, so this is enforced by test rather
+  than by convention.
+- **Adaptive write batching.** The writer's coalescing limit now follows the
+  link's measured drain rate (the same `netq.Budget` the TUN engine uses, moved
+  to a shared package) instead of a fixed 32 KiB, so a batch never blocks the
+  wire long enough to delay the control frames the peer is waiting on.
+- **`/stats` gains `queued_bytes` and `peak_queued_bytes`.**
+
+### Verified
+End-to-end on a two-namespace testbed with real TUN devices and sockets:
+
+| | 1.11.0 | 1.12.0 |
+|---|---|---|
+| mux session RTT under load (shaped 20 Mbit) | 209 ms | 153-179 ms |
+| mux peak egress backlog | up to ~16 MB | 256 KiB (bounded) |
+| mux bulk, unshaped | 1579 Mbit/s | 1701-1749 Mbit/s |
+| mux new-stream setup under load | 0.5 ms avg | 0.4-0.5 ms avg |
+| TUN tcp carrier, unshaped | — | 1859 Mbit/s, ping 0.68 ms |
+| TUN udp carrier, unshaped | — | 1160 Mbit/s, ping 0.52 ms |
+
+New-stream setup was already fast in 1.11.0 (SYN was always prioritised); the
+gains here are in the queue's depth, its fairness between streams, and the
+session's own round trip under load.
+
+### Compatibility
+Wire protocol unchanged from 1.11.0 (still v3) — a 1.11.0 peer interoperates
+with a 1.12.0 peer. Config schema, defaults and CLI unchanged.
+
 ## [1.11.0] — 2026-08-10
 
 A networking-layer overhaul aimed squarely at the two symptoms that made the

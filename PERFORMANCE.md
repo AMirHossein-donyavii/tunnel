@@ -15,19 +15,27 @@ the two servers, and the tunnel now manages all four:
 | Engine TX queue | express class + CoDel AQM (`internal/l3/sched.go`) | keeps queueing delay near 5 ms instead of hundreds of ms |
 | Kernel socket send queue | `TCP_NOTSENT_LOWAT` = 128 KiB | anything here is beyond the scheduler's reach; capping it keeps the queue where priority still applies |
 | Kernel socket send buffer size | left to `tcp_wmem` autotuning | pinning a large `SO_SNDBUF` turns it into a multi-megabyte standing FIFO |
-| The frame itself | adaptive frame budget (`internal/l3/budget.go`) | a frame is indivisible on the wire, so its size is a hard floor on how long an express packet can be blocked |
+| The frame itself | adaptive frame budget (`internal/netq`) | a frame is indivisible on the wire, so its size is a hard floor on how long an express packet can be blocked |
+| mux egress queue | byte budget + per-stream round-robin (`internal/mux/writeq.go`) | bounds the backlog to 256 KiB and stops one bulk stream monopolising the link |
 
 A ping that sits at ~100 ms and jumps to 400 ms the moment a transfer starts is
 the classic signature of an unmanaged queue: the ICMP packet is sitting behind a
 few hundred kilobytes of bulk data. The express class removes exactly that wait,
 and CoDel stops the backlog forming in the first place.
 
+The mux engine reaches the same goal by a different route. Its queue is bounded
+in bytes and, once full, `Stream.Write` blocks — pushing back through TCP to
+whoever is sending. Backpressure beats dropping for a reliable stream; the TUN
+path cannot use it only because the kernel delivers packets regardless.
+
 **Reading `/stats`:** `rtt_ms` is the tunnel link's own round trip, measured with
 control frames. Compare it against a ping *through* the tunnel — if the ping is
 much higher, the extra time is queueing, not the path. `tx_dropped` rising
 steadily under load is CoDel doing its job (it is the congestion signal inner TCP
 needs), not packet loss to worry about; `bad_frames` rising means corrupt,
-forged or replayed carrier packets.
+forged or replayed carrier packets. On the mux engine, `queued_bytes` sitting at
+`peak_queued_bytes` means the carrier is the bottleneck and streams are being
+backpressured — that is the design working, not a fault.
 
 ## Memory
 
