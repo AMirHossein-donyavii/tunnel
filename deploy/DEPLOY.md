@@ -59,12 +59,20 @@ certbot --nginx -d dl.example.com
 nginx -t && systemctl reload nginx
 ```
 
-### 5. Test, then share the command
+### 5. Verify what the host is serving, then share the command
 ```bash
-# quick check the files are reachable:
-curl -fsSL https://dl.example.com/stable          # -> 1.2.0
-curl -fsSIL https://dl.example.com/install.sh | head -1
+deploy/verify-host.sh dl.example.com 1.2.0
 ```
+This checks the channel pointer, that `install.sh` matches its published
+checksum and is baked to this host, every asset against `SHA256SUMS`, that the
+served `et-panel.sh` is the same version as the channel, and that the core
+binary reports that version. It exits non-zero if anything is off.
+
+Run it every time. A build and an upload can both succeed while the host still
+serves a stale file — most damagingly `et-panel.sh`, which installs a current
+core next to an old console: new binary, old menus, and an update that looks to
+the user like it did nothing at all.
+
 **Your users run:**
 ```bash
 curl -fsSL https://dl.example.com/install.sh | bash
@@ -72,11 +80,16 @@ curl -fsSL https://dl.example.com/install.sh | bash
 
 ### Publishing a new version later
 ```bash
-scripts/build-release.sh 1.3.0 --channel stable    # (repeat step 1–2)
+deploy/configure-host.sh dl.example.com 1.3.0      # builds + bakes the host URL
 rsync -av ./release/ root@dl.example.com:/var/www/emergency-tunnel/
+deploy/verify-host.sh dl.example.com 1.3.0
 ```
 `rsync` adds `releases/v1.3.0/` and rewrites `stable` → `1.3.0`. Existing users
 update by re-running the same one-liner (idempotent; restarts active tunnels).
+
+Prefer `rsync` over `cp -a`: `cp -a` leaves whatever is already in the web root
+in place, so a `install.sh` from an older deploy can survive and keep installing
+old assets. If you do use `cp`, verify afterwards.
 
 ---
 

@@ -42,11 +42,20 @@ echo -e "${C_C}==> Baking host settings into release/install.sh${C_0}"
 IN="release/install.sh"
 [ -f "$IN" ] || die "release/install.sh not found (build failed?)"
 # Flip the two defaults so the hosted copy targets YOUR server with no env vars.
-sed -i.bak \
-    -e 's|^ET_SOURCE="${ET_SOURCE:-github}"|ET_SOURCE="${ET_SOURCE:-host}"|' \
-    -e "s|^ET_BASE_URL=\"\${ET_BASE_URL:-https://example.com}\"|ET_BASE_URL=\"\${ET_BASE_URL:-${BASE_URL}}\"|" \
+# Match whatever default is currently there rather than one specific literal: a
+# pattern that silently stops matching turns this whole step into a no-op that
+# still reports success, and the mis-targeted installer only surfaces later on a
+# user's server.
+sed -i.bak -E \
+    -e 's|^ET_SOURCE="\$\{ET_SOURCE:-[^}]*\}"|ET_SOURCE="${ET_SOURCE:-host}"|' \
+    -e "s|^ET_BASE_URL=\"\\\$\\{ET_BASE_URL:-[^}]*\\}\"|ET_BASE_URL=\"\\\${ET_BASE_URL:-${BASE_URL}}\"|" \
     "$IN"
 rm -f "${IN}.bak"
+grep -qF "ET_BASE_URL=\"\${ET_BASE_URL:-${BASE_URL}}\"" "$IN" \
+    || die "could not bake ET_BASE_URL into ${IN} — the installer's defaults changed shape"
+grep -qF 'ET_SOURCE="${ET_SOURCE:-host}"' "$IN" \
+    || die "could not bake ET_SOURCE into ${IN} — the installer's defaults changed shape"
+echo "    ET_BASE_URL=${BASE_URL}  ET_SOURCE=host"
 
 # If a public signing key is present, embed it and publish it too.
 if [ -f minisign.pub ]; then
