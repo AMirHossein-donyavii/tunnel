@@ -360,7 +360,21 @@ verify_install() {
         || die "et-core will not run"
     [ "$v" = "$VERSION" ] || warn "core reports v${v}, expected v${VERSION}"
     ok "core v${v}"
-    "${PREFIX}/et" --version >/dev/null 2>&1 && ok "panel responds" || warn "panel did not respond"
+    # Verify the panel by version, not merely that it runs. A stale console next
+    # to a fresh core is the failure that looks exactly like "the update did
+    # nothing" — same menus, new binary — so it must never pass silently.
+    local pv
+    pv="$("${PREFIX}/et" --version 2>/dev/null | awk '{print $2}' | tr -d 'v ')"
+    if [ -z "$pv" ]; then warn "panel did not report a version — it may be a pre-2.0 console"
+    elif [ "$pv" != "$VERSION" ]; then warn "panel reports v${pv}, expected v${VERSION}"
+    else ok "panel v${pv}"; fi
+
+    # An older copy earlier in PATH keeps launching after a successful install,
+    # which presents as an update that changed nothing at all.
+    local onpath; onpath="$(command -v et 2>/dev/null || true)"
+    if [ -n "$onpath" ] && [ "$onpath" != "${PREFIX}/et" ]; then
+        warn "'et' on PATH is ${onpath}, not ${PREFIX}/et — remove the old copy"
+    fi
     local n; n="$(find "$CONF_DIR" -maxdepth 1 -name '*.toml' 2>/dev/null | wc -l)"
     [ "$n" -gt 0 ] && ok "${n} existing configuration(s) preserved"
     printf "\n  ${GRY}%s${R}\n" "transports built into this core:"

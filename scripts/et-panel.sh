@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 CORE="/usr/local/bin/et-core"
 CONF_DIR="/etc/emergency-tunnel"
 LOG_DIR="/var/log/emergency-tunnel"
@@ -33,6 +33,10 @@ else
     R=''; B=''; DIM=''; RED=''; GRN=''; YEL=''; BLU=''; CYN=''; MAG=''; GRY=''
 fi
 W=74   # console width
+
+# Leaving on EOF (see ask) is delivered as a signal, because the read happens
+# inside a command substitution. Handle it as an ordinary quit.
+trap 'printf "\n"; exit 0' TERM
 
 have() { command -v "$1" >/dev/null 2>&1; }
 rule() { printf "${GRY}%${W}s${R}\n" '' | tr ' ' '─'; }
@@ -68,8 +72,17 @@ banner() {
    └─┘ ┴    └─┘┴ ┴└─┘┴└─└─┘└─┘┘└┘└─┘ ┴    ┴ └─┘┘└┘┘└┘└─┘┴─┘
 ART
     printf "${R}"
+    local cv; cv="$(core_version)"
     printf "  ${GRY}panel ${R}${B}v%s${R}${GRY}   core ${R}${B}v%s${R}${GRY}   %s${R}\n" \
-        "$SCRIPT_VERSION" "$(core_version)" "$(uname -m)"
+        "$SCRIPT_VERSION" "$cv" "$(uname -m)"
+    # A half-applied update — a new core binary next to the panel it shipped
+    # with replaced, or the reverse — looks like "the update did nothing": the
+    # menus are the old ones even though the core is current. Say so here rather
+    # than letting it be discovered protocol by protocol.
+    if [ "$cv" != "—" ] && [ "$cv" != "$SCRIPT_VERSION" ]; then
+        printf "  ${YEL}! panel v%s and core v%s are from different releases — re-run the installer${R}\n" \
+            "$SCRIPT_VERSION" "$cv"
+    fi
     rule
 }
 
@@ -83,7 +96,12 @@ ask() {  # ask <prompt> [default]
     # A failed read means stdin closed (piped input exhausted, or the terminal
     # went away). Returning the default here would spin the menu forever, so
     # treat EOF as "leave", the same as choosing Exit.
-    if ! read -r a; then printf "\n" >&2; exit 0; fi
+    #
+    # Every caller invokes this as $(ask …), so `exit` would only end the
+    # command-substitution subshell and the menu would keep redrawing against a
+    # closed stdin — an endless loop at full CPU. Signal the real shell instead;
+    # the TERM trap installed at the top of the script turns it into a clean exit.
+    if ! read -r a; then printf "\n" >&2; kill -TERM "$$" 2>/dev/null; exit 0; fi
     printf '%s' "${a:-$d}"
 }
 ask_req() { local v; while :; do v="$(ask "$1" "${2:-}")"; [ -n "$v" ] && { printf '%s' "$v"; return; }; bad "A value is required." >&2; done; }

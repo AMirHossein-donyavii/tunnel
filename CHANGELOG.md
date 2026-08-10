@@ -4,6 +4,22 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] — 2026-08-10
+
+### Fixed
+
+- **A stale console next to a fresh core now fails the install instead of
+  passing it.** Verification only checked that the panel ran, not which version
+  it was, so an update that replaced `et-core` but left an old `et` in place
+  reported success — and the server kept showing the pre-2.0 menus. The panel is
+  now verified by version, `et` being shadowed earlier in `PATH` is reported, and
+  the console itself warns in its header when panel and core come from different
+  releases.
+- **The console no longer spins forever when stdin closes.** Every prompt runs
+  inside a command substitution, so the EOF handler's `exit` ended only that
+  subshell; the menu redrew against a closed stdin at full CPU. EOF now signals
+  the real shell and leaves cleanly.
+
 ## [2.0.1] — 2026-08-10
 
 ### Fixed
