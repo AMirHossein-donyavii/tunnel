@@ -11,9 +11,9 @@ import (
 // net.Conn-ish contract used by the tunnel (Read/Write/Close plus deadlines are
 // approximated by the caller via context, so full net.Conn is not required).
 type Stream struct {
-	id  uint32
-	s   *Session
-	hi  bool
+	id   uint32
+	s    *Session
+	hi   bool
 	dest []byte // SYN hint (e.g. remote port) for accepted streams
 
 	// receive side

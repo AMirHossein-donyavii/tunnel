@@ -4,6 +4,118 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] — 2026-08-10
+
+A networking-layer overhaul aimed squarely at the two symptoms that made the
+tunnel feel unreliable: **latency spikes under load** and **poor throughput**.
+
+> **Upgrade both servers.** The link protocol is now v3 and a v2 peer cannot
+> talk to a v3 peer. The mismatch surfaces as a clean handshake rejection
+> ("not an emergency-tunnel peer (bad magic/version)"), not as corrupt data, but
+> the tunnel will not come up until both ends run 1.11.0.
+
+### The latency problem
+
+A ping that sat at ~97 ms and jumped to ~400 ms whenever traffic flowed was not
+path jitter — it was queueing. The transmit path was a plain 256-packet FIFO
+(~350 KB), so on a 20 Mbit link every packet, interactive or not, waited behind
+up to ~140 ms of bulk backlog. Three more unmanaged queues sat behind it: the
+kernel's socket send queue, the TUN device's `txqueuelen`, and (on the `fast`
+profile) a pinned 4 MiB `SO_SNDBUF`.
+
+### Added
+- **Two-class packet scheduler** (`internal/l3/sched.go`). Latency-critical
+  traffic — ICMP/ICMPv6, TCP segments with no payload (pure ACK, SYN, RST), UDP
+  ≤ 192 B (DNS, QUIC ACKs, VoIP, game traffic), anything ≤ 128 B — is drained
+  ahead of bulk data, so a ping never waits behind a download. The split is
+  conservative about reordering: only traffic where overtaking is provably
+  harmless is expedited, and a TCP **FIN is never expedited** because it consumes
+  sequence space and would truncate the stream. Expediting pure ACKs also keeps
+  the inner connection's ACK clock steady, which raises throughput.
+- **CoDel AQM (RFC 8289)** on the bulk class. Drops start only when queue
+  sojourn time stays above 5 ms for a full 100 ms interval, giving inner TCP the
+  congestion signal it needs to settle at a rate that keeps the queue short —
+  full throughput without the standing delay.
+- **`TCP_NOTSENT_LOWAT`** (128 KiB) on every carrier socket. Without it the
+  kernel accepts megabytes of application data on a congested path, putting it
+  beyond the reach of the scheduler; a packet marked latency-critical would still
+  sit behind whatever bulk data the kernel took a moment earlier.
+- **`fq_codel` and a short `txqueuelen`** on the TUN device, for per-flow
+  fairness on the way in — one download can no longer add delay to an
+  interactive session sharing the tunnel.
+- **Real link RTT measurement.** Control frames carry a timestamp and are echoed
+  by the peer; the smoothed round trip is exposed as `rtt_ms` on `/stats`.
+  Comparing it against a ping through the tunnel says immediately whether extra
+  latency is the path or queueing.
+- **Anti-replay window** (1024 counters) on the datagram carriers, so duplicated
+  or replayed packets are rejected instead of re-injected into the TUN device,
+  while ordinary path reordering is still accepted.
+- **Startup host-tuning advice.** The core checks `tcp_congestion_control`,
+  `default_qdisc`, `tcp_rmem`/`tcp_wmem` ceilings and
+  `tcp_slow_start_after_idle`, and logs a specific fix for anything working
+  against it.
+- **Adaptive frame budget.** A frame is indivisible on the wire, so its size is
+  a hard floor on how long an express packet can be delayed — at 20 Mbit a
+  60 KiB frame is 24 ms of head-of-line blocking, enough to negate the priority
+  scheduler completely. The batch size is now derived from the link's measured
+  drain rate so one frame never occupies the wire for more than ~4 ms, while a
+  link that never blocks keeps full-size frames and their amortised syscall cost.
+  On a shaped 20 Mbit link under 2× unresponsive UDP load, this moved ping
+  through the tunnel from 75.5/115.7/158.4 ms (min/avg/max, fixed 60 KiB) to
+  3.3/15.5/44.5 ms.
+- **Richer `/stats`**: `rtt_ms`, `express_packets`, `bulk_packets`,
+  `tx_dropped`, `queue_depth`, `bad_frames`.
+
+### Improved
+- **One syscall per frame.** The AEAD layer wrote the 2-byte length prefix and
+  the ciphertext as two separate `write` calls, which with `TCP_NODELAY` put a
+  2-byte TCP segment in front of *every* frame. Both are now sealed into one
+  buffer and written once.
+- **Frames carry up to 63 KiB** (was 16 KiB). A 60 KiB packet batch is now one
+  frame, one seal and one syscall instead of four frames and eight writes.
+- **The L3 engine dropped its redundant framing.** One packet batch maps onto one
+  AEAD frame, so the extra 4-byte header and the `io.ReadFull` reassembly loop
+  are gone, and frames are read without copying out of the decryption buffer.
+- **Zero-allocation data path.** The TUN reader used to allocate a right-sized
+  slice for every packet despite having a buffer pool; packets now stay in their
+  pooled buffer from read to frame. The UDP/ICMP/SPF demultiplexers pool their
+  buffers too. `BenchmarkQueuePushPop` and `BenchmarkWriteFrame` report
+  0 allocs/op.
+- **Batching is opportunistic instead of timer-driven.** The fixed 2 ms flush
+  timer added up to 2 ms to every packet on an idle tunnel; the batch is now
+  flushed the moment the queue drains, so light load pays nothing and heavy load
+  still fills whole frames.
+- **Faster failover.** Heartbeat defaults moved from 10 s/25 s to 3 s/12 s (for
+  both the TUN and mux engines), liveness is checked at millisecond rather than
+  second resolution, `TCP_USER_TIMEOUT` dropped to 12 s, and reconnect backoff
+  now starts at 250 ms and caps at 5 s. Packets still queued when a link dies are
+  discarded rather than delivered late after the reconnect.
+- **The mux writer coalesces up to 32 KiB** (was 60 KiB) — one AEAD frame per
+  write, and a bounded wait for a high-priority frame produced while the writer
+  is pushing a batch.
+- **A bad datagram no longer kills the carrier.** On an open UDP/ICMP port
+  anyone can inject a packet; the link now skips undecryptable datagrams (and
+  counts them) instead of tearing down, which closed a trivial remote
+  denial-of-service. A sustained flood of them still fails the link, since that
+  means the peer's keys genuinely do not match.
+
+### Fixed
+- A packet larger than the carrier's frame budget (reachable with an MTU
+  configured above what the carrier can wrap) failed the write and cycled an
+  otherwise healthy link. It is now shed and counted.
+
+### Compatibility
+Wire protocol v2 → v3: **both servers must be upgraded together.** Config schema,
+defaults and CLI are unchanged apart from the heartbeat defaults; existing
+configs keep working, and an explicit `heartbeat_interval`/`heartbeat_timeout`
+still overrides them.
+
+The panel no longer pins those two values into every generated config — doing so
+froze new tunnels at the old 10 s/25 s and stopped tuned core defaults from ever
+reaching them. Tunnels created before this release still carry the explicit
+values; delete those two lines from `/etc/emergency-tunnel/<name>.toml` (or
+recreate the tunnel) to pick up the faster defaults.
+
 ## [1.10.1] — 2026-07-22
 
 Fixes TUN/SPF peer-IP validation, which rejected valid input and blocked

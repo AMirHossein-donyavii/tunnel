@@ -31,6 +31,16 @@ const (
 const (
 	headerLen = 10
 	maxFrame  = 16 * 1024 // max DATA payload per frame
+	// writeBatch bounds how many bytes the writer coalesces into one Write.
+	//
+	// It is a latency/throughput trade: a bigger batch means fewer syscalls, but
+	// a high-priority frame produced while the writer is blocked pushing the
+	// batch out has to wait for the whole batch to drain first. 32 KiB is one
+	// AEAD frame on the encrypted link (so a full batch is exactly one write and
+	// one seal) and bounds that wait to a few milliseconds even on a slow path,
+	// while still being large enough that syscall cost is negligible at any rate
+	// this tunnel runs at.
+	writeBatch = 32 * 1024
 	// defaultWindow is the fallback initial per-stream receive window when the
 	// session Config does not set one. It caps the bandwidth-delay product a
 	// single stream can fill while only costing RAM for bytes actually in flight
@@ -60,7 +70,7 @@ func (h *header) encode(typ, flags uint8, id, length uint32) {
 	binary.BigEndian.PutUint32(h[6:10], length)
 }
 
-func (h *header) typ() uint8      { return h[0] }
-func (h *header) flags() uint8    { return h[1] }
-func (h *header) id() uint32      { return binary.BigEndian.Uint32(h[2:6]) }
-func (h *header) length() uint32  { return binary.BigEndian.Uint32(h[6:10]) }
+func (h *header) typ() uint8     { return h[0] }
+func (h *header) flags() uint8   { return h[1] }
+func (h *header) id() uint32     { return binary.BigEndian.Uint32(h[2:6]) }
+func (h *header) length() uint32 { return binary.BigEndian.Uint32(h[6:10]) }

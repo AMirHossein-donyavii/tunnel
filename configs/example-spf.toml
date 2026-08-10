@@ -44,8 +44,8 @@ cipher = "chacha20-poly1305"
 health_port = 9090
 profile = "fast"
 log_level = "info"
-heartbeat_interval = 10
-heartbeat_timeout = 25
+heartbeat_interval = 3
+heartbeat_timeout = 12
 
 # Optional port forwarding: DNAT these ports across the tunnel to peer_tun_ip
 # (both TCP and UDP). Requires peer_tun_ip; the panel enables/persists

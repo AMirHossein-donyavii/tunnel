@@ -3,6 +3,7 @@ package l3
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,17 +22,17 @@ func TestChannelDefaultByProfile(t *testing.T) {
 			t.Errorf("channelDefault(%q)=%d, want %d", profile, got, want)
 		}
 	}
-	// Shallower than the old fixed 1024 (the standing-queue bufferbloat fix).
-	if channelDefault(config.ProfileFast) >= 1024 {
-		t.Error("fast channel depth should be well below the old 1024")
-	}
 }
 
-// fakeQueue implements the queue interface for testing queueReader's drop-head
-// behaviour without a real TUN device.
+// fakeQueue implements the queue interface for testing without a real TUN
+// device. Writes come from an engine goroutine while the test inspects them, so
+// the written log is mutex-guarded.
 type fakeQueue struct {
 	packets [][]byte
 	idx     int
+
+	mu      sync.Mutex
+	written [][]byte
 }
 
 func (q *fakeQueue) Read(p []byte) (int, error) {
@@ -42,35 +43,98 @@ func (q *fakeQueue) Read(p []byte) (int, error) {
 	q.idx++
 	return n, nil
 }
-func (q *fakeQueue) Write(p []byte) (int, error) { return len(p), nil }
 
-// TestQueueReaderDropHead verifies that when the TX channel is full, queueReader
-// evicts the OLDEST packet and enqueues the newest, so the consumer always sees
-// the freshest data rather than stale buffered packets.
-func TestQueueReaderDropHead(t *testing.T) {
-	e := &Engine{pktLen: 64}
-	e.pool.New = func() any { b := make([]byte, e.pktLen); return &b }
+func (q *fakeQueue) Write(p []byte) (int, error) {
+	q.mu.Lock()
+	q.written = append(q.written, append([]byte(nil), p...))
+	q.mu.Unlock()
+	return len(p), nil
+}
 
-	// Capacity-1 channel; feed three distinct packets with no consumer.
-	ch := make(chan []byte, 1)
-	q := &fakeQueue{packets: [][]byte{{1}, {2}, {3}}}
+// snapshot returns a copy of everything written so far.
+func (q *fakeQueue) snapshot() [][]byte {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([][]byte(nil), q.written...)
+}
+
+// bulkPacket builds a TCP data packet of the given total length, which the
+// classifier must place in the bulk class.
+func bulkPacket(total int, marker byte) []byte {
+	if total < 40 {
+		total = 40
+	}
+	p := make([]byte, total)
+	p[0] = 0x45 // IPv4, IHL 5
+	p[2] = byte(total >> 8)
+	p[3] = byte(total)
+	p[9] = protoTCP
+	p[20+12] = 5 << 4 // TCP data offset 5 -> 20 bytes of header, rest is payload
+	p[20+13] = 0x10   // ACK
+	p[len(p)-1] = marker
+	return p
+}
+
+// TestQueueReaderFeedsScheduler checks that queueReader hands every packet it
+// reads to the scheduler in a pooled buffer, and that the scheduler serves them
+// back in order within a class.
+func TestQueueReaderFeedsScheduler(t *testing.T) {
+	e := &Engine{pktLen: 1500}
+	e.pool = newBufPool(e.pktLen)
+	tq := newTxQueue(64, 1380, e.pool, &e.qstats)
+
+	q := &fakeQueue{packets: [][]byte{
+		bulkPacket(200, 1),
+		bulkPacket(200, 2),
+		bulkPacket(200, 3),
+	}}
 
 	done := make(chan struct{})
-	go func() { e.queueReader(context.Background(), q, ch); close(done) }()
-
+	go func() { e.queueReader(context.Background(), q, tq); close(done) }()
 	select {
-	case <-done: // reader processed all three then hit EOF and returned
+	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("queueReader did not drain and return")
 	}
 
-	// The single slot should hold the NEWEST packet (3), not the oldest (1).
-	select {
-	case pkt := <-ch:
-		if len(pkt) != 1 || pkt[0] != 3 {
-			t.Fatalf("drop-head should keep the freshest packet {3}, got %v", pkt)
+	for want := byte(1); want <= 3; want++ {
+		p := tq.pop()
+		if p == nil {
+			t.Fatalf("queue drained early, expected marker %d", want)
 		}
-	default:
-		t.Fatal("expected a packet in the channel")
+		b := p.bytes()
+		if b[len(b)-1] != want {
+			t.Fatalf("out of order: got marker %d, want %d", b[len(b)-1], want)
+		}
+		e.pool.put(p)
+	}
+	if p := tq.pop(); p != nil {
+		t.Fatal("scheduler returned more packets than were read")
+	}
+}
+
+// TestQueueOverflowTailDrops verifies the hard cap sheds the newest bulk packet
+// rather than growing without bound.
+func TestQueueOverflowTailDrops(t *testing.T) {
+	e := &Engine{pktLen: 1500}
+	e.pool = newBufPool(e.pktLen)
+	tq := newTxQueue(16, 1380, e.pool, &e.qstats)
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		p := e.pool.get()
+		pkt := bulkPacket(200, byte(i))
+		p.n = copy(p.b, pkt)
+		tq.push(p)
+	}
+	if got := e.qstats.dropped.Load(); got == 0 {
+		t.Fatal("expected overflow drops once the ring filled")
+	}
+	queued := 0
+	for tq.pop() != nil {
+		queued++
+	}
+	if queued > 16 {
+		t.Fatalf("ring held %d packets, capacity is 16", queued)
 	}
 }

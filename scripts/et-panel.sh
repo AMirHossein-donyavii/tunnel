@@ -466,8 +466,10 @@ write_config() {
         echo "health_port = $health"
         echo "profile = \"$profile\""
         echo "log_level = \"info\""
-        echo "heartbeat_interval = 10"
-        echo "heartbeat_timeout = 25"
+        # heartbeat_interval / heartbeat_timeout are deliberately NOT written:
+        # pinning them here froze every generated config at the old 10s/25s and
+        # stopped tuned core defaults (now 3s/12s) from reaching new tunnels.
+        # Add them by hand only to override the core.
         if [ "$engine" = "tun" ]; then
             echo "tun_mode = \"$tun_mode\""
             echo "tun_iface = \"$iface\""

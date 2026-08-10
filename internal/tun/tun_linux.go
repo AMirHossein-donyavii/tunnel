@@ -14,11 +14,11 @@ import (
 
 // Linux TUN flags (from <linux/if_tun.h>).
 const (
-	iffTUN         = 0x0001
-	iffNoPI        = 0x1000
-	iffMultiQueue  = 0x0100
-	ifnamsiz       = 16
-	ifreqSize      = 40 // sizeof(struct ifreq)
+	iffTUN        = 0x0001
+	iffNoPI       = 0x1000
+	iffMultiQueue = 0x0100
+	ifnamsiz      = 16
+	ifreqSize     = 40 // sizeof(struct ifreq)
 )
 
 // Open creates (or attaches to) a multi-queue TUN device and configures its
@@ -43,7 +43,7 @@ func Open(cfg Config) (*Device, error) {
 		d.queues = append(d.queues, f)
 	}
 
-	if err := configure(d.name, cfg.Address, cfg.Address6, cfg.MTU); err != nil {
+	if err := configure(d.name, cfg.Address, cfg.Address6, cfg.MTU, cfg.Queues); err != nil {
 		_ = d.Close()
 		return nil, err
 	}
@@ -81,12 +81,19 @@ func createQueue(name string, flags uint16) (*os.File, string, error) {
 	return os.NewFile(uintptr(fd), "/dev/net/tun"), real, nil
 }
 
+// txQueueLen is the TUN device's kernel queue depth. The default (500 packets,
+// ~700 KB) is another place a backlog can build where the tunnel's own
+// scheduler cannot see it; a short queue pushes back on the kernel instead and
+// leaves the queueing decisions to fq_codel and the engine.
+const txQueueLen = 256
+
 // configure assigns the address/MTU and brings the link up using iproute2.
 // (Shelling out to `ip` avoids a netlink dependency and matches how the
 // reference tools configure their interfaces.)
-func configure(name, address, address6 string, mtu int) error {
+func configure(name, address, address6 string, mtu, queues int) error {
 	steps := [][]string{
 		{"ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu)},
+		{"ip", "link", "set", "dev", name, "txqueuelen", fmt.Sprintf("%d", txQueueLen)},
 		{"ip", "addr", "add", address, "dev", name},
 	}
 	if address6 != "" {
@@ -101,10 +108,72 @@ func configure(name, address, address6 string, mtu int) error {
 			if isAddrAdd(s) && bytes.Contains(out, []byte("File exists")) {
 				continue
 			}
+			// txqueuelen is a tuning nicety, not a requirement.
+			if isTxQueueLen(s) {
+				continue
+			}
 			return fmt.Errorf("tun: %v: %w: %s", s, err, bytes.TrimSpace(out))
 		}
 	}
+	applyQdisc(name, queues)
 	return nil
+}
+
+// applyQdisc puts fq_codel on the TUN device. The kernel's default pfifo_fast
+// is a plain FIFO: one bulk transfer fills it and every other flow queues
+// behind that backlog. fq_codel hashes flows into separate queues and applies
+// CoDel to each, so a download cannot add delay to an interactive session
+// sharing the tunnel. This complements the engine's own scheduler — fq_codel
+// gives per-flow fairness on the way into the TUN device, the engine gives
+// priority and AQM on the way out to the carrier.
+//
+// A multi-queue TUN device gets an `mq` root with one child qdisc per queue, so
+// the children are replaced individually: that keeps the kernel's queue
+// parallelism (and the queue-to-link affinity the engine relies on) while still
+// adding AQM. Replacing the root instead would collapse every queue onto one
+// qdisc. Single-queue devices have no mq root, so they take the root path.
+//
+// Best-effort throughout: `tc` may be absent and some kernels are built without
+// sch_fq_codel, in which case the tunnel simply runs with the default qdisc.
+func applyQdisc(name string, queues int) {
+	if queues > 1 {
+		ok := true
+		for i := 1; i <= queues; i++ {
+			if !tcReplace(name, fmt.Sprintf(":%d", i)) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+	}
+	tcReplace(name, "root")
+}
+
+// tcReplace installs the best available AQM qdisc at the given parent.
+func tcReplace(name, parent string) bool {
+	args := []string{"qdisc", "replace", "dev", name}
+	if parent == "root" {
+		args = append(args, "root")
+	} else {
+		args = append(args, "parent", parent)
+	}
+	for _, kind := range []string{"fq_codel", "fq"} {
+		if exec.Command("tc", append(args, kind)...).Run() == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isTxQueueLen(s []string) bool {
+	for _, a := range s {
+		if a == "txqueuelen" {
+			return true
+		}
+	}
+	return false
 }
 
 func isAddrAdd(s []string) bool {

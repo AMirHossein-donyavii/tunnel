@@ -13,7 +13,29 @@ type Options struct {
 	UserTimeout time.Duration // TCP_USER_TIMEOUT: drop link if unacked this long
 	Keepalive   time.Duration // TCP keepalive idle/interval
 	BBR         bool          // request BBR congestion control
+	// NotSentLowat bounds the bytes the kernel will hold in the socket send
+	// queue that have not yet been put on the wire (TCP_NOTSENT_LOWAT).
+	NotSentLowat int
 }
+
+// notSentLowat is the ceiling on un-transmitted bytes sitting in the kernel's
+// send queue.
+//
+// This is the other half of the anti-bufferbloat story. Leaving SO_SNDBUF to
+// kernel autotuning (see LinkOptions) stops us from *pinning* a huge buffer,
+// but autotuning still grows the send queue to a full bandwidth-delay product,
+// and on a congested path the kernel will happily accept that much application
+// data and dribble it out. Anything already handed to the kernel is beyond the
+// reach of the tunnel's own priority scheduler, so an interactive packet
+// classified as express still ends up behind however many megabytes of bulk
+// data the kernel accepted a moment earlier.
+//
+// TCP_NOTSENT_LOWAT keeps the socket unwritable until the unsent backlog falls
+// below this mark, so the queue lives in the tunnel's scheduler — where CoDel
+// can measure its delay and the express class can jump it — instead of in the
+// kernel where nothing can. 128 KiB is comfortably more than is needed to keep
+// the NIC busy at any rate this tunnel runs at, so throughput is unaffected.
+const notSentLowat = 128 << 10
 
 // LinkOptions builds recommended options for a TUNNEL LINK (the TCP carrier
 // used by the mux engine and the L3 tcp carrier). Datagram carriers size their
@@ -34,13 +56,19 @@ func LinkOptions(profile string, sndOverride, rcvOverride int) Options {
 	o := Options{
 		SndBuf:      sndOverride, // 0 => kernel autotune; only an explicit override pins it
 		RcvBuf:      rcv,
-		UserTimeout: 20 * time.Second,
-		Keepalive:   15 * time.Second,
+		UserTimeout: 12 * time.Second,
+		Keepalive:   10 * time.Second,
 		BBR:         true,
+		// Not applied when the operator pins SO_SNDBUF: they have asked for a
+		// specific send queue and the two knobs would fight.
+		NotSentLowat: notSentLowat,
+	}
+	if sndOverride > 0 {
+		o.NotSentLowat = 0
 	}
 	if profile == "resource" {
 		// Fewer wakeups on tiny VPS.
-		o.Keepalive = 30 * time.Second
+		o.Keepalive = 20 * time.Second
 	}
 	return o
 }

@@ -23,11 +23,27 @@ Every tunnel link is a TCP connection wrapped with:
    (fresh keys per connection → forward secrecy; **no pre-shared key**). Session
    keys are HKDF-derived per direction from the ECDH shared secret. The exchange
    is unauthenticated — firewall the tunnel port to the peer's IP.
-2. **AEAD framing**: ChaCha20-Poly1305 or AES-256-GCM, ≤16 KiB frames, monotonic
-   nonces, per-direction keys.
-3. **Socket tuning** (`internal/nettune`): `TCP_NODELAY`, `TCP_QUICKACK`,
-   `SO_SNDBUF`/`SO_RCVBUF` (profile-sized), `TCP_USER_TIMEOUT`, keepalive, and
-   BBR congestion control (best-effort).
+2. **AEAD framing**: ChaCha20-Poly1305 or AES-256-GCM, monotonic nonces,
+   per-direction keys. A frame is `[uint16 len][ciphertext||tag]` and reaches the
+   wire in **one write syscall** — the length prefix is sealed into the same
+   buffer, never written separately (with `TCP_NODELAY` on, a separate 2-byte
+   write puts a 2-byte segment in front of every frame). Frames carry up to
+   63 KiB, so a full L3 packet batch or a coalesced mux write is one frame, one
+   seal and one syscall instead of four. On the read side a frame is decrypted in
+   place and undelivered bytes are handed out as a slice of that buffer, so no
+   plaintext is ever copied twice.
+3. **Socket tuning** (`internal/nettune`): `TCP_NODELAY`, profile-sized
+   `SO_RCVBUF` (`SO_SNDBUF` is left to kernel autotuning on purpose),
+   **`TCP_NOTSENT_LOWAT`**, `TCP_USER_TIMEOUT`, keepalive, and BBR congestion
+   control (best-effort).
+
+   `TCP_NOTSENT_LOWAT` is the load-bearing one for latency. Without it the kernel
+   grows the send queue to a full bandwidth-delay product and will happily accept
+   megabytes of application data on a congested path. Anything already handed to
+   the kernel is out of reach of the tunnel's scheduler, so a packet classified
+   as latency-critical still ends up behind whatever bulk data the kernel took a
+   moment earlier. Capping the un-transmitted backlog at 128 KiB keeps the queue
+   where the tunnel can still reorder and manage it.
 
 ---
 
@@ -114,18 +130,74 @@ IPs with **any** IP protocol — TCP, UDP, ICMP (ping), and IPv6 ICMP.
 - **Multi-queue** TUN: `pool` queues, each paired 1:1 with an encrypted link.
   The kernel hashes each flow to a fixed queue, so per-flow ordering is preserved
   while load spreads across CPU cores.
-- **Batching:** the TX path coalesces packets into ≤16 KiB AEAD frames to cut
-  syscalls and CPU; a 2 ms flush bounds latency at low rates.
-- **Zero-copy-ish:** one persistent reader per queue with a `sync.Pool` of packet
-  buffers; steady-state allocation is minimal.
-- **Heartbeat + auto-reconnect** per link; a clear "Tunnel connected
-  successfully: Iran 10.10.10.1 <-> Foreign 10.10.10.2" line is logged once the
-  first link is up.
+- **Priority + AQM scheduler** (`internal/l3/sched.go`) on every queue — see
+  below. This is what keeps ping flat while a download runs.
+- **Batching:** the TX path coalesces packets into ≤60 KiB AEAD frames (one
+  frame, one syscall). Batching is *opportunistic*, not timer-driven: packets
+  accumulate while the queue has more to give and the batch is flushed the
+  instant it runs dry. A single packet on an idle tunnel therefore goes out
+  immediately, while a saturated tunnel fills whole frames — no fixed flush timer
+  taxing every packet.
+- **Zero-allocation data path:** one persistent reader per queue reads straight
+  into a pooled buffer that is handed to the scheduler and recycled after
+  framing. The packet-carrier demultiplexers (UDP/ICMP/SPF) pool their buffers
+  too. Steady-state allocation on the hot path is zero.
+- **Liveness + RTT:** control frames measure the *link's* real round trip (shown
+  as `rtt_ms` on `/stats`) and detect a dead link within ~12 s. Comparing
+  `rtt_ms` against a ping through the tunnel tells you immediately whether extra
+  latency is the path or queueing.
+- **Auto-reconnect** per link, with sub-second first retries; a clear "Tunnel
+  connected successfully: Iran 10.10.10.1 <-> Foreign 10.10.10.2" line is logged
+  once the first link is up. Whatever is still queued when a link dies is
+  discarded rather than delivered late after the reconnect.
 - **Validation:** `tun_ip` must be a valid IPv4 CIDR; `peer_tun_ip` must be a
   valid IP inside the same subnet and different from `tun_ip`; optional `tun_ip6`
   must be a valid IPv6 CIDR.
 
 Requires `CAP_NET_ADMIN` (granted by the systemd unit) to create the device.
+
+### The transmit scheduler — why ping stays flat
+
+The TUN transmit path is where the tunnel queues: the kernel supplies packets at
+local NIC speed while the carrier drains them at whatever the intercontinental
+path allows. A plain FIFO makes that gap hurt — a 256-packet queue is ~350 KB of
+backlog, and on a 20 Mbit path that is ~140 ms of delay added to *every* packet,
+interactive or not. That is the mechanism behind a ping that sits at 97 ms and
+then jumps to 400 ms whenever a transfer starts.
+
+Each queue therefore runs two mechanisms instead of a FIFO:
+
+**Two service classes.** Latency-critical packets go to an express ring that is
+always drained first, so they never wait behind a bulk backlog:
+
+| Class | Traffic |
+|-------|---------|
+| express | ICMP/ICMPv6, TCP with no payload (pure ACK, SYN, RST), UDP ≤ 192 B (DNS, QUIC ACKs, VoIP, game traffic, WireGuard handshakes), any packet ≤ 128 B |
+| bulk | everything else |
+
+The split is deliberately conservative about reordering, because packets in
+different classes can overtake each other and TCP reads reordering as loss.
+Only traffic where overtaking is provably harmless is expedited: ICMP and UDP
+have no ordering contract, and a TCP segment with no payload carries nothing a
+later segment could arrive before. A **FIN is explicitly never expedited** — it
+consumes sequence space, and delivering it ahead of queued data would truncate
+the stream. Expediting pure ACKs is not only safe but actively raises throughput:
+it keeps the inner connection's ACK clock steady, which is what lets it reach
+full rate.
+
+**CoDel AQM** (RFC 8289) on the bulk ring. Rather than letting the backlog grow
+until the queue is full, CoDel measures how long packets actually sit in the
+queue and starts dropping once the *sojourn time* stays above 5 ms for a full
+100 ms interval. Inner TCP reads those drops as the congestion signal it is
+waiting for and settles at a rate that keeps the queue short — full throughput,
+no standing delay. A non-zero, steady `tx_dropped` on `/stats` under load is the
+controller working, not a fault.
+
+The same idea is applied at the two other places a queue can hide: the TUN
+device gets `fq_codel` and a short `txqueuelen` (per-flow fairness on the way in,
+so one download cannot delay an interactive session), and the carrier socket gets
+`TCP_NOTSENT_LOWAT` (so the kernel cannot hoard what the scheduler should be
+managing).
 
 ### TUN carrier modes (`tun_mode`)
 
@@ -141,9 +213,14 @@ TUN traffic is identical in all modes; only the envelope changes.
 
 - **Datagram carriers** (`udp`/`icmp`/`bip`) use a connectionless AEAD: each
   packet carries its own counter, so loss/reordering is tolerated (fine for a
-  TUN, whose inner IP traffic already retransmits). The handshake retransmits
-  until the peer replies. One carrier datagram holds one full inner packet (the
-  batcher caps a frame at ~1400 B so it fits under a 1500-byte path MTU).
+  TUN, whose inner IP traffic already retransmits). A 1024-counter sliding
+  **anti-replay window** rejects duplicated and replayed datagrams while still
+  accepting the reordering a real path produces. A datagram that fails to
+  authenticate is *skipped*, never fatal — on an open UDP/ICMP port anyone can
+  inject a packet, and tearing the tunnel down for each one would be a free
+  denial of service. The handshake retransmits until the peer replies. One
+  carrier datagram holds one full inner packet (the batcher caps a frame at
+  ~1400 B so it fits under a 1500-byte path MTU).
 - **ICMP/BIP** send Echo Requests from the dialer and Echo Replies from the
   listener, demultiplexed by (source IP, ICMP id). On the **listener** set
   `sysctl -w net.ipv4.icmp_echo_ignore_all=1` (or the icmpv6 equivalent) so the

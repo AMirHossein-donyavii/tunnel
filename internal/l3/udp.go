@@ -101,10 +101,10 @@ func (l *udpLinkListener) route() {
 		f := l.flows[key]
 		l.mu.Unlock()
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
 		if f == nil {
-			f = &udpFlow{pc: l.pc, src: src, key: key, l: l, in: make(chan []byte, 256), firstMsg: pkt, closed: make(chan struct{})}
+			// One stable copy per flow for the handshake; not on the hot path.
+			first := append([]byte(nil), buf[:n]...)
+			f = &udpFlow{pc: l.pc, src: src, key: key, l: l, in: make(chan *[]byte, flowDepth), firstMsg: first, closed: make(chan struct{})}
 			l.mu.Lock()
 			l.flows[key] = f
 			l.mu.Unlock()
@@ -113,12 +113,15 @@ func (l *udpLinkListener) route() {
 			default: // accept backlog full: drop the new flow
 				l.remove(key)
 			}
-		} else {
-			select {
-			case f.in <- pkt:
-			case <-f.closed:
-			default: // flow buffer full: drop (inner IP retransmits)
-			}
+			continue
+		}
+		bp := getDgram(buf[:n])
+		select {
+		case f.in <- bp:
+		case <-f.closed:
+			putDgram(bp)
+		default: // flow buffer full: drop (inner IP retransmits)
+			putDgram(bp)
 		}
 	}
 }
@@ -160,7 +163,7 @@ type udpFlow struct {
 	src      *net.UDPAddr
 	key      string
 	l        *udpLinkListener
-	in       chan []byte
+	in       chan *[]byte
 	firstMsg []byte
 
 	dg deadlineGate
@@ -170,11 +173,13 @@ type udpFlow struct {
 }
 
 func (f *udpFlow) Read(b []byte) (int, error) {
-	pkt, err := f.dg.wait(f.in, f.closed)
+	bp, err := f.dg.wait(f.in, f.closed)
 	if err != nil {
 		return 0, err
 	}
-	return copy(b, pkt), nil
+	n := copy(b, *bp)
+	putDgram(bp)
+	return n, nil
 }
 
 func (f *udpFlow) Write(b []byte) (int, error) { return f.pc.WriteToUDP(b, f.src) }

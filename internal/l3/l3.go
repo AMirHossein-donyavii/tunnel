@@ -1,15 +1,19 @@
 // Package l3 implements the L3 TUN tunnel engine: it moves raw IP packets
 // between a local multi-queue TUN device and the peer over N authenticated,
-// encrypted TCP links (one per queue).
+// encrypted links (one per queue).
 //
-// Design (pengutunnel-style):
+// Design:
 //   - N = pool queues/links. The kernel distributes flows across TUN queues
 //     (per-flow, so ordering is preserved); each queue is paired 1:1 with a link.
-//   - One persistent reader per queue feeds a bounded channel, so links can come
-//     and go (reconnects) without leaking a blocked TUN read.
-//   - TX batches packets into as few AEAD frames as possible.
-//   - An application-level heartbeat detects dead links; the dialing side
-//     reconnects with backoff, the listening side frees the slot.
+//   - One persistent reader per queue feeds a scheduler (see sched.go), so links
+//     can come and go without leaking a blocked TUN read, and so a bulk transfer
+//     can never park an interactive packet behind its backlog.
+//   - TX drains the scheduler into as few AEAD frames and syscalls as possible.
+//     Batching is opportunistic rather than timer-driven: the batch is flushed
+//     the moment the queue runs dry, so a single packet on an idle tunnel is
+//     sent immediately while a saturated tunnel fills whole frames.
+//   - A control channel measures true link RTT and detects dead links; the
+//     dialing side reconnects with backoff, the listening side frees the slot.
 package l3
 
 import (
@@ -50,7 +54,7 @@ type Engine struct {
 	hbTimeout      time.Duration
 	nowSec         func() int64
 
-	pool sync.Pool // *[]byte packet buffers
+	pool *bufPool // recycled packet buffers
 
 	stats struct {
 		liveLinks  int64
@@ -59,7 +63,10 @@ type Engine struct {
 		txBytes    uint64
 		rxBytes    uint64
 		reconnects uint64
+		badFrames  uint64
+		rttNs      int64 // EWMA of the measured link RTT
 	}
+	qstats qstats
 }
 
 // safeDatagramMTU is the largest inner MTU that leaves room for the AEAD +
@@ -79,22 +86,21 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		cfg.MTU = safeDatagramMTU
 	}
 	e := &Engine{
-		cfg:         cfg,
-		log:         log,
-		cipher:      cfg.Cipher,
-		mode:        cfg.TunMode,
-		queues:      cfg.Pool,
-		isDialer:    cfg.IsDialer(),
+		cfg:      cfg,
+		log:      log,
+		cipher:   cfg.Cipher,
+		mode:     cfg.TunMode,
+		queues:   cfg.Pool,
+		isDialer: cfg.IsDialer(),
 		// A 64-packet batch fills the ~60 KiB TCP frame (fewer frames/syscalls).
-		// The per-queue channel is a STANDING QUEUE whose depth adds latency under
-		// load (latency ≈ depth / drain-rate; the 2 ms flush only bounds batch
-		// assembly, not this queue), so it is sized modestly by profile instead of
-		// a fixed 1024 — enough to absorb bursts without becoming a bufferbloat sink.
+		// The per-queue ring is only a burst absorber, not a standing queue —
+		// CoDel (sched.go) keeps its actual occupancy near 5 ms of drain time
+		// regardless of the configured depth.
 		batchSize:   orDefault(cfg.BatchSize, 64),
 		channelSize: orDefault(cfg.ChannelSize, channelDefault(cfg.Profile)),
 		pktLen:      cfg.MTU + 4,
-		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, 10)) * time.Second,
-		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, 25)) * time.Second,
+		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, defaultHeartbeatSec)) * time.Second,
+		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, defaultHeartbeatTimeoutSec)) * time.Second,
 		nowSec:      func() int64 { return time.Now().Unix() },
 	}
 	if cfg.IsSPF() {
@@ -112,7 +118,7 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 	if e.queues < 1 {
 		e.queues = 1
 	}
-	e.pool.New = func() any { b := make([]byte, e.pktLen); return &b }
+	e.pool = newBufPool(e.pktLen)
 	e.sndbuf, e.rcvbuf = nettune.BufSizes(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
 
 	if err := e.buildCarrier(cfg, log); err != nil {
@@ -210,14 +216,14 @@ func (e *Engine) Run(ctx context.Context) error {
 		defer firewall.Remove(e.cfg, e.log)
 	}
 
-	// One persistent reader per queue feeds a bounded channel. This survives
-	// link reconnects without leaking a blocked TUN read.
-	txChans := make([]chan []byte, e.queues)
+	// One persistent reader per queue feeds a priority + AQM scheduler. This
+	// survives link reconnects without leaking a blocked TUN read.
+	txQueues := make([]*txQueue, e.queues)
 	var readers sync.WaitGroup
 	for i := 0; i < e.queues; i++ {
-		txChans[i] = make(chan []byte, e.channelSize)
+		txQueues[i] = newTxQueue(e.channelSize, e.cfg.MTU, e.pool, &e.qstats)
 		readers.Add(1)
-		go func(i int) { defer readers.Done(); e.queueReader(ctx, dev.Queues()[i], txChans[i]) }(i)
+		go func(i int) { defer readers.Done(); e.queueReader(ctx, dev.Queues()[i], txQueues[i]) }(i)
 	}
 
 	var pumps sync.WaitGroup
@@ -225,11 +231,11 @@ func (e *Engine) Run(ctx context.Context) error {
 		for i := 0; i < e.queues; i++ {
 			i := i
 			pumps.Add(1)
-			go func() { defer pumps.Done(); e.clientQueue(ctx, dev.Queues()[i], txChans[i], i) }()
+			go func() { defer pumps.Done(); e.clientQueue(ctx, dev.Queues()[i], txQueues[i], i) }()
 		}
 	} else {
 		pumps.Add(1)
-		go func() { defer pumps.Done(); e.serverAccept(ctx, dev, txChans) }()
+		go func() { defer pumps.Done(); e.serverAccept(ctx, dev, txQueues) }()
 	}
 
 	<-ctx.Done()
@@ -281,40 +287,25 @@ func ipOnly(cidr string) string {
 }
 
 // queueReader is the single goroutine allowed to block on a TUN queue's Read.
-// It lives for the whole run; packets are dropped only if the channel is full
-// (i.e. the link is down), which is harmless for L3 (upper layers retransmit).
-func (e *Engine) queueReader(ctx context.Context, q queue, ch chan []byte) {
+// It lives for the whole run and hands each packet to the scheduler in the
+// pooled buffer it was read into — no per-packet allocation and no copy.
+// Admission control, classification and drops are the scheduler's job.
+func (e *Engine) queueReader(ctx context.Context, q queue, tq *txQueue) {
 	for {
-		bp := e.pool.Get().(*[]byte)
-		n, err := q.Read((*bp)[:e.pktLen])
+		p := e.pool.get()
+		n, err := q.Read(p.b[:e.pktLen])
 		if err != nil {
-			e.pool.Put(bp)
+			e.pool.put(p)
 			return // device closed
 		}
-		// Copy into a right-sized slice we hand off; recycle the read buffer.
-		pkt := make([]byte, n)
-		copy(pkt, (*bp)[:n])
-		e.pool.Put(bp)
-		select {
-		case ch <- pkt:
-		case <-ctx.Done():
+		if n <= 0 {
+			e.pool.put(p)
+			continue
+		}
+		p.n = n
+		tq.push(p)
+		if ctx.Err() != nil {
 			return
-		default:
-			// Queue full (link down / consumer slow). Drop the OLDEST packet and
-			// enqueue the newest so the far end gets the freshest data — stale
-			// buffered packets only add latency. Safe: this channel has exactly
-			// one producer (here) and one consumer (tunToLink).
-			select {
-			case <-ch: // evict head
-			default:
-			}
-			select {
-			case ch <- pkt:
-			case <-ctx.Done():
-				return
-			default:
-				// Consumer drained it in between; dropping the newest is fine.
-			}
 		}
 	}
 }
@@ -330,15 +321,15 @@ func (e *Engine) engineLabel() string {
 // clientQueue keeps a link dialed for its queue and pumps, reconnecting on loss
 // with exponential backoff. It counts consecutive failed attempts for the log so
 // a persistent problem is visible without spamming a line per packet.
-func (e *Engine) clientQueue(ctx context.Context, q queue, ch <-chan []byte, id int) {
-	backoff := time.Second
+func (e *Engine) clientQueue(ctx context.Context, q queue, tq *txQueue, id int) {
+	backoff := 250 * time.Millisecond
 	attempt := 0
 	for ctx.Err() == nil {
 		lk, err := e.ldialer.DialLink(ctx)
 		if err != nil {
 			attempt++
 			e.log.Warn("%s queue %d: reconnect attempt %d failed: %v (retrying in %s)",
-				e.engineLabel(), id, attempt, err, backoff.Round(time.Second))
+				e.engineLabel(), id, attempt, err, backoff.Round(time.Millisecond))
 			if !sleepCtx(ctx, &backoff) {
 				return
 			}
@@ -348,14 +339,14 @@ func (e *Engine) clientQueue(ctx context.Context, q queue, ch <-chan []byte, id 
 			e.log.Info("%s queue %d: reconnected after %d attempt(s)", e.engineLabel(), id, attempt)
 		}
 		attempt = 0
-		backoff = time.Second
-		e.pump(ctx, q, ch, lk, id)
+		backoff = 250 * time.Millisecond
+		e.pump(ctx, q, tq, lk, id)
 		atomic.AddUint64(&e.stats.reconnects, 1)
 	}
 }
 
 // serverAccept assigns each inbound link to a free queue slot and pumps it.
-func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txChans []chan []byte) {
+func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txQueues []*txQueue) {
 	free := make(chan int, e.queues)
 	for i := 0; i < e.queues; i++ {
 		free <- i
@@ -391,15 +382,38 @@ func (e *Engine) serverAccept(ctx context.Context, dev *tun.Device, txChans []ch
 		go func(slot int, lk link) {
 			defer wg.Done()
 			defer func() { free <- slot }()
-			e.pump(ctx, dev.Queues()[slot], txChans[slot], lk, slot)
+			e.pump(ctx, dev.Queues()[slot], txQueues[slot], lk, slot)
 		}(slot, lk)
 	}
 	wg.Wait()
 }
 
+// pumpState is the state one link's reader and writer share: liveness, the
+// measured RTT and the control messages the reader needs the writer to send
+// (the writer owns the link's send side exclusively, so the reader may never
+// write to it directly).
+type pumpState struct {
+	lastRecv atomic.Int64 // UnixNano of the last frame received
+	ctlOut   chan ctlMsg
+}
+
+type ctlMsg struct {
+	op byte
+	ts uint64
+}
+
+// enqueueCtl hands a control message to the writer, dropping it if the writer
+// is already backed up — a lost pong just means one skipped RTT sample.
+func (p *pumpState) enqueueCtl(op byte, ts uint64) {
+	select {
+	case p.ctlOut <- ctlMsg{op: op, ts: ts}:
+	default:
+	}
+}
+
 // pump bridges one TUN queue with one link until either side fails or the
 // heartbeat times out.
-func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, lk link, id int) {
+func (e *Engine) pump(ctx context.Context, q queue, tq *txQueue, lk link, id int) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer lk.Close()
@@ -411,8 +425,8 @@ func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, lk link, i
 	stopClose := context.AfterFunc(ctx, func() { _ = lk.Close() })
 	defer stopClose()
 
-	var lastRecv atomic.Int64
-	lastRecv.Store(e.nowSec())
+	ps := &pumpState{ctlOut: make(chan ctlMsg, 8)}
+	ps.lastRecv.Store(time.Now().UnixNano())
 	if atomic.AddInt64(&e.stats.liveLinks, 1) == 1 {
 		e.logConnected(id)
 	}
@@ -421,80 +435,135 @@ func (e *Engine) pump(ctx context.Context, q queue, ch <-chan []byte, lk link, i
 			e.log.Warn("TUN tunnel disconnected — all links down, reconnecting…")
 		}
 	}()
+	// Whatever is still queued when the link dies is already stale by the time a
+	// replacement is up; delivering it would only produce a latency spike and a
+	// burst of out-of-window retransmits.
+	defer tq.drain()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); defer cancel(); e.tunToLink(ctx, ch, lk) }()
-	go func() { defer wg.Done(); defer cancel(); e.linkToTun(ctx, q, lk, &lastRecv) }()
-	e.heartbeatMonitor(ctx, cancel, &lastRecv, id) // blocks until ctx is done
+	go func() { defer wg.Done(); defer cancel(); e.tunToLink(ctx, tq, lk, ps) }()
+	go func() { defer wg.Done(); defer cancel(); e.linkToTun(ctx, q, lk, ps) }()
+	e.livenessMonitor(ctx, cancel, ps, id) // blocks until ctx is done
 	wg.Wait()
 }
 
-// tunToLink consumes packets from the queue channel, batches them (up to the
-// link's max frame), and writes to the link. It also emits periodic heartbeats.
-func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, lk link) {
+// tunToLink drains the scheduler into the link, packing as many packets as fit
+// into each frame.
+//
+// Batching is opportunistic: packets keep accumulating while the scheduler has
+// more to give, and the batch is flushed the instant it runs dry. That gives
+// full-size frames exactly when the tunnel is busy enough to need them, and
+// adds zero latency when it is not — unlike a fixed flush timer, which taxes
+// every packet on an idle tunnel with its full period.
+//
+// How much may accumulate is governed by frameBudget rather than the carrier's
+// hard maximum: a frame is indivisible on the wire, so its size is a floor on
+// how long an express packet can be stuck behind bulk traffic (see budget.go).
+func (e *Engine) tunToLink(ctx context.Context, tq *txQueue, lk link, ps *pumpState) {
 	maxFrame := lk.MaxFrame()
 	batch := make([]byte, 0, maxFrame)
 	pending := 0
+	budget := newFrameBudget(maxFrame)
 
 	hb := time.NewTicker(e.hbInterval)
 	defer hb.Stop()
-	const flushEvery = 2 * time.Millisecond
-	flush := time.NewTimer(flushEvery)
-	if !flush.Stop() {
-		<-flush.C
-	}
-	defer flush.Stop()
 
 	send := func() bool {
 		if len(batch) == 0 {
 			return true
 		}
+		n := len(batch)
+		start := time.Now()
 		if err := lk.WriteFrame(batch); err != nil {
 			return false
 		}
 		atomic.AddUint64(&e.stats.txPackets, uint64(pending))
-		atomic.AddUint64(&e.stats.txBytes, uint64(len(batch)))
+		atomic.AddUint64(&e.stats.txBytes, uint64(n))
+		// How long the write blocked is the tunnel's only direct measurement of
+		// what the carrier can actually absorb.
+		budget.add(n, time.Since(start))
 		batch = batch[:0]
 		pending = 0
 		return true
 	}
 
+	// room reports whether another payload of n bytes still fits this frame. A
+	// packet that would not fit the budget but does fit the carrier's frame is
+	// still allowed through on an empty batch, so the budget can never wedge a
+	// packet (see the oversize guard below for the genuinely-too-big case).
+	room := func(n int) bool {
+		limit := budget.size()
+		if len(batch) == 0 && limit < n+2 {
+			limit = maxFrame
+		}
+		return len(batch)+2+n <= limit
+	}
+
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case pkt := <-ch:
-			// Flush first if this packet would overflow the frame budget.
-			if len(batch) > 0 && len(batch)+2+len(pkt) > maxFrame {
-				if !send() {
-					return
-				}
+		}
+		// Control messages ride along with whatever is already batched, so an RTT
+		// probe is never delayed behind a queue drain. Checking the heartbeat here
+		// as well as in the idle select below matters: a saturated tunnel never
+		// reaches the idle select, and probes must keep flowing precisely when the
+		// tunnel is busy enough for its latency to be worth measuring.
+		select {
+		case c := <-ps.ctlOut:
+			if !room(ctlLen) && !send() {
+				return
 			}
-			batch = appendPacket(batch, pkt)
-			pending++
-			if pending == 1 {
-				flush.Reset(flushEvery)
+			batch = appendControl(batch, c.op, c.ts)
+		case <-hb.C:
+			if !room(ctlLen) && !send() {
+				return
 			}
-			if pending >= e.batchSize || len(batch) >= maxFrame-e.pktLen {
-				if !flush.Stop() {
-					select {
-					case <-flush.C:
-					default:
-					}
-				}
-				if !send() {
-					return
-				}
-			}
-		case <-flush.C:
+			batch = appendControl(batch, ctlPing, uint64(time.Now().UnixNano()))
+		default:
+		}
+
+		p := tq.pop()
+		if p == nil {
+			// Queue drained: flush now rather than holding bytes back.
 			if !send() {
 				return
 			}
-		case <-hb.C:
-			// Heartbeat goes in its own frame if the batch is empty; else it
-			// rides with the pending packets.
-			batch = appendHeartbeat(batch)
+			select {
+			case <-ctx.Done():
+				return
+			case <-tq.signal():
+			case c := <-ps.ctlOut:
+				batch = appendControl(batch, c.op, c.ts)
+				if !send() {
+					return
+				}
+			case <-hb.C:
+				batch = appendControl(batch, ctlPing, uint64(time.Now().UnixNano()))
+				if !send() {
+					return
+				}
+			}
+			continue
+		}
+
+		if p.n+2 > maxFrame {
+			// Larger than an empty frame can hold — only reachable if the MTU is
+			// configured above what the carrier can wrap. Shed it rather than
+			// letting WriteFrame fail and cycle an otherwise healthy link.
+			e.qstats.dropped.Add(1)
+			e.pool.put(p)
+			continue
+		}
+		if !room(p.n) && !send() {
+			e.pool.put(p)
+			return
+		}
+		batch = appendPacket(batch, p.bytes())
+		pending++
+		e.pool.put(p)
+
+		if pending >= e.batchSize || !room(e.pktLen) {
 			if !send() {
 				return
 			}
@@ -502,34 +571,37 @@ func (e *Engine) tunToLink(ctx context.Context, ch <-chan []byte, lk link) {
 	}
 }
 
-// linkToTun reads encrypted frames, splits each into its packets, and writes
-// them to the TUN queue.
-func (e *Engine) linkToTun(ctx context.Context, q queue, lk link, lastRecv *atomic.Int64) {
+// linkToTun reads frames, splits each into its packets, and writes them to the
+// TUN queue.
+func (e *Engine) linkToTun(ctx context.Context, q queue, lk link, ps *pumpState) {
 	stop := context.AfterFunc(ctx, func() { _ = lk.SetReadDeadline(time.Now()) })
 	defer stop()
 
-	buf := make([]byte, lk.MaxFrame()+64)
 	for {
-		n, err := lk.ReadFrame(buf)
+		frame, err := lk.ReadFrame()
 		if err != nil {
 			return
 		}
-		lastRecv.Store(e.nowSec())
-		// A frame is a sequence of [uint16 len][payload] datagrams; len 0 is a
-		// heartbeat (already counted by updating lastRecv above).
-		frame := buf[:n]
+		ps.lastRecv.Store(time.Now().UnixNano())
+		// A frame is a sequence of [uint16 len][payload] records; see datagram.go
+		// for how the length discriminates heartbeats, control messages and
+		// packets.
 		for len(frame) >= 2 {
 			plen := int(frame[0])<<8 | int(frame[1])
 			frame = frame[2:]
 			if plen == 0 {
-				continue // heartbeat marker
+				continue // legacy heartbeat: liveness already refreshed above
 			}
 			if plen > len(frame) {
 				break // truncated frame; drop remainder
 			}
-			pkt := frame[:plen]
+			payload := frame[:plen]
 			frame = frame[plen:]
-			if _, err := q.Write(pkt); err != nil {
+			if plen < minIPPacket {
+				e.handleControl(payload, ps)
+				continue
+			}
+			if _, err := q.Write(payload); err != nil {
 				return
 			}
 			atomic.AddUint64(&e.stats.rxPackets, 1)
@@ -538,19 +610,59 @@ func (e *Engine) linkToTun(ctx context.Context, q queue, lk link, lastRecv *atom
 	}
 }
 
-// heartbeatMonitor cancels the pump if no datagram arrives within hbTimeout.
-func (e *Engine) heartbeatMonitor(ctx context.Context, cancel context.CancelFunc, lastRecv *atomic.Int64, id int) {
-	t := time.NewTicker(e.hbInterval)
+// handleControl answers a peer's RTT probe and records our own round trip.
+func (e *Engine) handleControl(payload []byte, ps *pumpState) {
+	op, ts, ok := parseControl(payload)
+	if !ok {
+		atomic.AddUint64(&e.stats.badFrames, 1)
+		return
+	}
+	switch op {
+	case ctlPing:
+		ps.enqueueCtl(ctlPong, ts)
+	case ctlPong:
+		rtt := time.Now().UnixNano() - int64(ts)
+		if rtt <= 0 || rtt > int64(time.Minute) {
+			return // clock stepped or an absurdly stale echo
+		}
+		e.recordRTT(rtt)
+	}
+}
+
+// recordRTT folds a sample into an exponentially weighted moving average (1/8
+// weight, the same smoothing TCP uses for its SRTT).
+func (e *Engine) recordRTT(sample int64) {
+	for {
+		old := atomic.LoadInt64(&e.stats.rttNs)
+		next := sample
+		if old > 0 {
+			next = old + (sample-old)/8
+		}
+		if atomic.CompareAndSwapInt64(&e.stats.rttNs, old, next) {
+			return
+		}
+	}
+}
+
+// livenessMonitor cancels the pump if no frame arrives within hbTimeout. It
+// polls at a fraction of the timeout so detection is prompt without depending
+// on the heartbeat period.
+func (e *Engine) livenessMonitor(ctx context.Context, cancel context.CancelFunc, ps *pumpState, id int) {
+	tick := e.hbTimeout / 4
+	if tick < 250*time.Millisecond {
+		tick = 250 * time.Millisecond
+	}
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			age := time.Since(time.Unix(lastRecv.Load(), 0))
+			age := time.Duration(time.Now().UnixNano() - ps.lastRecv.Load())
 			if age > e.hbTimeout {
-				e.log.Warn("%s connection lost on queue %d: heartbeat timeout after %s of silence (limit %s) — cycling link",
-					e.engineLabel(), id, age.Round(time.Second), e.hbTimeout)
+				e.log.Warn("%s connection lost on queue %d: no traffic for %s (limit %s) — cycling link",
+					e.engineLabel(), id, age.Round(time.Millisecond), e.hbTimeout)
 				cancel()
 				return
 			}
@@ -566,6 +678,19 @@ type Stats struct {
 	TxBytes    uint64 `json:"tx_bytes"`
 	RxBytes    uint64 `json:"rx_bytes"`
 	Reconnects uint64 `json:"reconnects"`
+	// RTTMs is the smoothed round trip of the tunnel links themselves, measured
+	// with control frames. Compare it against a ping through the tunnel: a large
+	// gap means queueing, not path latency.
+	RTTMs float64 `json:"rtt_ms"`
+	// ExpressPackets / BulkPackets show how traffic splits across the two
+	// service classes; TxDropped counts AQM and overflow drops, which are the
+	// congestion signal that keeps queueing delay bounded (a small, steady
+	// number under load is healthy, not a fault).
+	ExpressPackets uint64 `json:"express_packets"`
+	BulkPackets    uint64 `json:"bulk_packets"`
+	TxDropped      uint64 `json:"tx_dropped"`
+	QueueDepth     int64  `json:"queue_depth"`
+	BadFrames      uint64 `json:"bad_frames"`
 }
 
 // Healthy reports whether at least one link of the tunnel is currently up. The
@@ -576,12 +701,18 @@ func (e *Engine) Healthy() bool { return atomic.LoadInt64(&e.stats.liveLinks) > 
 // interface used by the health endpoint).
 func (e *Engine) Snapshot() any {
 	return Stats{
-		LiveLinks:  atomic.LoadInt64(&e.stats.liveLinks),
-		TxPackets:  atomic.LoadUint64(&e.stats.txPackets),
-		RxPackets:  atomic.LoadUint64(&e.stats.rxPackets),
-		TxBytes:    atomic.LoadUint64(&e.stats.txBytes),
-		RxBytes:    atomic.LoadUint64(&e.stats.rxBytes),
-		Reconnects: atomic.LoadUint64(&e.stats.reconnects),
+		LiveLinks:      atomic.LoadInt64(&e.stats.liveLinks),
+		TxPackets:      atomic.LoadUint64(&e.stats.txPackets),
+		RxPackets:      atomic.LoadUint64(&e.stats.rxPackets),
+		TxBytes:        atomic.LoadUint64(&e.stats.txBytes),
+		RxBytes:        atomic.LoadUint64(&e.stats.rxBytes),
+		Reconnects:     atomic.LoadUint64(&e.stats.reconnects),
+		RTTMs:          float64(atomic.LoadInt64(&e.stats.rttNs)) / float64(time.Millisecond),
+		ExpressPackets: e.qstats.expressPkts.Load(),
+		BulkPackets:    e.qstats.bulkPkts.Load(),
+		TxDropped:      e.qstats.dropped.Load(),
+		QueueDepth:     e.qstats.depth.Load(),
+		BadFrames:      atomic.LoadUint64(&e.stats.badFrames) + badDatagrams.Load(),
 	}
 }
 
@@ -607,10 +738,18 @@ func datagramCarrier(cfg *config.Config) bool {
 	return cfg.TunMode != "" && cfg.TunMode != config.TunModeTCP
 }
 
-// channelDefault sizes the per-queue TX channel by profile. Shallow queues keep
-// latency low (they are a standing queue when the carrier is the bottleneck);
-// they are deep enough to absorb short bursts, and a full queue is just an early
-// congestion signal the inner protocol already handles.
+// Liveness defaults. Probes are cheap — they ride inside whatever frame is
+// already being written — so they are frequent enough to cycle a dead link in
+// well under the old 25 s, which is the difference between a blip and a
+// noticeable outage on a flaky intercontinental path.
+const (
+	defaultHeartbeatSec        = 3
+	defaultHeartbeatTimeoutSec = 12
+)
+
+// channelDefault sizes the per-queue TX ring by profile. The ring only has to
+// absorb bursts: CoDel keeps the *occupied* depth near 5 ms of drain time
+// whatever the capacity is, so a deeper ring costs memory, not latency.
 func channelDefault(profile string) int {
 	switch profile {
 	case config.ProfileFast:
@@ -622,6 +761,10 @@ func channelDefault(profile string) int {
 	}
 }
 
+// maxDialBackoff caps the reconnect backoff. Failover matters more than saving
+// a dial, so the ceiling is low and the first retries are sub-second.
+const maxDialBackoff = 5 * time.Second
+
 func sleepCtx(ctx context.Context, b *time.Duration) bool {
 	t := time.NewTimer(*b)
 	defer t.Stop()
@@ -629,8 +772,10 @@ func sleepCtx(ctx context.Context, b *time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	case <-t.C:
-		if *b < 15*time.Second {
-			*b *= 2
+		if *b < maxDialBackoff {
+			if *b *= 2; *b > maxDialBackoff {
+				*b = maxDialBackoff
+			}
 		}
 		return true
 	}

@@ -1,19 +1,33 @@
 package l3
 
 import (
-	"bufio"
 	"encoding/binary"
-	"fmt"
-	"io"
 )
 
-// Datagram wire format over the encrypted byte-stream link:
+// Frame payload format (one frame = one AEAD frame on a stream carrier, one
+// datagram on a packet carrier):
 //
-//	[uint16 len][len bytes payload]
+//	[uint16 len][len bytes payload] ...
 //
-// A len of 0 is a heartbeat (no payload). Multiple datagrams may be written in
-// one call so the AEAD layer coalesces them into as few frames as possible.
-const maxPacket = 65535
+// The length discriminates payload kinds, because no valid IP packet is shorter
+// than an IPv4 header:
+//
+//	len == 0            legacy heartbeat (kept so a peer that only sends these
+//	                    still refreshes our liveness timer)
+//	0 < len < 20        control message: [opcode][operand...]
+//	len >= 20           an inner IP packet, written straight to the TUN queue
+//
+// Batching many packets into one frame is what keeps the syscall and AEAD tag
+// cost per packet low at high packet rates.
+
+// Control opcodes.
+const (
+	ctlPing = 0x01 // [op][uint64 sender timestamp ns]
+	ctlPong = 0x02 // [op][uint64 echoed timestamp ns]
+)
+
+// ctlLen is the wire length of a ping/pong control message.
+const ctlLen = 1 + 8
 
 // appendPacket appends one length-prefixed packet to dst.
 func appendPacket(dst, pkt []byte) []byte {
@@ -23,29 +37,24 @@ func appendPacket(dst, pkt []byte) []byte {
 	return append(dst, pkt...)
 }
 
-// appendHeartbeat appends a zero-length datagram.
-func appendHeartbeat(dst []byte) []byte {
-	return append(dst, 0, 0)
+// appendControl appends a ping/pong control message carrying ts.
+func appendControl(dst []byte, op byte, ts uint64) []byte {
+	var h [2 + ctlLen]byte
+	binary.BigEndian.PutUint16(h[0:2], ctlLen)
+	h[2] = op
+	binary.BigEndian.PutUint64(h[3:], ts)
+	return append(dst, h[:]...)
 }
 
-// readDatagram reads one datagram into buf. It returns the payload length
-// (0 for a heartbeat) and whether it was a heartbeat.
-func readDatagram(r *bufio.Reader, buf []byte) (n int, heartbeat bool, err error) {
-	var h [2]byte
-	if _, err = io.ReadFull(r, h[:]); err != nil {
-		return 0, false, err
+// parseControl decodes a control payload, returning the opcode and timestamp.
+func parseControl(p []byte) (op byte, ts uint64, ok bool) {
+	if len(p) != ctlLen {
+		return 0, 0, false
 	}
-	l := int(binary.BigEndian.Uint16(h[:]))
-	if l == 0 {
-		return 0, true, nil
+	switch p[0] {
+	case ctlPing, ctlPong:
+		return p[0], binary.BigEndian.Uint64(p[1:]), true
+	default:
+		return 0, 0, false
 	}
-	if l > len(buf) {
-		// Protocol violation or missized buffer: drain and report.
-		_, _ = io.CopyN(io.Discard, r, int64(l))
-		return 0, false, fmt.Errorf("datagram too large: %d", l)
-	}
-	if _, err = io.ReadFull(r, buf[:l]); err != nil {
-		return 0, false, err
-	}
-	return l, false, nil
 }

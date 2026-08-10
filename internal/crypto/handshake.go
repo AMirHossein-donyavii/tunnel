@@ -27,8 +27,14 @@ import (
 // tunnel port to the peer's IP with a firewall (see docs). This matches the
 // project's primary threat model (defeat passive DPI / censorship).
 const (
-	magic       = 0x45540202 // "ET" protocol v2.2 (ephemeral ECDH)
-	protoVer    = 2
+	// magic/protoVer identify the wire protocol. v3 changed the framing: a frame
+	// is written with a single syscall, frames may carry up to MaxPlaintext
+	// bytes, and the L3 engine maps one packet batch onto one AEAD frame instead
+	// of adding a second length header. A v2 peer therefore cannot talk to a v3
+	// peer — both servers must run the same core version. The mismatch surfaces
+	// here as a clean handshake rejection rather than as corrupt data later.
+	magic       = 0x45540203 // "ET" protocol v3 (ephemeral ECDH, single-syscall framing)
+	protoVer    = 3
 	pubLen      = 32
 	handshakeTO = 10 * time.Second
 )

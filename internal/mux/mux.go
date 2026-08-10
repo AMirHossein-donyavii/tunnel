@@ -70,10 +70,10 @@ type Session struct {
 	writeHi   chan outFrame
 	writeNorm chan outFrame
 
-	pingMu   sync.Mutex
-	pings    map[uint32]chan struct{}
-	pingSeq  uint32
-	lastRTT  int64 // nanoseconds, atomic
+	pingMu  sync.Mutex
+	pings   map[uint32]chan struct{}
+	pingSeq uint32
+	lastRTT int64 // nanoseconds, atomic
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -280,14 +280,14 @@ func (s *Session) getStream(id uint32) *Stream {
 // single Write. This yields adaptive batching for free: light load writes one
 // frame (low latency), heavy load packs many frames per syscall (throughput).
 func (s *Session) sendLoop() {
-	scratch := make([]byte, 0, 64*1024)
+	scratch := make([]byte, 0, writeBatch+maxFrame)
 	for {
 		f, ok := s.takeBlocking()
 		if !ok {
 			return
 		}
 		scratch = appendFrame(scratch[:0], f)
-		for len(scratch) < 60*1024 {
+		for len(scratch) < writeBatch {
 			f2, ok := s.takeNonBlocking()
 			if !ok {
 				break

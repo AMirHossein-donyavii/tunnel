@@ -19,13 +19,14 @@ import (
 	"github.com/emergency-tunnel/et/internal/l3"
 	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/muxeng"
+	"github.com/emergency-tunnel/et/internal/nettune"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
 )
 
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "1.10.1"
+var CoreVersion = "1.11.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -49,6 +50,13 @@ func Run(path string) error {
 	log.Info("emergency-tunnel core %s starting tunnel %q", CoreVersion, cfg.Name)
 	log.Info("resources: workers=%d gomaxprocs=%d effective_cpus=%d profile=%s",
 		workers, runtime.GOMAXPROCS(0), sysinfo.EffectiveCPUs(), cfg.Profile)
+
+	// Host-wide network settings the tunnel cannot set per-socket. Surfacing them
+	// once at startup turns "the tunnel feels slow" into a concrete, fixable
+	// action instead of a guess.
+	for _, tip := range nettune.Advise() {
+		log.Warn("host tuning: %s", tip)
+	}
 
 	// Select the data plane: mux = TCP Reverse Tunnel; tun/spf = virtual interface.
 	var eng engine
@@ -105,7 +113,7 @@ type engine interface {
 
 // RecoveryTimeout is how long the tunnel may stay down (after having been up)
 // before the watchdog forces a restart. It is well above a normal reconnect
-// (heartbeat/keepalive cycle a dead link within ~25s), so it only ever catches
+// (heartbeat/keepalive cycle a dead link within ~12s), so it only ever catches
 // a genuine wedge; during a real peer outage it merely restarts every ~2 min,
 // which is benign and stays under systemd's start-rate limit.
 const RecoveryTimeout = 120 * time.Second

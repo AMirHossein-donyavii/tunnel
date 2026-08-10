@@ -17,15 +17,79 @@ import (
 // tunnel, whose inner IP traffic is already loss-tolerant.
 //
 // Wire format per packet: [8-byte counter][ciphertext || tag].
+//
+// Open enforces a sliding replay window, so a datagram that is a duplicate (a
+// retransmission injected by a middlebox, or an attacker replaying a captured
+// packet) is rejected instead of being re-injected into the TUN device. The
+// window is 1024 counters wide, which tolerates far more reordering than any
+// real path produces. A Datagram is used by one reader and one writer goroutine.
 type Datagram struct {
 	send cipher.AEAD
 	recv cipher.AEAD
 	ctr  uint64
 	sn   [12]byte // send nonce scratch (bytes 4..11 = counter)
 	rn   [12]byte // recv nonce scratch
+	seen replayWindow
 }
 
 const dgNonceLen = 8
+
+// ErrReplay reports a duplicated or too-old datagram counter. It is expected
+// occasionally on a lossy path and must not tear the carrier down.
+var ErrReplay = fmt.Errorf("crypto: replayed or stale datagram")
+
+// replayWindowBits is the width of the anti-replay bitmap in counters.
+const replayWindowBits = 1024
+
+// replayWindow is an IPsec-style sliding window: bit i tracks the counter
+// (last - i), so bit 0 is the highest counter accepted so far.
+type replayWindow struct {
+	last uint64
+	bits [replayWindowBits / 64]uint64
+}
+
+func (w *replayWindow) get(i uint) bool { return w.bits[i/64]&(1<<(i%64)) != 0 }
+func (w *replayWindow) set(i uint)      { w.bits[i/64] |= 1 << (i % 64) }
+
+// shift moves every recorded counter n positions further into the past.
+func (w *replayWindow) shift(n uint) {
+	words := int(n / 64)
+	rem := n % 64
+	for i := len(w.bits) - 1; i >= 0; i-- {
+		var v uint64
+		if src := i - words; src >= 0 {
+			// Go defines a shift >= the operand width as 0, so rem == 0 works too.
+			v = w.bits[src] << rem
+			if src > 0 {
+				v |= w.bits[src-1] >> (64 - rem)
+			}
+		}
+		w.bits[i] = v
+	}
+}
+
+// accept reports whether ctr has not been seen before, recording it if so.
+func (w *replayWindow) accept(ctr uint64) bool {
+	if ctr == 0 {
+		return false // counters start at 1
+	}
+	if ctr > w.last {
+		if shift := ctr - w.last; shift >= replayWindowBits {
+			w.bits = [replayWindowBits / 64]uint64{}
+		} else {
+			w.shift(uint(shift))
+		}
+		w.last = ctr
+		w.set(0)
+		return true
+	}
+	diff := w.last - ctr
+	if diff >= replayWindowBits || w.get(uint(diff)) {
+		return false
+	}
+	w.set(uint(diff))
+	return true
+}
 
 // DatagramOverhead is the per-packet expansion (counter + AEAD tag).
 const DatagramOverhead = dgNonceLen + tagOverhead
@@ -59,7 +123,16 @@ func (d *Datagram) Open(dst, packet []byte) ([]byte, error) {
 	}
 	ctr := binary.BigEndian.Uint64(packet[:dgNonceLen])
 	binary.BigEndian.PutUint64(d.rn[4:], ctr)
-	return d.recv.Open(dst, d.rn[:], packet[dgNonceLen:], nil)
+	pt, err := d.recv.Open(dst, d.rn[:], packet[dgNonceLen:], nil)
+	if err != nil {
+		return nil, err
+	}
+	// Only counters that authenticate are recorded, so a forged counter cannot
+	// poison the window and lock out the real peer.
+	if !d.seen.accept(ctr) {
+		return nil, ErrReplay
+	}
+	return pt, nil
 }
 
 // ClientHandshakePacket performs the X25519 exchange over a datagram conn

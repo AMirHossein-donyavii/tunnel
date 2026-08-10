@@ -39,8 +39,8 @@ profile = "fast"           # fast | balance | resource
 log_level = "info"
 
 # Liveness: heartbeat every interval; cycle a link if silent past timeout.
-heartbeat_interval = 10
-heartbeat_timeout = 25
+heartbeat_interval = 3
+heartbeat_timeout = 12
 
 # Optional port forwarding: DNAT these ports across the tunnel to peer_tun_ip
 # (both TCP and UDP). Same syntax as the mux engine. Requires peer_tun_ip and,

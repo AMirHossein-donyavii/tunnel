@@ -39,10 +39,16 @@ CPU/RAM usage on cheap VPS servers (2 cores / 2–4 GB).
   `8000=9000`); rules are created on start, removed on delete, restored on
   restart/reboot, and idempotent (no duplicates). *(L3 forwarding is Linux-only.)*
 - **Self-healing** — per-stream keepalive/heartbeat cycles a dead link within
-  ~25 s and reconnects with backoff; a liveness watchdog restarts the process via
-  systemd if a tunnel ever wedges, so long-running tunnels recover with no manual
-  intervention. Profile-scaled flow-control windows maximise single-stream
-  throughput on long-distance links.
+  ~12 s and reconnects with sub-second backoff; a liveness watchdog restarts the
+  process via systemd if a tunnel ever wedges, so long-running tunnels recover
+  with no manual intervention. Profile-scaled flow-control windows maximise
+  single-stream throughput on long-distance links.
+- **Latency that holds under load** — the TUN transmit path is a two-class
+  scheduler with CoDel AQM, not a FIFO: pings, DNS, ACKs and handshakes are
+  drained ahead of bulk traffic, and the queue is kept short instead of being
+  allowed to fill. Frame size adapts to the link's measured rate so a bulk frame
+  never blocks the wire long enough to undo that. See
+  [PERFORMANCE.md](PERFORMANCE.md#where-the-packets-queue-read-this-first).
 - **One-command install** — detects the distro, bootstraps Go if needed, builds a
   static binary, wires up systemd, and launches the panel.
 - **Interactive panel (`et`)** — banner, live IP/geo/ASN, create wizard, and full
@@ -69,9 +75,9 @@ internal/transport     transport interface + registry
         /dns /ssh /hysteria /ipx   experimental extension points
 internal/mux           stream multiplexer: binary framing, per-stream flow control, PING/RTT
 internal/muxeng        TCP Reverse engine: session pool, stream routing, PROXY v2
-internal/l3            TUN engine: multi-queue TUN pump, datagram framing, batching, heartbeat
+internal/l3            TUN engine: multi-queue pump, priority+CoDel scheduler, adaptive framing
 internal/tun           multi-queue TUN device (linux impl + non-linux stub)
-internal/nettune       socket/kernel tuning (NODELAY/QUICKACK/USER_TIMEOUT, SO_*BUF, BBR)
+internal/nettune       socket/host tuning (NODELAY, NOTSENT_LOWAT, USER_TIMEOUT, SO_*BUF, BBR)
 internal/proxyproto    PROXY protocol v2 header builder
 internal/sysinfo       CPU cores (cgroup v1/v2 aware), memory limits
 internal/logx          leveled logging + size-based rotation
@@ -104,10 +110,10 @@ there are no goroutine/conn leaks.
 app ─▶ emergency-tun (TUN, 10.10.10.1/24)   any IP: TCP/UDP/ICMP/ICMPv6
           │  kernel hashes the flow to queue i (ordering preserved)
           ▼
-    reader i ─▶ [batch N packets] ─▶ AEAD link i ═══▶ peer link i ─▶ TUN queue i ─▶ peer stack
+    reader i ─▶ [express | CoDel bulk] ─▶ AEAD link i ═▶ peer link i ─▶ TUN queue i ─▶ peer stack
                        ▲                                                  │
-                       └───────────── heartbeat every 10s ◀──────────────┘
-                         (no datagram for 25s ⇒ cycle & reconnect link i)
+                       └────── heartbeat / RTT probe every 3s ◀───────────┘
+                         (no frame for 12s ⇒ cycle & reconnect link i)
 ```
 
 `pool` sets the number of queues **and** links (keep it ≈ CPU cores). Both ends
@@ -212,7 +218,8 @@ on-the-wire protocol are unchanged.
 ## Security model
 
 - **Confidentiality/integrity:** every byte is AEAD-sealed (ChaCha20-Poly1305 or
-  AES-256-GCM) in ≤16 KiB frames with per-direction keys and monotonic nonces.
+  AES-256-GCM) with per-direction keys and monotonic nonces. The datagram
+  carriers add a 1024-counter sliding anti-replay window.
 - **Key exchange:** ephemeral **X25519** per connection — session keys are
   HKDF-derived from the ECDH shared secret. No pre-shared key to manage or leak,
   and every connection gets fresh keys (**forward secrecy**).

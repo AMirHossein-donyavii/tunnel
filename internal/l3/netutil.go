@@ -73,10 +73,54 @@ func (g *deadlineGate) snapshot() (time.Time, <-chan struct{}) {
 	return g.dl, g.notify
 }
 
+// flowDepth is the per-flow inbound queue depth in the packet-carrier
+// demultiplexers. It only has to cover the gap between the shared socket's read
+// loop and the flow's reader; a deeper queue would just add delay, since a
+// datagram carrier's backlog is not retransmitted.
+const flowDepth = 256
+
+// dgramBufSize is the pooled buffer size for the packet-carrier demultiplexers.
+// Every carrier datagram fits comfortably inside it (dgramMaxFrame plus AEAD
+// and header overhead), so the pool covers the whole hot path.
+const dgramBufSize = 2048
+
+// dgramPool recycles the buffers the UDP/ICMP/SPF demultiplexers use to hand a
+// datagram from the shared listening socket to its flow. Without it every
+// inbound datagram costs one heap allocation, which at a few tens of thousands
+// of packets per second is the single largest source of GC pressure on the
+// packet carriers.
+var dgramPool = sync.Pool{New: func() any { b := make([]byte, dgramBufSize); return &b }}
+
+// getDgram returns a pooled buffer holding a copy of src.
+func getDgram(src []byte) *[]byte {
+	if len(src) > dgramBufSize {
+		b := make([]byte, len(src))
+		copy(b, src)
+		return &b
+	}
+	bp := dgramPool.Get().(*[]byte)
+	b := (*bp)[:cap(*bp)][:len(src)]
+	copy(b, src)
+	*bp = b
+	return bp
+}
+
+// putDgram returns a buffer to the pool. Buffers that did not come from it (an
+// oversized datagram) are simply dropped for the GC.
+func putDgram(bp *[]byte) {
+	if bp == nil || cap(*bp) != dgramBufSize {
+		return
+	}
+	*bp = (*bp)[:dgramBufSize]
+	dgramPool.Put(bp)
+}
+
 // wait blocks until data arrives on in, the flow closes, or the deadline passes.
 // It honours deadline changes made mid-wait. Returns the payload, or a nil slice
 // with an error (timeoutErr on deadline, net.ErrClosed on close).
-func (g *deadlineGate) wait(in <-chan []byte, closed <-chan struct{}) ([]byte, error) {
+//
+// The caller owns the returned buffer and must hand it back with putDgram.
+func (g *deadlineGate) wait(in <-chan *[]byte, closed <-chan struct{}) (*[]byte, error) {
 	for {
 		dl, changed := g.snapshot()
 		var timeout <-chan time.Time

@@ -10,12 +10,15 @@
 // spf_profile:
 //   - icmp: an ICMP echo (id demultiplexes links)
 //   - tcp:  a bare TCP segment  (source port demultiplexes links)
+//
 // Both use the SAME datagram AEAD, handshake, and link framing; only the L4
 // envelope and the spoofed IP header differ.
 //
 // Requires Linux + CAP_NET_RAW. For the tcp profile the peer kernel will emit a
 // RST for the unsolicited segments — drop them so they don't reset the flow:
-//   iptables -A OUTPUT -p tcp --sport <tunnel_port> --tcp-flags RST RST -j DROP
+//
+//	iptables -A OUTPUT -p tcp --sport <tunnel_port> --tcp-flags RST RST -j DROP
+//
 // (both hosts). NOT runtime-tested in CI — validate on a real Linux host.
 package l3
 
@@ -220,10 +223,9 @@ func (l *spfLinkListener) route() {
 		l.mu.Lock()
 		f := l.flows[key]
 		l.mu.Unlock()
-		pkt := make([]byte, len(data))
-		copy(pkt, data)
 		if f == nil {
-			f = &spfFlow{l: l, key: key, in: make(chan []byte, 256), firstMsg: pkt, closed: make(chan struct{})}
+			first := append([]byte(nil), data...)
+			f = &spfFlow{l: l, key: key, in: make(chan *[]byte, flowDepth), firstMsg: first, closed: make(chan struct{})}
 			l.mu.Lock()
 			l.flows[key] = f
 			l.mu.Unlock()
@@ -232,12 +234,15 @@ func (l *spfLinkListener) route() {
 			default:
 				l.remove(key)
 			}
-		} else {
-			select {
-			case f.in <- pkt:
-			case <-f.closed:
-			default:
-			}
+			continue
+		}
+		bp := getDgram(data)
+		select {
+		case f.in <- bp:
+		case <-f.closed:
+			putDgram(bp)
+		default:
+			putDgram(bp)
 		}
 	}
 }
@@ -272,7 +277,7 @@ func (l *spfLinkListener) Close() error {
 type spfFlow struct {
 	l        *spfLinkListener
 	key      int
-	in       chan []byte
+	in       chan *[]byte
 	firstMsg []byte
 	seq      uint32
 
@@ -282,11 +287,13 @@ type spfFlow struct {
 }
 
 func (f *spfFlow) Read(b []byte) (int, error) {
-	pkt, err := f.dg.wait(f.in, f.closed)
+	bp, err := f.dg.wait(f.in, f.closed)
 	if err != nil {
 		return 0, err
 	}
-	return copy(b, pkt), nil
+	n := copy(b, *bp)
+	putDgram(bp)
+	return n, nil
 }
 
 func (f *spfFlow) Write(b []byte) (int, error) {

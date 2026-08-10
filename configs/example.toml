@@ -27,8 +27,8 @@ profile = "balance"        # fast | balance | resource
 log_level = "info"         # debug | info | warn | error
 
 # mux keepalive / RTT probe:
-heartbeat_interval = 10
-heartbeat_timeout = 25
+heartbeat_interval = 3
+heartbeat_timeout = 12
 
 proxy_protocol = false     # default; override per forward with @pp / @nopp
 

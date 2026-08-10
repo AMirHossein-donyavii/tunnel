@@ -176,10 +176,9 @@ func (l *icmpLinkListener) route() {
 		l.mu.Lock()
 		f := l.flows[key]
 		l.mu.Unlock()
-		pkt := make([]byte, len(data))
-		copy(pkt, data)
 		if f == nil {
-			f = &icmpFlow{l: l, src: src, id: id, key: key, in: make(chan []byte, 256), firstMsg: pkt, closed: make(chan struct{})}
+			first := append([]byte(nil), data...)
+			f = &icmpFlow{l: l, src: src, id: id, key: key, in: make(chan *[]byte, flowDepth), firstMsg: first, closed: make(chan struct{})}
 			l.mu.Lock()
 			l.flows[key] = f
 			l.mu.Unlock()
@@ -188,12 +187,15 @@ func (l *icmpLinkListener) route() {
 			default:
 				l.remove(key)
 			}
-		} else {
-			select {
-			case f.in <- pkt:
-			case <-f.closed:
-			default:
-			}
+			continue
+		}
+		bp := getDgram(data)
+		select {
+		case f.in <- bp:
+		case <-f.closed:
+			putDgram(bp)
+		default:
+			putDgram(bp)
 		}
 	}
 }
@@ -231,7 +233,7 @@ type icmpFlow struct {
 	src      net.Addr
 	id       int
 	key      string
-	in       chan []byte
+	in       chan *[]byte
 	firstMsg []byte
 	seq      uint32
 
@@ -241,11 +243,13 @@ type icmpFlow struct {
 }
 
 func (f *icmpFlow) Read(b []byte) (int, error) {
-	pkt, err := f.dg.wait(f.in, f.closed)
+	bp, err := f.dg.wait(f.in, f.closed)
 	if err != nil {
 		return 0, err
 	}
-	return copy(b, pkt), nil
+	n := copy(b, *bp)
+	putDgram(bp)
+	return n, nil
 }
 
 func (f *icmpFlow) Write(b []byte) (int, error) {
@@ -306,4 +310,3 @@ func parseEchoRequest(p icmpProto, raw []byte) ([]byte, int, bool) {
 	}
 	return echo.Data, echo.ID, true
 }
-

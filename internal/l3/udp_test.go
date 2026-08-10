@@ -48,10 +48,9 @@ func TestUDPLinkRoundTrip(t *testing.T) {
 			if err := clk.WriteFrame(payload); err != nil {
 				t.Fatal(err)
 			}
-			buf := make([]byte, 4096)
-			n, err := slk.ReadFrame(buf)
-			if err != nil || !bytes.Equal(buf[:n], payload) {
-				t.Fatalf("c->s frame: n=%d err=%v", n, err)
+			got, err := slk.ReadFrame()
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("c->s frame: got %d bytes err=%v", len(got), err)
 			}
 
 			// server -> client
@@ -59,9 +58,9 @@ func TestUDPLinkRoundTrip(t *testing.T) {
 			if err := slk.WriteFrame(reply); err != nil {
 				t.Fatal(err)
 			}
-			n, err = clk.ReadFrame(buf)
-			if err != nil || !bytes.Equal(buf[:n], reply) {
-				t.Fatalf("s->c frame: n=%d err=%v", n, err)
+			got, err = clk.ReadFrame()
+			if err != nil || !bytes.Equal(got, reply) {
+				t.Fatalf("s->c frame: got %d bytes err=%v", len(got), err)
 			}
 		})
 	}

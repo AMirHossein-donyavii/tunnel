@@ -2,10 +2,9 @@ package l3
 
 import (
 	"context"
-	"encoding/binary"
-	"fmt"
-	"io"
+	"errors"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/emergency-tunnel/et/internal/crypto"
@@ -17,12 +16,20 @@ import (
 // of length-prefixed packets (see datagram.go). The TUN engine treats every
 // carrier uniformly through this interface; TCP uses a reliable stream, while
 // UDP/ICMP use a datagram AEAD.
+//
+// One frame maps onto exactly one AEAD frame on a stream carrier and onto
+// exactly one datagram on a packet carrier, so neither path pays for a second
+// length header or an extra copy.
 type link interface {
-	// WriteFrame sends one encrypted frame (a [len][pkt]... payload).
+	// WriteFrame sends one encrypted frame (a [len][pkt]... payload) using a
+	// single write syscall.
 	WriteFrame(payload []byte) error
-	// ReadFrame reads one decrypted frame into buf, returning its length.
-	ReadFrame(buf []byte) (int, error)
-	// MaxFrame is the largest payload accepted by WriteFrame.
+	// ReadFrame returns the next decrypted frame. The slice aliases an internal
+	// buffer and is valid only until the next ReadFrame call.
+	ReadFrame() ([]byte, error)
+	// MaxFrame is the largest payload accepted by WriteFrame. It is a hard
+	// carrier limit; how much the engine actually packs into a frame is governed
+	// by frameBudget (see budget.go).
 	MaxFrame() int
 	SetReadDeadline(t time.Time) error
 	Close() error
@@ -41,7 +48,9 @@ type linkListener interface {
 }
 
 const (
-	streamMaxFrame = 60 * 1024 // TCP: large batches
+	// streamMaxFrame is the batch ceiling on a reliable carrier. It stays under
+	// crypto.MaxPlaintext so a full batch is one AEAD frame and one write.
+	streamMaxFrame = 60 * 1024
 	// dgramMaxFrame keeps one full-size inner packet + framing inside one
 	// carrier datagram, comfortably under a 1500-byte path MTU after AEAD and
 	// UDP/ICMP/IP headers.
@@ -51,51 +60,48 @@ const (
 // ---- TCP (reliable stream over crypto.SecureConn) --------------------------
 
 type streamLink struct {
-	sc   *crypto.SecureConn
-	wbuf []byte
+	sc *crypto.SecureConn
 }
 
-func (l *streamLink) WriteFrame(p []byte) error {
-	l.wbuf = l.wbuf[:0]
-	var h [4]byte
-	binary.BigEndian.PutUint32(h[:], uint32(len(p)))
-	l.wbuf = append(l.wbuf, h[:]...)
-	l.wbuf = append(l.wbuf, p...)
-	_, err := l.sc.Write(l.wbuf)
-	return err
-}
-
-func (l *streamLink) ReadFrame(buf []byte) (int, error) {
-	var h [4]byte
-	if _, err := io.ReadFull(l.sc, h[:]); err != nil {
-		return 0, err
-	}
-	n := int(binary.BigEndian.Uint32(h[:]))
-	if n > len(buf) {
-		return 0, fmt.Errorf("l3: frame too large (%d)", n)
-	}
-	if _, err := io.ReadFull(l.sc, buf[:n]); err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
-func (l *streamLink) MaxFrame() int                   { return streamMaxFrame }
+func (l *streamLink) WriteFrame(p []byte) error         { return l.sc.WriteFrame(p) }
+func (l *streamLink) ReadFrame() ([]byte, error)        { return l.sc.NextFrame() }
+func (l *streamLink) MaxFrame() int                     { return streamMaxFrame }
 func (l *streamLink) SetReadDeadline(t time.Time) error { return l.sc.SetReadDeadline(t) }
-func (l *streamLink) Close() error                    { return l.sc.Close() }
+func (l *streamLink) Close() error                      { return l.sc.Close() }
 
 // ---- datagram (UDP / ICMP) over crypto.Datagram ---------------------------
+
+// maxBadDatagrams bounds how many consecutive undecryptable datagrams are
+// tolerated before the link is considered broken. A handful is normal on an
+// open UDP port (scanners, stale packets from a previous session, replays); a
+// continuous stream means the peer's keys no longer match ours.
+const maxBadDatagrams = 64
+
+// badDatagrams counts every datagram the AEAD refused (corrupt, forged or
+// replayed) across all carriers. A process runs exactly one tunnel engine, so a
+// package counter is the simplest way to surface this on /stats without
+// threading engine state through every carrier constructor.
+var badDatagrams atomic.Uint64
 
 type datagramLink struct {
 	conn net.Conn
 	dg   *crypto.Datagram
 	wbuf []byte
-	rbuf []byte
+	rbuf []byte // raw ciphertext
+	pbuf []byte // plaintext scratch
+	bad  uint64 // consecutive undecryptable datagrams
 }
 
 func newDatagramLink(conn net.Conn, dg *crypto.Datagram) *datagramLink {
-	return &datagramLink{conn: conn, dg: dg, rbuf: make([]byte, dgramMaxFrame+crypto.DatagramOverhead+64)}
+	return &datagramLink{
+		conn: conn,
+		dg:   dg,
+		rbuf: make([]byte, dgramMaxFrame+crypto.DatagramOverhead+64),
+		pbuf: make([]byte, 0, dgramMaxFrame+64),
+	}
 }
+
+var errBadDatagramFlood = errors.New("l3: too many undecryptable datagrams — peer keys do not match")
 
 func (l *datagramLink) WriteFrame(p []byte) error {
 	l.wbuf = l.dg.Seal(l.wbuf[:0], p)
@@ -103,21 +109,33 @@ func (l *datagramLink) WriteFrame(p []byte) error {
 	return err
 }
 
-func (l *datagramLink) ReadFrame(buf []byte) (int, error) {
-	n, err := l.conn.Read(l.rbuf)
-	if err != nil {
-		return 0, err
+// ReadFrame returns the next authenticated frame. A datagram that fails to
+// decrypt is *skipped*, not fatal: on an unprotected UDP/ICMP carrier anyone can
+// inject a packet, and tearing the tunnel down for each one would hand a remote
+// attacker a trivial denial of service.
+func (l *datagramLink) ReadFrame() ([]byte, error) {
+	for {
+		n, err := l.conn.Read(l.rbuf)
+		if err != nil {
+			return nil, err
+		}
+		pt, err := l.dg.Open(l.pbuf[:0], l.rbuf[:n])
+		if err != nil {
+			l.bad++
+			badDatagrams.Add(1)
+			if l.bad > maxBadDatagrams {
+				return nil, errBadDatagramFlood
+			}
+			continue
+		}
+		l.bad = 0
+		return pt, nil
 	}
-	pt, err := l.dg.Open(buf[:0], l.rbuf[:n])
-	if err != nil {
-		return 0, err
-	}
-	return len(pt), nil
 }
 
-func (l *datagramLink) MaxFrame() int                   { return dgramMaxFrame }
+func (l *datagramLink) MaxFrame() int                     { return dgramMaxFrame }
 func (l *datagramLink) SetReadDeadline(t time.Time) error { return l.conn.SetReadDeadline(t) }
-func (l *datagramLink) Close() error                    { return l.conn.Close() }
+func (l *datagramLink) Close() error                      { return l.conn.Close() }
 
 // ---- TCP factory (reuses the tcp transport + stream handshake) -------------
 

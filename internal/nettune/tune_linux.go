@@ -49,6 +49,11 @@ func Apply(c net.Conn, o Options) {
 			_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, ka)
 			_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, 3)
 		}
+		if o.NotSentLowat > 0 {
+			// Keep the queue in our scheduler instead of the kernel's send buffer,
+			// so priority and AQM still govern it. See nettune.notSentLowat.
+			_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, o.NotSentLowat)
+		}
 		if o.BBR {
 			// Prefer BBR when the kernel offers it; silently ignored otherwise.
 			_ = unix.SetsockoptString(ifd, unix.IPPROTO_TCP, unix.TCP_CONGESTION, "bbr")
@@ -58,5 +63,9 @@ func Apply(c net.Conn, o Options) {
 
 // TuneConn is the legacy buffer-only entry point (used by the L3 engine).
 func TuneConn(c net.Conn, sndbuf, rcvbuf int) {
-	Apply(c, Options{SndBuf: sndbuf, RcvBuf: rcvbuf, BBR: true, Keepalive: 30 * time.Second, UserTimeout: 20 * time.Second})
+	o := Options{SndBuf: sndbuf, RcvBuf: rcvbuf, BBR: true, Keepalive: 20 * time.Second, UserTimeout: 12 * time.Second}
+	if sndbuf == 0 {
+		o.NotSentLowat = notSentLowat
+	}
+	Apply(c, o)
 }
