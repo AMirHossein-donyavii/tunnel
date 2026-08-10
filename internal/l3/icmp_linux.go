@@ -5,11 +5,19 @@
 // Each encrypted frame rides in the payload of an ICMP Echo message: the dialer
 // sends Echo Requests, the listener answers with Echo Replies carrying its own
 // frames. This mimics ping traffic, which some networks allow when TCP/UDP are
-// filtered. Requires a Linux host with CAP_NET_RAW, and on the listener:
+// filtered. Requires a Linux host with CAP_NET_RAW.
 //
-//	sysctl -w net.ipv4.icmp_echo_ignore_all=1     # icmp mode  (or icmpv6.* for bip)
+// The listener's kernel answers echo requests too, and its automatic reply
+// carries our own payload back verbatim with the same ICMP id — indistinguishable
+// from a real reply by address and id alone. A dialer that accepts those reads
+// its own ciphertext as if it came from the peer, and the link passes no traffic
+// at all until it times out and cycles. Disabling kernel replies host-wide
+// (net.ipv4.icmp_echo_ignore_all=1) does avoid it, but at the price of the server
+// no longer answering ping on any interface — including its tunnel address.
 //
-// so the kernel does not also auto-reply to the dialer's echo requests.
+// So each payload carries a one-byte direction tag instead. A mirrored request
+// arrives tagged as a request and is discarded; only genuine peer traffic is
+// read. No sysctl is required and ping keeps working.
 //
 // This carrier reuses the same datagram AEAD, handshake, and link framing as the
 // UDP carrier; only the packet envelope differs.
@@ -28,6 +36,14 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+)
+
+// Direction tags. The first payload byte says which way a datagram is
+// travelling, so a packet that comes back to its own sender — a kernel echo
+// reply mirroring our request — is recognisable and dropped.
+const (
+	tagToListener = 0xE1 // dialer -> listener, rides in Echo Requests
+	tagToDialer   = 0xE2 // listener -> dialer, rides in Echo Replies
 )
 
 type icmpProto struct {
@@ -98,14 +114,20 @@ type icmpConn struct {
 	pc    *icmp.PacketConn
 	peer  net.Addr
 	id    int
-	seq   uint32
+
+	mu      sync.Mutex
+	seq     uint32
+	scratch []byte
 }
 
 func (c *icmpConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
 	c.seq++
+	c.scratch = append(append(c.scratch[:0], tagToListener), b...)
 	m := icmp.Message{Type: c.proto.echoType, Code: 0,
-		Body: &icmp.Echo{ID: c.id, Seq: int(c.seq & 0xffff), Data: b}}
-	out, err := m.Marshal(nil)
+		Body: &icmp.Echo{ID: c.id, Seq: int(c.seq & 0xffff), Data: c.scratch}}
+	out, err := m.Marshal(nil) // copies scratch, which is free to reuse after
+	c.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
@@ -129,7 +151,13 @@ func (c *icmpConn) Read(b []byte) (int, error) {
 		if !ok {
 			continue
 		}
-		return copy(b, data), nil
+		// Drop anything tagged for the listener: that is our own request
+		// mirrored back by the peer's kernel, not a frame from the peer.
+		payload, ok := stripTag(data, tagToDialer)
+		if !ok {
+			continue
+		}
+		return copy(b, payload), nil
 	}
 }
 
@@ -169,6 +197,13 @@ func (l *icmpLinkListener) route() {
 			continue
 		}
 		data, id, ok := parseEchoRequest(l.proto, buf[:n])
+		if !ok {
+			continue
+		}
+		// Only frames a dialer addressed to us. This rejects ordinary ping
+		// traffic from anywhere on the internet, which would otherwise open a
+		// flow per source and be offered to the handshake.
+		data, ok = stripTag(data, tagToListener)
 		if !ok {
 			continue
 		}
@@ -235,7 +270,10 @@ type icmpFlow struct {
 	key      string
 	in       chan *[]byte
 	firstMsg []byte
-	seq      uint32
+
+	wmu     sync.Mutex
+	seq     uint32
+	scratch []byte
 
 	dg        deadlineGate
 	closeOnce sync.Once
@@ -253,10 +291,13 @@ func (f *icmpFlow) Read(b []byte) (int, error) {
 }
 
 func (f *icmpFlow) Write(b []byte) (int, error) {
+	f.wmu.Lock()
 	f.seq++
+	f.scratch = append(append(f.scratch[:0], tagToDialer), b...)
 	m := icmp.Message{Type: f.l.proto.replyType, Code: 0,
-		Body: &icmp.Echo{ID: f.id, Seq: int(f.seq & 0xffff), Data: b}}
+		Body: &icmp.Echo{ID: f.id, Seq: int(f.seq & 0xffff), Data: f.scratch}}
 	out, err := m.Marshal(nil)
+	f.wmu.Unlock()
 	if err != nil {
 		return 0, err
 	}
@@ -280,6 +321,17 @@ func (f *icmpFlow) LocalAddr() net.Addr                { return f.l.pc.LocalAddr
 func (f *icmpFlow) RemoteAddr() net.Addr               { return f.src }
 
 // ---- codec -----------------------------------------------------------------
+
+// stripTag accepts a payload only when it carries the expected direction tag,
+// and returns it with the tag removed. Traffic travelling the other way — our
+// own request mirrored back by a kernel echo reply, or a stray ping from a
+// stranger — fails here instead of reaching the AEAD as a peer frame.
+func stripTag(data []byte, want byte) ([]byte, bool) {
+	if len(data) < 1 || data[0] != want {
+		return nil, false
+	}
+	return data[1:], true
+}
 
 // parseEcho parses an ICMP message and returns the Echo body data if it matches
 // the wanted id and (reply?reply:request) type.

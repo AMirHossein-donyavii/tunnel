@@ -4,6 +4,30 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.3] — 2026-08-10
+
+### Fixed
+
+- **The ICMP carrier carried nothing and cycled every 25s.** A listener's kernel
+  answers echo requests by itself, and its reply repeats the dialer's own payload
+  with the same ICMP id — by address and id alone it cannot be told apart from a
+  real reply. The dialer read its own ciphertext as peer traffic, no genuine
+  frame was ever accepted, and both queues tore down on the liveness timeout.
+  Each payload now carries a one-byte direction tag, so a mirrored request is
+  recognised and dropped.
+
+  This also removes the `net.ipv4.icmp_echo_ignore_all=1` requirement the carrier
+  used to have. That sysctl did avoid the collision, but it silenced ping on
+  every interface including the tunnel address — so the standard way to test a
+  tunnel stopped working on exactly the servers that needed it.
+
+  A side effect of the same tag: the listener now ignores ordinary ping traffic
+  instead of opening a flow per source and offering each to the handshake.
+
+  Verified on a two-namespace testbed with real ICMP sockets: with kernel replies
+  enabled the tunnel went from 100% loss and both queues cycling at 25s, to 0%
+  loss and no cycling over a 30s soak.
+
 ## [2.0.2] — 2026-08-10
 
 ### Fixed
