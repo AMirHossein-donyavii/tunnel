@@ -28,9 +28,9 @@ type Stream struct {
 	// 42 Mbit/s, which is why one upload stream crawls on a link that measures
 	// far higher. The window has to follow the path, and the only thing the
 	// receiver can see of the path is how quickly it drains what it advertised.
-	win        int       // currently advertised receive window
-	drained    int       // bytes consumed since lastGrow
-	lastGrow   time.Time // when the window was last reconsidered
+	win      int       // currently advertised receive window
+	drained  int       // bytes consumed since lastGrow
+	lastGrow time.Time // when the window was last reconsidered
 
 	// send side
 	wmu     sync.Mutex

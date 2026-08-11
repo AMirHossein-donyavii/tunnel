@@ -65,8 +65,8 @@ const notSentLowat = 128 << 10
 // path and wants a specific size.
 func LinkOptions(profile string, sndOverride, rcvOverride int) Options {
 	o := Options{
-		SndBuf: sndOverride, // 0 => kernel autotune; only an explicit override pins it
-		RcvBuf: rcvOverride, // likewise: pinning it would cap the receive window
+		SndBuf:      sndOverride, // 0 => kernel autotune; only an explicit override pins it
+		RcvBuf:      rcvOverride, // likewise: pinning it would cap the receive window
 		UserTimeout: 12 * time.Second,
 		Keepalive:   10 * time.Second,
 		BBR:         true,
