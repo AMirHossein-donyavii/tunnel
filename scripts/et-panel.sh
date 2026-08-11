@@ -6,7 +6,7 @@
 # script, so there is no partial-install state to reason about):
 #
 #   1. constants + UI primitives      6. optimiser (per-protocol defaults)
-#   2. validation helpers             7. sections: Basic / TUN / Gaming / SPF
+#   2. validation helpers             7. sections: Basic / TUN / Gaming / SPF / Backpack
 #   3. system + network probes        8. tunnel management
 #   4. tunnel registry + allocator    9. dashboard + diagnostics
 #   5. config reader/writer          10. migration + main menu
@@ -1153,7 +1153,7 @@ main_menu() {
         while IFS= read -r n; do [ -n "$n" ] && [ "$(svc_state "$n")" = "active" ] && active=$((active+1)); done < <(list_tunnels)
         printf "  ${GRY}%s tunnel(s) configured · ${R}${GRN}%s running${R}\n\n" "$total" "$active"
         item 1 "Dashboard"      "live status, resources, per-tunnel health"
-        item 2 "Create tunnel"  "Basic · TUN · Gaming · SPF"
+        item 2 "Create tunnel"  "Basic · TUN · Gaming · SPF · Backpack"
         item 3 "Manage tunnels" "start, stop, logs, stats, edit, delete"
         item 4 "Speed test"     "iperf3 across the tunnel"
         item 5 "Host tuning"    "apply BBR, fq and buffer sysctls"
