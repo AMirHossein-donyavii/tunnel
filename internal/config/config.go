@@ -285,6 +285,16 @@ func (c *Config) validateTUN() error {
 	default:
 		return fmt.Errorf("tun_mode must be tcp, udp, icmp or bip, got %q", c.TunMode)
 	}
+	// bip carries the link inside ICMPv6, so the peer address it dials must be
+	// IPv6. Catching an IPv4 literal here turns a permanent reconnect loop —
+	// "no suitable address found", once per queue every five seconds — into a
+	// message at the moment the config is written. A hostname is left to the
+	// runtime, which cannot know its addresses until it resolves them.
+	if c.TunMode == TunModeBIP && c.Peer != "" {
+		if pip := net.ParseIP(strings.TrimSpace(c.Peer)); pip != nil && pip.To4() != nil {
+			return fmt.Errorf("peer %q is IPv4 but tun_mode=bip carries the link inside ICMPv6 — set peer to the other server's IPv6 address, or use tun_mode=icmp for IPv4", c.Peer)
+		}
+	}
 	ip, ipnet, err := net.ParseCIDR(strings.TrimSpace(c.TunIP))
 	if err != nil {
 		return fmt.Errorf("tun_ip must be an address with prefix, e.g. 10.10.10.1/24 (got %q)", c.TunIP)

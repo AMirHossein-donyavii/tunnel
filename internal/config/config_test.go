@@ -27,6 +27,11 @@ func TestValidateTUNModes(t *testing.T) {
 	for _, m := range []string{TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP} {
 		c := baseTUN()
 		c.TunMode = m
+		if m == TunModeBIP {
+			// bip dials over ICMPv6, so its peer has to be an IPv6 address;
+			// TestBIPRejectsIPv4Peer covers the mismatch itself.
+			c.Peer = "2a01:4f8::1"
+		}
 		if err := c.Validate(); err != nil {
 			t.Fatalf("tun_mode %q rejected: %v", m, err)
 		}
@@ -371,5 +376,35 @@ func TestTOMLRoundTrip(t *testing.T) {
 		got.HeartbeatTimeout != c.HeartbeatTimeout || got.Peer != c.Peer ||
 		got.PeerTunIP != c.PeerTunIP {
 		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+// bip dials over ICMPv6. An IPv4 peer produces a config that can never connect:
+// every queue retries "no suitable address found" every five seconds, forever.
+// The config is where that is knowable, so it must not pass validation.
+func TestBIPRejectsIPv4Peer(t *testing.T) {
+	base := func() *Config {
+		c := Defaults()
+		c.Name, c.Role, c.Mode = "b", "kharej", "reverse"
+		c.Engine, c.TunMode = "tun", TunModeBIP
+		c.TunnelPort, c.TunIP, c.PeerTunIP = 1234, "10.10.10.2/24", "10.10.10.1"
+		c.TunIface = "et0"
+		return &c
+	}
+	c := base()
+	c.Peer = "193.138.77.167"
+	if err := c.Validate(); err == nil {
+		t.Fatal("an IPv4 peer was accepted for tun_mode=bip")
+	}
+	c = base()
+	c.Peer = "2a01:4f8::1"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an IPv6 peer was rejected for tun_mode=bip: %v", err)
+	}
+	// icmp is the IPv4 carrier and must keep accepting IPv4 peers.
+	c = base()
+	c.TunMode, c.Peer = TunModeICMP, "193.138.77.167"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("tun_mode=icmp rejected an IPv4 peer: %v", err)
 	}
 }

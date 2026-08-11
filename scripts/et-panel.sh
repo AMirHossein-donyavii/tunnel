@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.0.3"
+SCRIPT_VERSION="2.0.4"
 CORE="/usr/local/bin/et-core"
 CONF_DIR="/etc/emergency-tunnel"
 LOG_DIR="/var/log/emergency-tunnel"
@@ -146,6 +146,23 @@ ask_ip() {
         bad "Enter a valid IPv4 address or hostname." >&2
     done
 }
+valid_ipv6() { [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$1" != *:::* ]]; }
+ask_ip6() {
+    local v
+    while :; do
+        v="$(ask "$1" "${2:-}")"
+        valid_ipv6 "$v" && { printf '%s' "$v"; return; }
+        [[ "$v" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] && { printf '%s' "$v"; return; }
+        bad "Enter an IPv6 address (e.g. 2a01:4f8::1) or a hostname with an AAAA record." >&2
+    done
+}
+
+# host_has_ipv6 — a routable (non-link-local) IPv6 address on some interface.
+host_has_ipv6() {
+    [ -r /proc/net/if_inet6 ] || return 1
+    ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
+}
+
 ask_name() {
     local v
     while :; do
@@ -426,7 +443,14 @@ common_endpoint() {
     local tp; tp="$(ask_port "Tunnel port ${GRY}(same on BOTH servers)${R}" "$(next_free_port 1234)")"
     cfg_set tunnel_port "$tp"
     if [ "$role" = "kharej" ]; then
-        cfg_set peer "$(ask_ip "Iran server public IP")"
+        # bip dials over ICMPv6, so it needs the peer's IPv6 address. Asking for
+        # an IPv4 one here produces a config that never connects — every queue
+        # retrying "no suitable address found" forever.
+        if [ "${CFG[tun_mode]:-}" = "bip" ]; then
+            cfg_set peer "$(ask_ip6 "Iran server public IPv6 address")"
+        else
+            cfg_set peer "$(ask_ip "Iran server public IP")"
+        fi
     fi
     cfg_set health_port "$(next_free_port 9090)"
 }
@@ -475,10 +499,22 @@ section_tun() {
     item 1 "TCP"  "reliable carrier — most compatible, best throughput"
     item 2 "UDP"  "datagram carrier — lower overhead, no carrier retransmits"
     item 3 "ICMP" "inside ping packets — beta, needs CAP_NET_RAW"
-    item 4 "BIP"  "inside ICMPv6 — beta, needs CAP_NET_RAW"
-    local c; c="$(ask_choice "Method" "1" 1 2 3 4)"
+    item 4 "BIP"  "inside ICMPv6 — beta, needs CAP_NET_RAW and IPv6 on BOTH servers"
+    if ! host_has_ipv6; then
+        echo; warn "This server has no global IPv6 address, so BIP cannot connect."
+        note "BIP carries the link inside ICMPv6. Use ICMP for the same idea over IPv4."
+    fi
+    local c m
+    while :; do
+        c="$(ask_choice "Method" "1" 1 2 3 4)"
+        case "$c" in 1) m=tcp;; 2) m=udp;; 3) m=icmp;; 4) m=bip;; esac
+        [ "$m" = "bip" ] && ! host_has_ipv6 && {
+            bad "No global IPv6 on this server — BIP would retry forever."
+            yesno "Choose a different method?" "y" && continue
+        }
+        break
+    done
     cfg_reset
-    local m; case "$c" in 1) m=tcp;; 2) m=udp;; 3) m=icmp;; 4) m=bip;; esac
     optimise tun "$m"; cfg_set tun_mode "$m"
     cfg_set name "$(ask_name "Tunnel name" "tun$(tunnel_count)")"
     common_endpoint

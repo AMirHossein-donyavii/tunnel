@@ -95,7 +95,13 @@ func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
 	peer, err := net.ResolveIPAddr(ipnet, d.peer)
 	if err != nil {
 		_ = pc.Close()
-		return nil, err
+		// The resolver's own wording for "you asked for IPv6 and this is an IPv4
+		// address" is "no suitable address found", which reads like a routing or
+		// DNS fault and sends people to the firewall. Say what is actually wrong.
+		if d.proto.v6 {
+			return nil, fmt.Errorf("peer %q has no IPv6 address: tun_mode=bip carries the link inside ICMPv6, so peer must be the other server's IPv6 address — use tun_mode=icmp to carry it over IPv4 (%w)", d.peer, err)
+		}
+		return nil, fmt.Errorf("peer %q has no IPv4 address (%w)", d.peer, err)
 	}
 	conn := &icmpConn{proto: d.proto, pc: pc, peer: peer, id: rand.Intn(0xfffe) + 1}
 	dg, err := crypto.ClientHandshakePacket(conn, d.cipher)

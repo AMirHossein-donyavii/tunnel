@@ -4,6 +4,23 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.4] — 2026-08-10
+
+### Fixed
+
+- **BIP with an IPv4 peer retried forever.** BIP carries the link inside ICMPv6,
+  so the address it dials has to be IPv6. Given an IPv4 one the resolver answered
+  "no suitable address found" — wording that reads like a DNS or routing fault
+  and sends you to the firewall — and every queue repeated it every five seconds
+  with no way to tell what was actually wrong.
+
+  Three changes, at the three points where it was knowable: the config is
+  rejected at validation time with the reason and the fix; the runtime dial error
+  now says the peer has no IPv6 address and that `tun_mode=icmp` is the IPv4
+  equivalent; and the console asks for an IPv6 peer when BIP is chosen, warns
+  when the server has no global IPv6 at all, and offers to switch method rather
+  than writing a config that cannot connect.
+
 ## [2.0.3] — 2026-08-10
 
 ### Fixed
