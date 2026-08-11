@@ -26,6 +26,7 @@ import (
 
 	// Register transports. TCP is production; the rest register experimental
 	// placeholders from the transport package's init.
+	_ "github.com/emergency-tunnel/et/internal/transport/quic"
 	_ "github.com/emergency-tunnel/et/internal/transport/rudp"
 	_ "github.com/emergency-tunnel/et/internal/transport/stealth"
 	_ "github.com/emergency-tunnel/et/internal/transport/tcp"

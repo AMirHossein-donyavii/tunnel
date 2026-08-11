@@ -192,19 +192,38 @@ func (c *Conn) signal() {
 // datagram can yield several packets: the one that arrived, plus any the parity
 // let us rebuild.
 func (c *Conn) input(b []byte) {
+	fed := false
 	if c.fecDec == nil {
-		if c.arq.Input(b) && c.arq.PendingRecv() {
-			c.signal()
+		fed = c.arq.Input(b)
+	} else {
+		// With FEC on, one datagram can yield several packets: the one that
+		// arrived, plus any the parity let us rebuild.
+		for _, pkt := range c.fecDec.decode(b) {
+			if c.arq.Input(pkt) {
+				fed = true
+			}
 		}
+	}
+	if !fed {
 		return
 	}
-	fed := false
-	for _, pkt := range c.fecDec.decode(b) {
-		if c.arq.Input(pkt) {
-			fed = true
-		}
-	}
-	if fed && c.arq.PendingRecv() {
+	// Drive the state machine on arrival, not on the next tick.
+	//
+	// Flushing only from the interval timer made the tick period the effective
+	// round trip in both directions. On the receiving side an acknowledgement
+	// waited up to a tick before it was sent; on the sending side the window
+	// that acknowledgement re-opened sat unused until a tick after that. A
+	// congestion window divided by 10 ms instead of by the path's real 0.1 ms is
+	// the whole difference: the same loopback transfer measured 91 Mbit/s on the
+	// timer and 2.3 Gbit/s once arrivals drove it.
+	//
+	// This is ACK clocking, which is how TCP has always worked: an arriving
+	// acknowledgement is what releases the next data, so the sender paces itself
+	// to the path rather than to a timer that knows nothing about it. The timer
+	// stays for what only it can do — retransmissions, probes, and flushing a
+	// last acknowledgement when nothing further arrives.
+	c.arq.Update(c.now())
+	if c.arq.PendingRecv() {
 		c.signal()
 	}
 }

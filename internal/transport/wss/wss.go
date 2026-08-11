@@ -77,7 +77,7 @@ func (*wssTransport) NewDialer(cfg *config.Config, log *logx.Logger) (transport.
 }
 
 func (*wssTransport) NewListener(cfg *config.Config, log *logx.Logger) (transport.Listener, error) {
-	cert, err := certificateFor(cfg)
+	cert, err := CertificateFor(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -101,11 +101,12 @@ func (*wssTransport) NewListener(cfg *config.Config, log *logx.Logger) (transpor
 	}, nil
 }
 
-// certificateFor loads the configured certificate, or generates a self-signed
-// one. A generated certificate is enough for the tunnel — nothing depends on it
+// CertificateFor loads the configured certificate, or generates a self-signed
+// one. Exported because the QUIC transport needs exactly the same behaviour —
+// QUIC is always TLS — and two copies of certificate handling would drift. A generated certificate is enough for the tunnel — nothing depends on it
 // for security — but it will not survive a probe that checks the chain, so a
 // real one is better where the address is a domain.
-func certificateFor(cfg *config.Config) (tls.Certificate, error) {
+func CertificateFor(cfg *config.Config) (tls.Certificate, error) {
 	crt, key := strings.TrimSpace(cfg.TLSCert), strings.TrimSpace(cfg.TLSKey)
 	if crt != "" || key != "" {
 		if crt == "" || key == "" {

@@ -76,6 +76,7 @@ type segment struct {
 	rto      uint32 // this segment's timeout (doubles per resend)
 	fastAck  uint32 // how many later segments have been acknowledged
 	xmit     uint32 // transmission count
+	rtoXmit  uint32 // transmissions caused by a timeout, not by a fast retransmit
 }
 
 func (s *segment) encode(b []byte) int {
@@ -336,7 +337,19 @@ func (a *ARQ) Input(data []byte) bool {
 				maxAck, ackedAny = sn, true
 			}
 			a.shrinkSndBuf()
-		case cmdPush, cmdSyn:
+		case cmdSyn:
+			// A SYN opens the connection; it carries no stream data and must NOT
+			// consume a sequence number.
+			//
+			// It used to be handled as data. Its sn is 0, so it took slot 0 of the
+			// receive stream and advanced rcvNxt to 1 — and then the first real
+			// segment, whose sn is also 0 because the sender starts there, was
+			// rejected as already seen and acknowledged anyway, so it was never
+			// resent. Every connection established perfectly and then carried
+			// nothing in that direction: the tunnel's handshake timed out on one
+			// side and read EOF on the other. Acknowledge it and deliver nothing.
+			a.ackList = append(a.ackList, ack{sn: sn, ts: ts})
+		case cmdPush:
 			// Only accept what fits the advertised window; anything beyond it is
 			// the peer ignoring flow control.
 			if sn < a.rcvNxt+a.rcvWnd {
@@ -632,6 +645,7 @@ func (a *ARQ) flush(current uint32) {
 			s.resendTs = current + s.rto
 		case current >= s.resendTs: // timeout
 			send = true
+			s.rtoXmit++
 			if a.nodelay {
 				s.rto += s.rto / 2
 			} else {
@@ -654,7 +668,17 @@ func (a *ARQ) flush(current uint32) {
 		s.wnd = seg.wnd
 		s.una = a.rcvNxt
 		emit(s)
-		if s.xmit >= deadLinkResends {
+		// Only timeouts count toward "the path is gone".
+		//
+		// This counted every transmission, fast retransmits included, which was
+		// survivable only while flushing was throttled to one pass per interval
+		// tick. Once arrivals drive the flush, a segment being recovered on a
+		// busy link can be fast-retransmitted many times within a few
+		// milliseconds and trip the limit — and a fast retransmit is triggered by
+		// acknowledgements arriving, which is positive proof the path is alive.
+		// A path that is really gone stops acknowledging, and then it is the RTO
+		// that fires, over and over, which is what this counts now.
+		if s.rtoXmit >= deadLinkResends {
 			a.dead = true
 		}
 	}
