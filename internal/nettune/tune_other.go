@@ -8,7 +8,7 @@ import "net"
 // USER_TIMEOUT/BBR options are Linux-specific). Production runs on Linux; this
 // keeps other OSes building and lightly tuned.
 func Apply(c net.Conn, o Options) {
-	if tc, ok := c.(*net.TCPConn); ok {
+	if tc := baseTCPConn(c); tc != nil {
 		_ = tc.SetNoDelay(true)
 		if o.Keepalive > 0 {
 			_ = tc.SetKeepAlive(true)

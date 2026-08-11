@@ -218,3 +218,35 @@ func itoa(i int) string {
 	}
 	return string(b)
 }
+
+// wss is the most deeply wrapped transport there is here: WebSocket framing
+// over a TLS record layer over TCP. nettune has to reach the socket at the
+// bottom of that stack to set TCP_NODELAY and the rest, and it does so by
+// walking NetConn() down the chain — so every layer must expose it.
+//
+// It did not, and the result was silent: Apply took a conn it could not
+// recognise and returned, leaving Nagle's algorithm on and no bufferbloat guard
+// for exactly the protocols people pick when the network is hostile. Nothing
+// failed, nothing logged; the tunnel was just slower to respond than it should
+// have been. This asserts the whole chain resolves on a real connection.
+func TestTuningReachesTheSocketUnderTLSAndWebSocket(t *testing.T) {
+	cli, srv, _ := endpoints(t, config.Config{})
+
+	for name, c := range map[string]net.Conn{"dialer": cli, "listener": srv} {
+		t.Run(name, func(t *testing.T) {
+			cur := c
+			for i := 0; i < 8; i++ {
+				if _, ok := cur.(*net.TCPConn); ok {
+					return // reached the socket: nettune can tune it
+				}
+				u, ok := cur.(interface{ NetConn() net.Conn })
+				if !ok {
+					t.Fatalf("%T does not expose NetConn, so socket tuning stops here "+
+						"and this transport runs untuned", cur)
+				}
+				cur = u.NetConn()
+			}
+			t.Fatal("wrapping is deeper than the unwrap limit")
+		})
+	}
+}

@@ -12,20 +12,14 @@ func TestICMPCodecRoundTrip(t *testing.T) {
 	data := []byte("icmp-spf-payload")
 
 	// dialer -> server (request)
-	req, err := c.encode(nil, nil, key, tunnel, 1, data, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	req := c.encode(nil, nil, nil, key, tunnel, 1, data, false)
 	gd, gk, ok := c.parseServer(req, tunnel)
 	if !ok || gk != key || !bytes.Equal(gd, data) {
 		t.Fatalf("parseServer: ok=%v key=%d data=%q", ok, gk, gd)
 	}
 
 	// server -> dialer (reply)
-	rep, err := c.encode(nil, nil, key, tunnel, 2, data, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rep := c.encode(nil, nil, nil, key, tunnel, 2, data, true)
 	gd, ok = c.matchClient(rep, key, tunnel)
 	if !ok || !bytes.Equal(gd, data) {
 		t.Fatalf("matchClient: ok=%v data=%q", ok, gd)
@@ -44,7 +38,7 @@ func TestTCPCodecRoundTrip(t *testing.T) {
 	data := []byte("tcp-spf-payload-of-some-length")
 
 	// dialer -> server: srcPort=key, dstPort=tunnel
-	seg, _ := c.encode(src, dst, key, tunnel, 1, data, false)
+	seg := c.encode(nil, src, dst, key, tunnel, 1, data, false)
 	gd, gk, ok := c.parseServer(seg, tunnel)
 	if !ok || gk != key || !bytes.Equal(gd, data) {
 		t.Fatalf("parseServer: ok=%v key=%d data=%q", ok, gk, gd)
@@ -55,7 +49,7 @@ func TestTCPCodecRoundTrip(t *testing.T) {
 	}
 
 	// server -> dialer: srcPort=tunnel, dstPort=key
-	rep, _ := c.encode(src, dst, key, tunnel, 2, data, true)
+	rep := c.encode(nil, src, dst, key, tunnel, 2, data, true)
 	gd, ok = c.matchClient(rep, key, tunnel)
 	if !ok || !bytes.Equal(gd, data) {
 		t.Fatalf("matchClient: ok=%v data=%q", ok, gd)

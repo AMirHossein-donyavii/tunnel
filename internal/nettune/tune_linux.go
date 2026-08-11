@@ -13,8 +13,10 @@ import (
 // connection. All settings are best-effort; failures are ignored so a
 // restrictive kernel never breaks the tunnel.
 func Apply(c net.Conn, o Options) {
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
+	// Unwrap: ws/wss/stealth hand back a wrapper, not a *net.TCPConn, and used
+	// to fall straight through this function untuned. See baseTCPConn.
+	tc := baseTCPConn(c)
+	if tc == nil {
 		return
 	}
 	_ = tc.SetNoDelay(true)

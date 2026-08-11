@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -35,8 +36,6 @@ import (
 	"github.com/emergency-tunnel/et/internal/crypto"
 	"github.com/emergency-tunnel/et/internal/nettune"
 	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 // Direction tags. The first payload byte says which way a datagram is
@@ -69,7 +68,7 @@ func newICMPCarrier(mode string, cfg *config.Config, isDialer bool, cipher strin
 		return nil, nil, fmt.Errorf("icmp listen (%s): %w (needs CAP_NET_RAW)", p.network, err)
 	}
 	tuneICMPSocket(pc, cfg)
-	l := &icmpLinkListener{proto: p, pc: pc, cipher: cipher, flows: map[string]*icmpFlow{}, accept: make(chan *icmpFlow, 64), closed: make(chan struct{})}
+	l := &icmpLinkListener{proto: p, pc: pc, cipher: cipher, flows: map[icmpKey]*icmpFlow{}, accept: make(chan *icmpFlow, 64), closed: make(chan struct{})}
 	go l.route()
 	return nil, l, nil
 }
@@ -215,13 +214,38 @@ func (c *icmpConn) RemoteAddr() net.Addr               { return c.peer }
 
 // ---- listener / server -----------------------------------------------------
 
+// icmpKey identifies a flow by peer address and ICMP id.
+//
+// It used to be built with fmt.Sprintf on every inbound packet — formatting an
+// address into a string, twice over, on the single busiest path in the program.
+// A comparable struct is the same map lookup with nothing allocated and no
+// formatting at all.
+type icmpKey struct {
+	addr netip.Addr
+	id   uint16
+}
+
+func makeICMPKey(src net.Addr, id int) (icmpKey, bool) {
+	ipa, ok := src.(*net.IPAddr)
+	if !ok {
+		return icmpKey{}, false
+	}
+	a, ok := netip.AddrFromSlice(ipa.IP)
+	if !ok {
+		return icmpKey{}, false
+	}
+	return icmpKey{addr: a.Unmap(), id: uint16(id)}, true
+}
+
 type icmpLinkListener struct {
 	proto  icmpProto
 	pc     *icmp.PacketConn
 	cipher string
 
-	mu    sync.Mutex
-	flows map[string]*icmpFlow
+	mu sync.Mutex
+	// See icmpKey: the key is built for every packet the server receives, so it
+	// must not allocate.
+	flows map[icmpKey]*icmpFlow
 
 	accept    chan *icmpFlow
 	closeOnce sync.Once
@@ -255,7 +279,10 @@ func (l *icmpLinkListener) route() {
 		if !ok {
 			continue
 		}
-		key := fmt.Sprintf("%s/%d", src.String(), id)
+		key, ok := makeICMPKey(src, id)
+		if !ok {
+			continue
+		}
 		l.mu.Lock()
 		f := l.flows[key]
 		l.mu.Unlock()
@@ -283,7 +310,7 @@ func (l *icmpLinkListener) route() {
 	}
 }
 
-func (l *icmpLinkListener) remove(key string) {
+func (l *icmpLinkListener) remove(key icmpKey) {
 	l.mu.Lock()
 	delete(l.flows, key)
 	l.mu.Unlock()
@@ -327,7 +354,7 @@ type icmpFlow struct {
 	l        *icmpLinkListener
 	src      net.Addr
 	id       int
-	key      string
+	key      icmpKey
 	in       chan *[]byte
 	firstMsg []byte
 
@@ -388,110 +415,39 @@ func stripTag(data []byte, want byte) ([]byte, bool) {
 	return data[1:], true
 }
 
-// The echo header is a fixed eight bytes — type, code, two checksum bytes, then
-// id and seq as big-endian uint16s — with the payload immediately after. The
-// receive socket hands us the ICMP message with no IP header in front (that is
-// why icmp.ParseMessage worked on the same bytes: it reads offset 0 as the ICMP
-// type). Parsing those eight bytes by hand keeps the icmp.Message and
-// icmp.Echo allocation that ParseMessage makes off every received packet, which
-// on a single-core server is CPU that could have moved bytes instead. The
-// checksum is not verified here — the kernel already dropped anything corrupt,
-// and the AEAD rejects anything the kernel let through.
-const icmpEchoHdr = 8
-
 // parseEcho returns the echo payload when raw is an echo of the wanted id and
-// the wanted direction (reply when wantReply, else request).
+// the wanted direction (reply when wantReply, else request). See icmpframe.go
+// for the wire format.
 func parseEcho(p icmpProto, raw []byte, wantID int, wantReply bool) ([]byte, bool) {
-	if len(raw) < icmpEchoHdr {
+	payload, id, ok := parseEchoMsg(raw, p.v6, wantReply)
+	if !ok || id != wantID {
 		return nil, false
 	}
-	if raw[0] != echoTypeByte(p, wantReply) {
-		return nil, false
-	}
-	if int(raw[4])<<8|int(raw[5]) != wantID {
-		return nil, false
-	}
-	return raw[icmpEchoHdr:], true
+	return payload, true
 }
 
 func parseEchoRequest(p icmpProto, raw []byte) ([]byte, int, bool) {
-	if len(raw) < icmpEchoHdr {
-		return nil, 0, false
-	}
-	if raw[0] != echoTypeByte(p, false) {
-		return nil, 0, false
-	}
-	id := int(raw[4])<<8 | int(raw[5])
-	return raw[icmpEchoHdr:], id, true
+	return parseEchoMsg(raw, p.v6, false)
 }
 
 // ---- framing ---------------------------------------------------------------
-//
-// The echo header is eight bytes and never varies, so it is written directly
-// into a buffer the caller reuses. Building it through icmp.Message.Marshal
-// allocated a fresh slice for every packet — tens of thousands per second at
-// these rates, and on a one-core server that allocation and the collection it
-// causes come straight out of the budget for moving bytes.
 
-// appendEcho appends a complete ICMP echo *request* to dst.
+// appendEcho appends a complete ICMP echo *request* — header, direction tag,
+// payload — to dst, which the caller reuses across packets.
 func appendEcho(dst []byte, p icmpProto, id, seq int, tag byte, payload []byte) []byte {
-	return appendICMP(dst, echoTypeByte(p, false), id, seq, tag, payload, p.v6)
+	return appendTagged(dst, p, false, id, seq, tag, payload)
 }
 
 // appendReply appends a complete ICMP echo *reply* to dst.
 func appendReply(dst []byte, p icmpProto, id, seq int, tag byte, payload []byte) []byte {
-	return appendICMP(dst, echoTypeByte(p, true), id, seq, tag, payload, p.v6)
+	return appendTagged(dst, p, true, id, seq, tag, payload)
 }
 
-func echoTypeByte(p icmpProto, reply bool) byte {
-	if reply {
-		if p.v6 {
-			return byte(ipv6.ICMPTypeEchoReply)
-		}
-		return byte(ipv4.ICMPTypeEchoReply)
-	}
-	if p.v6 {
-		return byte(ipv6.ICMPTypeEchoRequest)
-	}
-	return byte(ipv4.ICMPTypeEcho)
-}
-
-func appendICMP(dst []byte, typ byte, id, seq int, tag byte, payload []byte, v6 bool) []byte {
-	dst = append(dst, typ, 0, 0, 0) // type, code, checksum placeholder
-	dst = append(dst, byte(id>>8), byte(id), byte(seq>>8), byte(seq))
+func appendTagged(dst []byte, p icmpProto, reply bool, id, seq int, tag byte, payload []byte) []byte {
+	off := len(dst)
+	dst = appendEchoHeader(dst, p.v6, reply, id, seq)
 	dst = append(dst, tag)
 	dst = append(dst, payload...)
-	if !v6 {
-		// ICMPv6 checksums cover a pseudo-header the kernel fills in for a raw
-		// socket, so leaving it zero there is not just allowed but required.
-		ck := checksum(dst)
-		dst[2], dst[3] = byte(ck>>8), byte(ck)
-	}
+	finishICMP(dst[off:], p.v6)
 	return dst
-}
-
-// checksum is the standard one's-complement sum used by ICMPv4. Unlike UDP,
-// whose checksum the kernel (often the NIC) computes, a raw ICMP socket leaves
-// it to us, so this runs over every byte of every packet sent — it is the one
-// per-packet cost the ICMP carrier pays and the UDP carrier does not. It folds
-// four bytes per iteration to keep that cost as low as the arithmetic allows;
-// the deferred carries cannot overflow uint64 within one datagram.
-func checksum(b []byte) uint16 {
-	var sum uint64
-	for len(b) >= 4 {
-		sum += uint64(b[0])<<8 | uint64(b[1])
-		sum += uint64(b[2])<<8 | uint64(b[3])
-		b = b[4:]
-	}
-	for len(b) >= 2 {
-		sum += uint64(b[0])<<8 | uint64(b[1])
-		b = b[2:]
-	}
-	if len(b) == 1 {
-		sum += uint64(b[0]) << 8
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
 }

@@ -133,14 +133,19 @@ type spfConn struct {
 	tunnelPort, key          int
 	seq                      uint32
 	rbuf                     []byte // reusable receive buffer (single reader)
+
+	wmu  sync.Mutex
+	wbuf []byte // reusable send buffer, guarded by wmu
 }
 
 func (c *spfConn) Write(b []byte) (int, error) {
+	// One buffer per conn, reused for every packet: encoding used to allocate a
+	// fresh segment each time, on the path that runs once per packet sent.
+	c.wmu.Lock()
 	c.seq++
-	l4, err := c.codec.encode(c.spoofSrc, c.peer, c.key, c.tunnelPort, int(c.seq&0xffff), b, false)
-	if err != nil {
-		return 0, err
-	}
+	c.wbuf = c.codec.encode(c.wbuf[:0], c.spoofSrc, c.peer, c.key, c.tunnelPort, int(c.seq&0xffff), b, false)
+	l4 := c.wbuf
+	c.wmu.Unlock()
 	if err := writeSpoofed(c.rc, c.codec.proto(), c.spoofSrc, c.peer, l4); err != nil {
 		return 0, err
 	}
@@ -294,7 +299,10 @@ type spfFlow struct {
 	key      int
 	in       chan *[]byte
 	firstMsg []byte
-	seq      uint32
+
+	wmu  sync.Mutex
+	seq  uint32
+	wbuf []byte // reusable send buffer, guarded by wmu
 
 	dg        deadlineGate
 	closeOnce sync.Once
@@ -312,11 +320,11 @@ func (f *spfFlow) Read(b []byte) (int, error) {
 }
 
 func (f *spfFlow) Write(b []byte) (int, error) {
+	f.wmu.Lock()
 	f.seq++
-	l4, err := f.l.codec.encode(f.l.spoofSrc, f.l.peer, f.key, f.l.tunnelPort, int(f.seq&0xffff), b, true)
-	if err != nil {
-		return 0, err
-	}
+	f.wbuf = f.l.codec.encode(f.wbuf[:0], f.l.spoofSrc, f.l.peer, f.key, f.l.tunnelPort, int(f.seq&0xffff), b, true)
+	l4 := f.wbuf
+	f.wmu.Unlock()
 	if err := writeSpoofed(f.l.rc, f.l.codec.proto(), f.l.spoofSrc, f.l.peer, l4); err != nil {
 		return 0, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -44,8 +45,13 @@ type udpLinkListener struct {
 	pc     *net.UDPConn
 	cipher string
 
-	mu     sync.Mutex
-	flows  map[string]*udpFlow
+	mu sync.Mutex
+	// Keyed by netip.AddrPort rather than the address formatted as a string.
+	// The key is built once per datagram on the busiest path in the program, and
+	// a string key means formatting an address — an allocation — for every packet
+	// the server receives, i.e. for every packet of the upload direction.
+	// AddrPort is a comparable value: the same lookup with nothing allocated.
+	flows  map[netip.AddrPort]*udpFlow
 	accept chan *udpFlow
 
 	closeOnce sync.Once
@@ -75,7 +81,7 @@ func newUDPListener(port, sndbuf, rcvbuf int, cipher string) (*udpLinkListener, 
 	l := &udpLinkListener{
 		pc:     pc,
 		cipher: cipher,
-		flows:  make(map[string]*udpFlow),
+		flows:  make(map[netip.AddrPort]*udpFlow),
 		accept: make(chan *udpFlow, 64),
 		closed: make(chan struct{}), q: newHandshakeQueue(),
 	}
@@ -90,7 +96,9 @@ func newUDPListener(port, sndbuf, rcvbuf int, cipher string) (*udpLinkListener, 
 func (l *udpLinkListener) route() {
 	buf := make([]byte, 64*1024)
 	for {
-		n, src, err := l.pc.ReadFromUDP(buf)
+		// ReadFromUDPAddrPort returns the peer as a value; ReadFromUDP allocated a
+		// *net.UDPAddr for every datagram, which on this path is per packet.
+		n, src, err := l.pc.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if isClosed(l.closed) || !isTransientReadErr(err) {
 				l.Close()
@@ -98,7 +106,7 @@ func (l *udpLinkListener) route() {
 			}
 			continue
 		}
-		key := src.String()
+		key := src
 		l.mu.Lock()
 		f := l.flows[key]
 		l.mu.Unlock()
@@ -128,7 +136,7 @@ func (l *udpLinkListener) route() {
 	}
 }
 
-func (l *udpLinkListener) remove(key string) {
+func (l *udpLinkListener) remove(key netip.AddrPort) {
 	l.mu.Lock()
 	delete(l.flows, key)
 	l.mu.Unlock()
@@ -175,8 +183,8 @@ func (l *udpLinkListener) Close() error {
 // datagram link.
 type udpFlow struct {
 	pc       *net.UDPConn
-	src      *net.UDPAddr
-	key      string
+	src      netip.AddrPort
+	key      netip.AddrPort
 	l        *udpLinkListener
 	in       chan *[]byte
 	firstMsg []byte
@@ -197,7 +205,7 @@ func (f *udpFlow) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-func (f *udpFlow) Write(b []byte) (int, error) { return f.pc.WriteToUDP(b, f.src) }
+func (f *udpFlow) Write(b []byte) (int, error) { return f.pc.WriteToUDPAddrPort(b, f.src) }
 
 func (f *udpFlow) SetReadDeadline(t time.Time) error {
 	f.dg.set(t)
@@ -211,7 +219,7 @@ func (f *udpFlow) Close() error {
 
 // The remaining net.Conn methods are unused by the link/handshake layer.
 func (f *udpFlow) LocalAddr() net.Addr                { return f.pc.LocalAddr() }
-func (f *udpFlow) RemoteAddr() net.Addr               { return f.src }
+func (f *udpFlow) RemoteAddr() net.Addr               { return net.UDPAddrFromAddrPort(f.src) }
 func (f *udpFlow) SetDeadline(t time.Time) error      { return f.SetReadDeadline(t) }
 func (f *udpFlow) SetWriteDeadline(t time.Time) error { return nil }
 

@@ -312,6 +312,13 @@ func newConn(c net.Conn, client bool) *Conn {
 }
 
 // Write emits p as a single binary frame.
+// NetConn returns the connection underneath the WebSocket framing.
+//
+// nettune.Apply needs the real TCP socket to set TCP_NODELAY and the rest; it
+// unwraps through this method. Without it every ws/wss tunnel ran with Nagle's
+// algorithm on and no bufferbloat guard.
+func (c *Conn) NetConn() net.Conn { return c.Conn }
+
 func (c *Conn) Write(p []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()

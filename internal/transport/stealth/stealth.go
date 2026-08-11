@@ -225,6 +225,10 @@ func newConn(raw net.Conn, sendKey, recvKey []byte) (net.Conn, error) {
 		plain: make([]byte, 0, maxRecord+maxPad+1)}, nil
 }
 
+// NetConn returns the connection underneath the stealth record layer, so
+// nettune.Apply can reach the TCP socket to tune it (see nettune.baseTCPConn).
+func (c *conn) NetConn() net.Conn { return c.Conn }
+
 func (c *conn) Write(p []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()

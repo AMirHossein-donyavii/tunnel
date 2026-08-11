@@ -5,8 +5,6 @@ import (
 	"net"
 
 	"github.com/emergency-tunnel/et/internal/config"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
 )
 
 // spfCodec encodes/decodes the L4 envelope for one SPF profile. It is pure
@@ -15,9 +13,13 @@ import (
 type spfCodec interface {
 	network() string // raw-socket network, e.g. "ip4:icmp" / "ip4:tcp"
 	proto() int      // IP protocol number (1 or 6)
-	// encode builds the L4 bytes for a datagram. key is the per-link id/port,
-	// tunnelPort is the fixed SPF port, reply marks the listener->dialer direction.
-	encode(spoofSrc, dst net.IP, key, tunnelPort, seq int, data []byte, reply bool) ([]byte, error)
+	// encode appends the L4 bytes for a datagram to buf and returns the result.
+	// key is the per-link id/port, tunnelPort is the fixed SPF port, reply marks
+	// the listener->dialer direction. It appends rather than returning a fresh
+	// slice so the caller can reuse one buffer for every packet it sends: this
+	// runs once per packet, and a per-packet allocation here is CPU that could
+	// have moved bytes instead.
+	encode(buf []byte, spoofSrc, dst net.IP, key, tunnelPort, seq int, data []byte, reply bool) []byte
 	// matchClient extracts data from an inbound packet addressed to myKey (dialer).
 	matchClient(p []byte, myKey, tunnelPort int) ([]byte, bool)
 	// parseServer extracts data + the sender's key from an inbound packet (listener).
@@ -38,37 +40,27 @@ type icmpCodec struct{}
 func (icmpCodec) network() string { return "ip4:icmp" }
 func (icmpCodec) proto() int      { return 1 }
 
-func (icmpCodec) encode(_, _ net.IP, key, _ int, seq int, data []byte, reply bool) ([]byte, error) {
-	typ := icmp.Type(ipv4.ICMPTypeEcho)
-	if reply {
-		typ = ipv4.ICMPTypeEchoReply
-	}
-	m := icmp.Message{Type: typ, Code: 0, Body: &icmp.Echo{ID: key, Seq: seq, Data: data}}
-	return m.Marshal(nil)
+// The echo message is built and read through the shared framing helpers rather
+// than golang.org/x/net/icmp, which allocated a message and a body per packet
+// in each direction. The bytes are identical — see the framing test.
+func (icmpCodec) encode(buf []byte, _, _ net.IP, key, _ int, seq int, data []byte, reply bool) []byte {
+	off := len(buf)
+	buf = appendEchoHeader(buf, false, reply, key, seq)
+	buf = append(buf, data...)
+	finishICMP(buf[off:], false)
+	return buf
 }
 
 func (icmpCodec) matchClient(p []byte, myKey, _ int) ([]byte, bool) {
-	m, err := icmp.ParseMessage(1, p)
-	if err != nil || m.Type != ipv4.ICMPTypeEchoReply {
+	data, id, ok := parseEchoMsg(p, false, true)
+	if !ok || id != myKey {
 		return nil, false
 	}
-	e, ok := m.Body.(*icmp.Echo)
-	if !ok || e.ID != myKey {
-		return nil, false
-	}
-	return e.Data, true
+	return data, true
 }
 
 func (icmpCodec) parseServer(p []byte, _ int) ([]byte, int, bool) {
-	m, err := icmp.ParseMessage(1, p)
-	if err != nil || m.Type != ipv4.ICMPTypeEcho {
-		return nil, 0, false
-	}
-	e, ok := m.Body.(*icmp.Echo)
-	if !ok {
-		return nil, 0, false
-	}
-	return e.Data, e.ID, true
+	return parseEchoMsg(p, false, false)
 }
 
 // ---- TCP codec (bare segments, no handshake) -------------------------------
@@ -80,12 +72,12 @@ func (tcpCodec) proto() int      { return 6 }
 
 // encode builds a minimal TCP segment: dialer uses srcPort=key,dstPort=tunnel;
 // listener replies with srcPort=tunnel,dstPort=key.
-func (tcpCodec) encode(spoofSrc, dst net.IP, key, tunnelPort, seq int, data []byte, reply bool) ([]byte, error) {
+func (tcpCodec) encode(buf []byte, spoofSrc, dst net.IP, key, tunnelPort, seq int, data []byte, reply bool) []byte {
 	srcPort, dstPort := key, tunnelPort
 	if reply {
 		srcPort, dstPort = tunnelPort, key
 	}
-	return buildTCP(spoofSrc, dst, srcPort, dstPort, uint32(seq), data), nil
+	return appendTCP(buf, spoofSrc, dst, srcPort, dstPort, uint32(seq), data)
 }
 
 func (tcpCodec) matchClient(p []byte, myKey, _ int) ([]byte, bool) {
@@ -104,17 +96,22 @@ func (tcpCodec) parseServer(p []byte, tunnelPort int) ([]byte, int, bool) {
 	return data, srcPort, true
 }
 
-func buildTCP(src, dst net.IP, srcPort, dstPort int, seq uint32, data []byte) []byte {
-	seg := make([]byte, 20+len(data))
-	binary.BigEndian.PutUint16(seg[0:], uint16(srcPort))
-	binary.BigEndian.PutUint16(seg[2:], uint16(dstPort))
-	binary.BigEndian.PutUint32(seg[4:], seq)
-	seg[12] = 5 << 4 // data offset = 5 words (20 bytes), no options
-	seg[13] = 0x18   // PSH | ACK
-	binary.BigEndian.PutUint16(seg[14:], 0xffff)
-	copy(seg[20:], data)
+// appendTCP appends a minimal TCP segment to buf. Like the icmp codec it
+// appends into the caller's buffer so sending a packet allocates nothing.
+func appendTCP(buf []byte, src, dst net.IP, srcPort, dstPort int, seq uint32, data []byte) []byte {
+	off := len(buf)
+	var hdr [20]byte
+	binary.BigEndian.PutUint16(hdr[0:], uint16(srcPort))
+	binary.BigEndian.PutUint16(hdr[2:], uint16(dstPort))
+	binary.BigEndian.PutUint32(hdr[4:], seq)
+	hdr[12] = 5 << 4 // data offset = 5 words (20 bytes), no options
+	hdr[13] = 0x18   // PSH | ACK
+	binary.BigEndian.PutUint16(hdr[14:], 0xffff)
+	buf = append(buf, hdr[:]...)
+	buf = append(buf, data...)
+	seg := buf[off:]
 	binary.BigEndian.PutUint16(seg[16:], tcpChecksum(src, dst, seg))
-	return seg
+	return buf
 }
 
 func parseTCP(p []byte) (data []byte, srcPort, dstPort int, ok bool) {
