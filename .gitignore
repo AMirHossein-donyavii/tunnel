@@ -7,6 +7,7 @@
 /et-core
 /et-core-linux-*
 /et-core-check
+/et-core-test
 *.exe
 
 # Signing material — NEVER commit secret keys

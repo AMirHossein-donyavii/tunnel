@@ -33,6 +33,7 @@ import (
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/crypto"
+	"github.com/emergency-tunnel/et/internal/nettune"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -47,29 +48,27 @@ const (
 )
 
 type icmpProto struct {
-	network   string // "ip4:icmp" or "ip6:ipv6-icmp"
-	echoType  icmp.Type
-	replyType icmp.Type
-	protoNum  int // 1 (ICMPv4) or 58 (ICMPv6)
-	v6        bool
+	network string // "ip4:icmp" or "ip6:ipv6-icmp"
+	v6      bool
 }
 
 func protoFor(mode string) icmpProto {
 	if mode == config.TunModeBIP {
-		return icmpProto{"ip6:ipv6-icmp", ipv6.ICMPTypeEchoRequest, ipv6.ICMPTypeEchoReply, 58, true}
+		return icmpProto{"ip6:ipv6-icmp", true}
 	}
-	return icmpProto{"ip4:icmp", ipv4.ICMPTypeEcho, ipv4.ICMPTypeEchoReply, 1, false}
+	return icmpProto{"ip4:icmp", false}
 }
 
 func newICMPCarrier(mode string, cfg *config.Config, isDialer bool, cipher string) (linkDialer, linkListener, error) {
 	p := protoFor(mode)
 	if isDialer {
-		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher}, nil, nil
+		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher, cfg: cfg}, nil, nil
 	}
 	pc, err := icmp.ListenPacket(p.network, "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("icmp listen (%s): %w (needs CAP_NET_RAW)", p.network, err)
 	}
+	tuneICMPSocket(pc, cfg)
 	l := &icmpLinkListener{proto: p, pc: pc, cipher: cipher, flows: map[string]*icmpFlow{}, accept: make(chan *icmpFlow, 64), closed: make(chan struct{})}
 	go l.route()
 	return nil, l, nil
@@ -81,6 +80,42 @@ type icmpLinkDialer struct {
 	proto  icmpProto
 	peer   string
 	cipher string
+	cfg    *config.Config
+}
+
+// tuneICMPSocket sizes the raw socket's buffers.
+//
+// It used to size neither, so the carrier ran on the kernel's default receive
+// buffer — a couple of hundred kilobytes. A tunnel does not deliver its traffic
+// evenly: it arrives in bursts, and a burst larger than the socket queue is
+// discarded by the kernel before this process ever sees it. That is packet loss
+// the tunnel creates for itself, and on a carrier chosen precisely because the
+// path is difficult it is indistinguishable from the path being at fault.
+//
+// The receive side is sized generously because a datagram socket has no
+// autotuning and an over-large receive queue costs only memory — it cannot
+// cause the standing delay an over-large *send* queue does, which is why the
+// send side keeps the profile's modest size and the tunnel's own scheduler
+// stays the place where queueing happens.
+func tuneICMPSocket(pc *icmp.PacketConn, cfg *config.Config) {
+	snd, rcv := nettune.BufSizes(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
+	type bufConn interface {
+		SetReadBuffer(int) error
+		SetWriteBuffer(int) error
+	}
+	// The v4 and v6 raw sockets are reached through different accessors; using
+	// the wrong one silently sizes nothing, which is the failure this whole
+	// function exists to remove.
+	var inner interface{}
+	if p6 := pc.IPv6PacketConn(); p6 != nil {
+		inner = p6.PacketConn
+	} else if p4 := pc.IPv4PacketConn(); p4 != nil {
+		inner = p4.PacketConn
+	}
+	if c, ok := inner.(bufConn); ok {
+		_ = c.SetReadBuffer(rcv)
+		_ = c.SetWriteBuffer(snd)
+	}
 }
 
 func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
@@ -88,6 +123,7 @@ func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("icmp socket: %w (needs CAP_NET_RAW)", err)
 	}
+	tuneICMPSocket(pc, d.cfg)
 	ipnet := "ip4"
 	if d.proto.v6 {
 		ipnet = "ip6"
@@ -124,19 +160,15 @@ type icmpConn struct {
 	mu      sync.Mutex
 	seq     uint32
 	scratch []byte
+	rbuf    []byte // receive buffer, owned by the single reader
 }
 
 func (c *icmpConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	c.seq++
-	c.scratch = append(append(c.scratch[:0], tagToListener), b...)
-	m := icmp.Message{Type: c.proto.echoType, Code: 0,
-		Body: &icmp.Echo{ID: c.id, Seq: int(c.seq & 0xffff), Data: c.scratch}}
-	out, err := m.Marshal(nil) // copies scratch, which is free to reuse after
+	c.scratch = appendEcho(c.scratch[:0], c.proto, c.id, int(c.seq&0xffff), tagToListener, b)
+	out := c.scratch
 	c.mu.Unlock()
-	if err != nil {
-		return 0, err
-	}
 	if _, err := c.pc.WriteTo(out, c.peer); err != nil {
 		return 0, err
 	}
@@ -144,7 +176,14 @@ func (c *icmpConn) Write(b []byte) (int, error) {
 }
 
 func (c *icmpConn) Read(b []byte) (int, error) {
-	buf := make([]byte, len(b)+64)
+	// One reader per connection (the datagram link pumps it), so a buffer owned
+	// by the conn is safe and removes an allocation from every packet — which on
+	// a single-core server is a measurable share of the CPU that could have been
+	// spent moving bytes.
+	if cap(c.rbuf) < len(b)+64 {
+		c.rbuf = make([]byte, len(b)+64)
+	}
+	buf := c.rbuf[:len(b)+64]
 	for {
 		n, _, err := c.pc.ReadFrom(buf)
 		if err != nil {
@@ -314,14 +353,9 @@ func (f *icmpFlow) Read(b []byte) (int, error) {
 func (f *icmpFlow) Write(b []byte) (int, error) {
 	f.wmu.Lock()
 	f.seq++
-	f.scratch = append(append(f.scratch[:0], tagToDialer), b...)
-	m := icmp.Message{Type: f.l.proto.replyType, Code: 0,
-		Body: &icmp.Echo{ID: f.id, Seq: int(f.seq & 0xffff), Data: f.scratch}}
-	out, err := m.Marshal(nil)
+	f.scratch = appendReply(f.scratch[:0], f.l.proto, f.id, int(f.seq&0xffff), tagToDialer, b)
+	out := f.scratch
 	f.wmu.Unlock()
-	if err != nil {
-		return 0, err
-	}
 	if _, err := f.l.pc.WriteTo(out, f.src); err != nil {
 		return 0, err
 	}
@@ -354,32 +388,110 @@ func stripTag(data []byte, want byte) ([]byte, bool) {
 	return data[1:], true
 }
 
-// parseEcho parses an ICMP message and returns the Echo body data if it matches
-// the wanted id and (reply?reply:request) type.
+// The echo header is a fixed eight bytes — type, code, two checksum bytes, then
+// id and seq as big-endian uint16s — with the payload immediately after. The
+// receive socket hands us the ICMP message with no IP header in front (that is
+// why icmp.ParseMessage worked on the same bytes: it reads offset 0 as the ICMP
+// type). Parsing those eight bytes by hand keeps the icmp.Message and
+// icmp.Echo allocation that ParseMessage makes off every received packet, which
+// on a single-core server is CPU that could have moved bytes instead. The
+// checksum is not verified here — the kernel already dropped anything corrupt,
+// and the AEAD rejects anything the kernel let through.
+const icmpEchoHdr = 8
+
+// parseEcho returns the echo payload when raw is an echo of the wanted id and
+// the wanted direction (reply when wantReply, else request).
 func parseEcho(p icmpProto, raw []byte, wantID int, wantReply bool) ([]byte, bool) {
-	m, err := icmp.ParseMessage(p.protoNum, raw)
-	if err != nil {
+	if len(raw) < icmpEchoHdr {
 		return nil, false
 	}
-	echo, ok := m.Body.(*icmp.Echo)
-	if !ok || echo.ID != wantID {
+	if raw[0] != echoTypeByte(p, wantReply) {
 		return nil, false
 	}
-	isReply := m.Type == p.replyType
-	if isReply != wantReply {
+	if int(raw[4])<<8|int(raw[5]) != wantID {
 		return nil, false
 	}
-	return echo.Data, true
+	return raw[icmpEchoHdr:], true
 }
 
 func parseEchoRequest(p icmpProto, raw []byte) ([]byte, int, bool) {
-	m, err := icmp.ParseMessage(p.protoNum, raw)
-	if err != nil || m.Type != p.echoType {
+	if len(raw) < icmpEchoHdr {
 		return nil, 0, false
 	}
-	echo, ok := m.Body.(*icmp.Echo)
-	if !ok {
+	if raw[0] != echoTypeByte(p, false) {
 		return nil, 0, false
 	}
-	return echo.Data, echo.ID, true
+	id := int(raw[4])<<8 | int(raw[5])
+	return raw[icmpEchoHdr:], id, true
+}
+
+// ---- framing ---------------------------------------------------------------
+//
+// The echo header is eight bytes and never varies, so it is written directly
+// into a buffer the caller reuses. Building it through icmp.Message.Marshal
+// allocated a fresh slice for every packet — tens of thousands per second at
+// these rates, and on a one-core server that allocation and the collection it
+// causes come straight out of the budget for moving bytes.
+
+// appendEcho appends a complete ICMP echo *request* to dst.
+func appendEcho(dst []byte, p icmpProto, id, seq int, tag byte, payload []byte) []byte {
+	return appendICMP(dst, echoTypeByte(p, false), id, seq, tag, payload, p.v6)
+}
+
+// appendReply appends a complete ICMP echo *reply* to dst.
+func appendReply(dst []byte, p icmpProto, id, seq int, tag byte, payload []byte) []byte {
+	return appendICMP(dst, echoTypeByte(p, true), id, seq, tag, payload, p.v6)
+}
+
+func echoTypeByte(p icmpProto, reply bool) byte {
+	if reply {
+		if p.v6 {
+			return byte(ipv6.ICMPTypeEchoReply)
+		}
+		return byte(ipv4.ICMPTypeEchoReply)
+	}
+	if p.v6 {
+		return byte(ipv6.ICMPTypeEchoRequest)
+	}
+	return byte(ipv4.ICMPTypeEcho)
+}
+
+func appendICMP(dst []byte, typ byte, id, seq int, tag byte, payload []byte, v6 bool) []byte {
+	dst = append(dst, typ, 0, 0, 0) // type, code, checksum placeholder
+	dst = append(dst, byte(id>>8), byte(id), byte(seq>>8), byte(seq))
+	dst = append(dst, tag)
+	dst = append(dst, payload...)
+	if !v6 {
+		// ICMPv6 checksums cover a pseudo-header the kernel fills in for a raw
+		// socket, so leaving it zero there is not just allowed but required.
+		ck := checksum(dst)
+		dst[2], dst[3] = byte(ck>>8), byte(ck)
+	}
+	return dst
+}
+
+// checksum is the standard one's-complement sum used by ICMPv4. Unlike UDP,
+// whose checksum the kernel (often the NIC) computes, a raw ICMP socket leaves
+// it to us, so this runs over every byte of every packet sent — it is the one
+// per-packet cost the ICMP carrier pays and the UDP carrier does not. It folds
+// four bytes per iteration to keep that cost as low as the arithmetic allows;
+// the deferred carries cannot overflow uint64 within one datagram.
+func checksum(b []byte) uint16 {
+	var sum uint64
+	for len(b) >= 4 {
+		sum += uint64(b[0])<<8 | uint64(b[1])
+		sum += uint64(b[2])<<8 | uint64(b[3])
+		b = b[4:]
+	}
+	for len(b) >= 2 {
+		sum += uint64(b[0])<<8 | uint64(b[1])
+		b = b[2:]
+	}
+	if len(b) == 1 {
+		sum += uint64(b[0]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }

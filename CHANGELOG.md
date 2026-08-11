@@ -4,6 +4,42 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.3.1] — 2026-08-11
+
+The ICMP/BIP carrier gets the socket sizing and the per-packet budget the other
+datagram carriers already had. Wire format is unchanged — a 2.3.1 end
+interoperates with a 2.3.0 end — so either side may upgrade on its own.
+
+### Changed
+
+- **Datagram carriers now size their receive queue to absorb bursts.** Both the
+  send and receive socket buffers were set to the same profile number; the
+  receive side is now several times larger while the send side stays small. A
+  tunnel's traffic arrives in bursts, and a burst larger than the receive queue
+  is dropped by the kernel before the process sees it — loss the tunnel inflicts
+  on itself, on the very carriers chosen because the path is already hard. An
+  over-large receive queue costs only memory and adds no delay; an over-large
+  *send* queue would add standing delay, so it is left small and queueing stays
+  in the tunnel's own CoDel-managed scheduler. (fast 4/8 MiB, balance 1/4 MiB,
+  resource 256 KiB / 2 MiB send/recv.)
+
+- **The ICMP/BIP carrier sizes its socket buffers.** It set neither, so it alone
+  ran on the kernel default of a couple hundred KiB and dropped bursts the UDP
+  and SPF carriers absorbed.
+
+### Performance
+
+- **The ICMP/BIP hot path no longer allocates per packet.** Every send built its
+  echo through `icmp.Message.Marshal`, every receive parsed through
+  `icmp.ParseMessage`, and each read allocated a fresh buffer — tens of thousands
+  of allocations a second at line rate, and on a one-core VPS that is CPU that
+  could have moved bytes. Sends now write the fixed eight-byte echo header into a
+  reused buffer, receives parse those eight bytes directly, and the read buffer
+  is owned by the connection. The framing is asserted byte-for-byte against the
+  library it replaced, for both ICMPv4 and ICMPv6. On a CPU-bound loopback bed
+  the ICMP carrier rose from ~440 to ~625 Mbit/s; the real-path effect is the
+  bursts the larger receive queue no longer drops.
+
 ## [2.3.0] — 2026-08-11
 
 Throughput, in the two places a fixed number was standing in for the path.

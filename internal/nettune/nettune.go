@@ -87,13 +87,27 @@ func LinkOptions(profile string, sndOverride, rcvOverride int) Options {
 // BufSizes resolves send/recv socket buffer sizes for a profile. Non-zero
 // overrides take precedence. A return of 0 means "leave the OS default".
 func BufSizes(profile string, sndOverride, rcvOverride int) (snd, rcv int) {
+	// Datagram carriers only (TCP links leave both to the kernel — see
+	// LinkOptions). The two sides are sized differently on purpose.
+	//
+	// The receive side is generous. A datagram socket has no autotuning, traffic
+	// arrives in bursts, and a burst larger than the socket queue is dropped by
+	// the kernel before this process sees it — packet loss the tunnel inflicts on
+	// itself, on carriers picked precisely because the path is already difficult.
+	// An over-large receive queue costs only memory; it cannot add delay, because
+	// nothing waits in it.
+	//
+	// The send side stays small. There the queue is delay: bytes sitting in the
+	// socket are bytes the scheduler can no longer reorder, so an express packet
+	// ends up behind whatever bulk was handed down earlier. Queueing belongs in
+	// the tunnel's own scheduler, where CoDel can measure it.
 	switch profile {
 	case "fast":
-		snd, rcv = 4<<20, 4<<20 // 4 MiB: maximise throughput on roomy links
+		snd, rcv = 4<<20, 8<<20
 	case "resource":
-		snd, rcv = 256<<10, 256<<10 // 256 KiB: minimise memory on tiny VPS
+		snd, rcv = 256<<10, 2<<20 // small send queue, room to absorb bursts
 	default: // balance
-		snd, rcv = 1<<20, 1<<20 // 1 MiB
+		snd, rcv = 1<<20, 4<<20
 	}
 	if sndOverride > 0 {
 		snd = sndOverride

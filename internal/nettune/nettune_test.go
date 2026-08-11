@@ -66,3 +66,23 @@ func TestLinkLeavesSocketBuffersToTheKernel(t *testing.T) {
 		}
 	}
 }
+
+// Datagram carriers have no autotuning, so their receive queue must be big
+// enough to absorb a burst. Anything it cannot hold the kernel discards before
+// the tunnel sees it — loss the tunnel causes itself, on the carriers chosen
+// because the path was already hard.
+func TestDatagramReceiveBufferAbsorbsBursts(t *testing.T) {
+	const floor = 2 << 20
+	for _, profile := range []string{"fast", "balance", "resource"} {
+		snd, rcv := BufSizes(profile, 0, 0)
+		if rcv < floor {
+			t.Errorf("%s: receive buffer %d is below the %d floor — bursts will be dropped",
+				profile, rcv, floor)
+		}
+		// The send side is deliberately the smaller of the two: queue there is
+		// delay the scheduler can no longer do anything about.
+		if snd > rcv {
+			t.Errorf("%s: send buffer %d exceeds receive %d", profile, snd, rcv)
+		}
+	}
+}
