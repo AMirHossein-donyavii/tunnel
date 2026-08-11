@@ -172,7 +172,7 @@ func (e *Engine) buildCarrier(cfg *config.Config, log *logx.Logger) error {
 			if err != nil {
 				return err
 			}
-			e.llistener = &tcpLinkListener{l: l, cipher: e.cipher, tune: tune}
+			e.llistener = &tcpLinkListener{l: l, cipher: e.cipher, tune: tune, q: newHandshakeQueue()}
 		}
 	}
 	return nil

@@ -187,6 +187,9 @@ type icmpLinkListener struct {
 	accept    chan *icmpFlow
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	once sync.Once
+	q    *handshakeQueue
 }
 
 func (l *icmpLinkListener) route() {
@@ -248,19 +251,31 @@ func (l *icmpLinkListener) remove(key string) {
 }
 
 func (l *icmpLinkListener) AcceptLink() (link, error) {
-	for {
-		select {
-		case f := <-l.accept:
-			dg, err := crypto.ServerHandshakePacket(f, l.cipher, f.firstMsg)
-			if err != nil {
-				f.Close()
-				continue
+	l.once.Do(l.start)
+	return l.q.next()
+}
+
+// start drains accepted flows, handshaking each in its own goroutine — see
+// handshakeQueue for why this must not happen on the accept path.
+func (l *icmpLinkListener) start() {
+	go func() {
+		for {
+			select {
+			case f := <-l.accept:
+				l.q.submit(func() (link, error) {
+					dg, err := crypto.ServerHandshakePacket(f, l.cipher, f.firstMsg)
+					if err != nil {
+						f.Close()
+						return nil, err
+					}
+					return newDatagramLink(f, dg), nil
+				}, func() { f.Close() })
+			case <-l.closed:
+				l.q.close()
+				return
 			}
-			return newDatagramLink(f, dg), nil
-		case <-l.closed:
-			return nil, fmt.Errorf("icmp listener closed")
 		}
-	}
+	}()
 }
 
 func (l *icmpLinkListener) Close() error {

@@ -2,7 +2,6 @@ package l3
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -51,6 +50,9 @@ type udpLinkListener struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	once sync.Once
+	q    *handshakeQueue
 }
 
 // setUDPBuffers applies best-effort socket buffer sizes; failures are ignored so
@@ -75,7 +77,7 @@ func newUDPListener(port, sndbuf, rcvbuf int, cipher string) (*udpLinkListener, 
 		cipher: cipher,
 		flows:  make(map[string]*udpFlow),
 		accept: make(chan *udpFlow, 64),
-		closed: make(chan struct{}),
+		closed: make(chan struct{}), q: newHandshakeQueue(),
 	}
 	go l.route()
 	return l, nil
@@ -133,19 +135,32 @@ func (l *udpLinkListener) remove(key string) {
 }
 
 func (l *udpLinkListener) AcceptLink() (link, error) {
-	for {
-		select {
-		case f := <-l.accept:
-			dg, err := crypto.ServerHandshakePacket(f, l.cipher, f.firstMsg)
-			if err != nil {
-				f.Close()
-				continue
+	l.once.Do(l.start)
+	return l.q.next()
+}
+
+// start drains accepted flows, handshaking each in its own goroutine. Doing it
+// inline would let one flow that never completes its handshake hold up every
+// real peer behind it for the full handshake timeout (see handshakeQueue).
+func (l *udpLinkListener) start() {
+	go func() {
+		for {
+			select {
+			case f := <-l.accept:
+				l.q.submit(func() (link, error) {
+					dg, err := crypto.ServerHandshakePacket(f, l.cipher, f.firstMsg)
+					if err != nil {
+						f.Close()
+						return nil, err
+					}
+					return newDatagramLink(f, dg), nil
+				}, func() { f.Close() })
+			case <-l.closed:
+				l.q.close()
+				return
 			}
-			return newDatagramLink(f, dg), nil
-		case <-l.closed:
-			return nil, errors.New("udp listener closed")
 		}
-	}
+	}()
 }
 
 func (l *udpLinkListener) Close() error {

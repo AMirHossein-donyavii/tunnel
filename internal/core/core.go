@@ -27,7 +27,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "2.0.4"
+var CoreVersion = "2.0.5"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"

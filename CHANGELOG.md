@@ -4,6 +4,25 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.5] — 2026-08-10
+
+### Fixed
+
+- **A port scanner could hold a TUN tunnel down.** The L3 engine ran each peer's
+  handshake on the accept path itself, so a connection that opened the tunnel
+  port and then said nothing was charged to every real link queued behind it —
+  the full handshake timeout, serially, per silent connection. The listening side
+  is a public address, so this is not a rare event.
+
+  Measured on a two-namespace testbed, time until the tunnel established its
+  first link: no silent connections 0.5s, one 9.6s, three 29.7s. After the fix it
+  is 0.5s with ten of them held open.
+
+  Each handshake now runs in its own goroutine and only finished links reach the
+  accept loop, with a ceiling on how many can be in flight so a flood is shed
+  rather than queued. Applies to all four TUN carriers. The mux and direct
+  engines already did this correctly and are unchanged.
+
 ## [2.0.4] — 2026-08-10
 
 ### Fixed
