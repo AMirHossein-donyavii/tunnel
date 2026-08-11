@@ -251,7 +251,7 @@ func (l *icmpLinkListener) remove(key string) {
 }
 
 func (l *icmpLinkListener) AcceptLink() (link, error) {
-	l.once.Do(l.start)
+	l.once.Do(func() { ensureQueue(&l.q); l.start() })
 	return l.q.next()
 }
 

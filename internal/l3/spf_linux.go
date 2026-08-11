@@ -257,7 +257,7 @@ func (l *spfLinkListener) remove(key int) {
 }
 
 func (l *spfLinkListener) AcceptLink() (link, error) {
-	l.once.Do(l.start)
+	l.once.Do(func() { ensureQueue(&l.q); l.start() })
 	return l.q.next()
 }
 

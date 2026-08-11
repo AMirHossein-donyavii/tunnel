@@ -216,6 +216,17 @@ func (q *handshakeQueue) submit(shake func() (link, error), drop func()) {
 	}()
 }
 
+// ensure returns the queue, creating it on first use. Callers reach it only
+// through here, so a listener cannot be constructed without one — which is
+// exactly what happened to the icmp and spf listeners, and cost a nil
+// dereference on the first connection rather than a compile error.
+func ensureQueue(q **handshakeQueue) *handshakeQueue {
+	if *q == nil {
+		*q = newHandshakeQueue()
+	}
+	return *q
+}
+
 func (q *handshakeQueue) next() (link, error) {
 	select {
 	case lk := <-q.ready:
@@ -239,7 +250,7 @@ type tcpLinkListener struct {
 }
 
 func (t *tcpLinkListener) AcceptLink() (link, error) {
-	t.once.Do(t.start)
+	t.once.Do(func() { ensureQueue(&t.q); t.start() })
 	return t.q.next()
 }
 
@@ -276,6 +287,8 @@ func (t *tcpLinkListener) start() {
 }
 
 func (t *tcpLinkListener) Close() error {
-	t.q.close()
+	if t.q != nil {
+		t.q.close()
+	}
 	return t.l.Close()
 }

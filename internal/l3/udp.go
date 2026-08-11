@@ -135,7 +135,7 @@ func (l *udpLinkListener) remove(key string) {
 }
 
 func (l *udpLinkListener) AcceptLink() (link, error) {
-	l.once.Do(l.start)
+	l.once.Do(func() { ensureQueue(&l.q); l.start() })
 	return l.q.next()
 }
 

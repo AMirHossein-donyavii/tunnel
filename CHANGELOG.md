@@ -4,6 +4,26 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.2] — 2026-08-11
+
+### Fixed
+
+- **TUN/ICMP and SPF crashed on the first connection.** 2.0.5 moved peer
+  handshakes off the accept path by giving each listener a queue, added to the
+  four constructors by hand — and two were missed. `AcceptLink` then dereferenced
+  a nil queue, the process died with SIGSEGV, systemd restarted it, and the
+  tunnel crash-looped until systemd gave up. Both carriers have been unusable
+  since 2.0.5.
+
+  The queue is now created where it is first used rather than in each
+  constructor, so there is nothing left to forget. A test builds every listener
+  as a zero value — exactly the "constructor forgot" case — and requires that
+  accepting still works; the tests that shipped with the bug exercised the queue
+  directly and never the listeners, which is why all of them passed.
+
+  Verified end to end on a two-namespace testbed: all three TUN carriers now
+  carry traffic at 0% loss with no panic in the logs.
+
 ## [2.2.1] — 2026-08-11
 
 ### Fixed
