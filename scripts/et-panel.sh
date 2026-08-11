@@ -13,8 +13,9 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 CORE="/usr/local/bin/et-core"
+PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
 LOG_DIR="/var/log/emergency-tunnel"
 LIB_DIR="/usr/local/lib/emergency-tunnel"
@@ -80,8 +81,9 @@ ART
     # menus are the old ones even though the core is current. Say so here rather
     # than letting it be discovered protocol by protocol.
     if [ "$cv" != "—" ] && [ "$cv" != "$SCRIPT_VERSION" ]; then
-        printf "  ${YEL}! panel v%s and core v%s are from different releases — re-run the installer${R}\n" \
+        printf "  ${YEL}! panel v%s and core v%s are from different releases${R}\n" \
             "$SCRIPT_VERSION" "$cv"
+        printf "  ${GRY}  leave this console and run 'et' again; if it persists, re-run the installer${R}\n"
     fi
     rule
 }
@@ -1114,6 +1116,15 @@ update_core() {
     yesno "Download and install the latest version?" "y" || return
     if curl -fsSL "$url" | bash; then
         ok "update complete"; migrate_configs
+        # The file on disk is new; this process is not. A shell runs the script
+        # it was started with, so without re-execing, the console keeps showing
+        # the old version and the old menus — a new section simply is not there —
+        # while the core reports the new version, because that is read by running
+        # et-core afresh each time. That reads exactly like a broken update.
+        echo
+        note "Restarting the console on the new version…"
+        sleep 1
+        exec "$PANEL" || exec et
     else bad "update failed — the existing install is untouched"; fi
     pause
 }

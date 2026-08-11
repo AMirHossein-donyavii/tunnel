@@ -4,6 +4,20 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] — 2026-08-11
+
+### Fixed
+
+- **The console kept running its old self after updating itself.** `et` → Update
+  replaces the script on disk, but a shell runs the script it was started with:
+  the process stayed on the old version, so the header showed the old panel
+  number and the menus were the old menus — a newly added section simply was not
+  there — while the core reported the new version, because that is read by
+  running `et-core` afresh each time. It reads exactly like a broken update, and
+  the only thing needed was to leave the console and start it again. It now
+  re-execs itself once the update succeeds, and the version-mismatch warning
+  names that as the first thing to try.
+
 ## [2.2.0] — 2026-08-11
 
 ### Added
