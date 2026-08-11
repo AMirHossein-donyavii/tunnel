@@ -26,6 +26,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -215,21 +216,26 @@ func serverHandshake(c net.Conn, path string) error {
 	if err != nil {
 		return err
 	}
-	// Path first: an unrelated probe should see an ordinary web server's 404
-	// rather than a protocol complaint that hints something else lives here.
+	// Anything that is not a genuine tunnel connection is served a website.
+	//
+	// Looking like a web server only to our own client is not enough: a browser
+	// that opens the address, a scanner sweeping the port, or an active probe
+	// must all get a plausible page. A 404 is a fingerprint of its own — a real
+	// site has a homepage — and a 400 saying the request was not an upgrade
+	// announces that something here speaks WebSocket.
 	if path != "/" && req.URL.Path != path {
-		writeHTTPError(c, "404 Not Found")
+		writeDecoy(c)
 		return fmt.Errorf("ws: unexpected path %q", req.URL.Path)
 	}
 	if req.Method != http.MethodGet ||
 		!strings.EqualFold(req.Header.Get("Upgrade"), "websocket") ||
 		!strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade") {
-		writeHTTPError(c, "400 Bad Request")
+		writeDecoy(c)
 		return fmt.Errorf("ws: not an upgrade request")
 	}
 	key := req.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
-		writeHTTPError(c, "400 Bad Request")
+		writeDecoy(c)
 		return fmt.Errorf("ws: missing Sec-WebSocket-Key")
 	}
 	if br.Buffered() > 0 {
@@ -244,8 +250,45 @@ func serverHandshake(c net.Conn, path string) error {
 	return err
 }
 
-func writeHTTPError(c net.Conn, status string) {
-	_, _ = io.WriteString(c, "HTTP/1.1 "+status+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+// decoyPage is the most ordinary thing on the web: the placeholder a freshly
+// installed web server shows. Nothing about it suggests a tunnel.
+const decoyPage = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+`
+
+// writeDecoy answers as an ordinary web server would. It is deliberately a 200
+// with a real page: the point is that a probe cannot tell this port from a host
+// that is simply serving a default site.
+func writeDecoy(c net.Conn) {
+	body := decoyPage
+	_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\n"+
+		"Server: nginx\r\n"+
+		"Content-Type: text/html\r\n"+
+		"Content-Length: "+strconv.Itoa(len(body))+"\r\n"+
+		"Connection: close\r\n\r\n"+body)
 }
 
 // ---- framed connection ------------------------------------------------------
@@ -408,4 +451,36 @@ func (c *Conn) readFrame() (byte, []byte, error) {
 		}
 	}
 	return opcode, buf, nil
+}
+
+// ---- reuse by the TLS variant ----------------------------------------------
+//
+// The wss transport is this framing over TLS. It needs the same upgrade and the
+// same Conn, so both are exposed here rather than duplicated there — a second
+// copy of a handshake is a second place for the decoy behaviour to drift out of
+// step with this one.
+
+// NewClientHandshaker returns a function that performs the WebSocket upgrade
+// over an already-established connection and wraps it in this framing.
+func NewClientHandshaker(cfg *config.Config) func(net.Conn) (net.Conn, error) {
+	host, path := hostOrDefault(cfg.WSHost, cfg.Peer), pathOrDefault(cfg.WSPath)
+	return func(c net.Conn) (net.Conn, error) {
+		if err := clientHandshake(c, host, path); err != nil {
+			return nil, err
+		}
+		return newConn(c, true), nil
+	}
+}
+
+// NewServerHandshaker is the listening side of NewClientHandshaker. Anything
+// that is not a genuine tunnel connection is served the decoy page, exactly as
+// on the plaintext transport.
+func NewServerHandshaker(cfg *config.Config) func(net.Conn) (net.Conn, error) {
+	path := pathOrDefault(cfg.WSPath)
+	return func(c net.Conn) (net.Conn, error) {
+		if err := serverHandshake(c, path); err != nil {
+			return nil, err
+		}
+		return newConn(c, false), nil
+	}
 }

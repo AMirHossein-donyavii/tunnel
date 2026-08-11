@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/logx"
@@ -147,4 +149,70 @@ func TestWSConcurrentReadWrite(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// Anything that is not a genuine tunnel connection must look like a website.
+//
+// The listener used to answer a 404 for a wrong path and a 400 for a
+// non-upgrade request. Both are tells: a real site has a homepage, and a
+// complaint that the request was not an upgrade announces that something here
+// speaks WebSocket.
+func TestProbeSeesAWebsite(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_ = serverHandshake(c, "/tunnel")
+				c.Close()
+			}()
+		}
+	}()
+
+	probes := []struct {
+		name, req string
+	}{
+		{"a browser opening the address", "GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+		{"a scanner on another path", "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n"},
+		{"an upgrade on the wrong path", "GET /wrong HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"},
+		{"an upgrade with no key", "GET /tunnel HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"},
+		{"a POST", "POST /tunnel HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"},
+	}
+	for _, p := range probes {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(c, p.req)
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		body, _ := io.ReadAll(c)
+		c.Close()
+
+		got := string(body)
+		if !strings.HasPrefix(got, "HTTP/1.1 200 OK") {
+			t.Errorf("%s: got %q, want a 200 — anything else marks the port",
+				p.name, firstLine(got))
+		}
+		if !strings.Contains(got, "Welcome to nginx!") {
+			t.Errorf("%s: no page body was served", p.name)
+		}
+		if !strings.Contains(got, "Server: nginx") {
+			t.Errorf("%s: no ordinary server header", p.name)
+		}
+	}
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\r'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

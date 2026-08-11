@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 CORE="/usr/local/bin/et-core"
 CONF_DIR="/etc/emergency-tunnel"
 LOG_DIR="/var/log/emergency-tunnel"
@@ -305,6 +305,7 @@ write_config() {
         local k
         for k in name role engine transport mode peer tunnel_port \
                  ws_path ws_host low_latency token fec_data fec_parity \
+                 tls_cert tls_key tls_sni tls_verify \
                  tun_mode spf_profile encapsulation spoof_src_ip spoof_dst_ip \
                  tun_ip tun_ip6 peer_tun_ip tun_iface mtu tun_queues \
                  workers pool cipher profile health_port log_level \
@@ -316,7 +317,7 @@ write_config() {
                 tunnel_port|mtu|workers|pool|health_port|tun_queues|\
                 heartbeat_interval|heartbeat_timeout|batch_size|channel_size|\
                 so_sndbuf|so_rcvbuf|proxy_protocol|forwards|low_latency|\
-                fec_data|fec_parity)
+                fec_data|fec_parity|tls_verify)
                     echo "$k = ${CFG[$k]}" ;;
                 *)  echo "$k = \"${CFG[$k]}\"" ;;
             esac
@@ -540,17 +541,45 @@ section_backpack() {
     note "a faster carrier does not help. These change what it looks like."
     echo
     item 1 "Stealth"   "TCP with no fingerprint — a wrong token gets no reply"
-    item 2 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
+    item 2 "WSS"       "HTTPS with a Chrome fingerprint — serves a decoy website"
+    item 3 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
     echo
-    note "Stealth wraps the whole tunnel, so the core handshake — which does"
-    note "carry a constant — never reaches the wire where a filter could match it."
-    note "Both servers need the SAME token."
-    local c; c="$(ask_choice "Method" "1" 1 2)"
+    note "Stealth looks like nothing at all; WSS looks like an ordinary website."
+    note "Where the traffic pattern is being matched, either works — WSS is the"
+    note "one that also passes a CDN, Stealth the one with nothing to match."
+    local c; c="$(ask_choice "Method" "1" 1 2 3)"
     cfg_reset
     case "$c" in
         1) backpack_stealth ;;
-        2) backpack_fec ;;
+        2) backpack_wss ;;
+        3) backpack_fec ;;
     esac
+}
+
+backpack_wss() {
+    optimise basic wsmux
+    cfg_set engine "mux"
+    cfg_set transport "wss"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    echo
+    note "Anything that is not a tunnel connection — a browser, a scanner, a"
+    note "probe — is served an ordinary nginx welcome page over TLS."
+    local h; h="$(ask "Hostname to present (a domain you own, or blank)" "")"
+    [ -n "$h" ] && { cfg_set tls_sni "$h"; cfg_set ws_host "$h"; }
+    cfg_set ws_path "/$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    note "Tunnel path: ${CFG[ws_path]}  (must match on BOTH servers)"
+    if [ -n "$h" ] && yesno "Do you have a certificate for ${h}?" "n"; then
+        cfg_set tls_cert "$(ask_req "Path to fullchain.pem")"
+        cfg_set tls_key  "$(ask_req "Path to privkey.pem")"
+        cfg_set tls_verify true
+    else
+        note "Using a generated self-signed certificate. The tunnel is unaffected —"
+        note "its own handshake is what secures it — but a probe that checks the"
+        note "chain will see it is not signed. A real certificate is better."
+    fi
+    common_endpoint
+    forwards_prompt
+    finish_tunnel
 }
 
 backpack_stealth() {

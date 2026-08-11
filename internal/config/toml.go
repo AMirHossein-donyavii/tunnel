@@ -114,6 +114,18 @@ func assign(c *Config, key, val string) error {
 		c.WSPath = unquote(val)
 	case "ws_host":
 		c.WSHost = unquote(val)
+	case "tls_cert":
+		c.TLSCert = unquote(val)
+	case "tls_key":
+		c.TLSKey = unquote(val)
+	case "tls_sni":
+		c.TLSSNI = unquote(val)
+	case "tls_verify":
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err != nil {
+			return fmt.Errorf("expected true/false")
+		}
+		c.TLSVerify = b
 	case "token":
 		c.Token = unquote(val)
 	case "fec_data":

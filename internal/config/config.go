@@ -90,6 +90,17 @@ type Config struct {
 	SoSndbuf          int `toml:"so_sndbuf"`          // bytes; 0 = OS default
 	SoRcvbuf          int `toml:"so_rcvbuf"`          // bytes; 0 = OS default
 
+	// TLS settings for the wss transport. The TLS layer is camouflage — the
+	// tunnel's own handshake is what authenticates and encrypts — so a
+	// self-signed certificate is generated when none is given, and the client
+	// does not verify one unless TLSVerify is set. Point TLSSNI at a real
+	// hostname with a real certificate and turn verification on when the address
+	// is a domain you control.
+	TLSCert   string `toml:"tls_cert"`
+	TLSKey    string `toml:"tls_key"`
+	TLSSNI    string `toml:"tls_sni"`
+	TLSVerify bool   `toml:"tls_verify"`
+
 	// Token is the pre-shared secret the stealth transport authenticates with.
 	// It must be identical on both servers. It is not the tunnel's encryption
 	// key — the core handshake still negotiates that per connection — it is what

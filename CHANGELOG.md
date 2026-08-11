@@ -4,6 +4,33 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-08-11
+
+### Added
+
+- **WSS transport** (`transport = "wss"`): the WebSocket framing over TLS,
+  dialled with a real Chrome fingerprint via uTLS rather than Go's. A
+  ClientHello is one of the few parts of a TLS connection an observer reads in
+  full, and Go's is distinctive on its own — measured, Go sends 253 bytes where
+  the Chrome fingerprint sends 563. A self-signed certificate is generated when
+  none is configured; `tls_cert`/`tls_key`/`tls_sni`/`tls_verify` use a real one.
+  The TLS is camouflage, not the security boundary — the tunnel's own handshake
+  still authenticates and encrypts everything inside it.
+- **Decoy site.** The WebSocket listener answered 404 to a wrong path and 400 to
+  anything that was not an upgrade. Both are tells: a real site has a homepage,
+  and a complaint about an upgrade announces that something here speaks
+  WebSocket. Every request that is not a genuine tunnel connection now gets an
+  ordinary nginx welcome page, 200, with a `Server: nginx` header.
+- Backpack section now offers Stealth, WSS and the coded UDP carrier.
+
+### Verified
+
+Across two namespaces, for both new carriers: a user reaches the far service
+through the tunnel, while a probe on the tunnel port gets nothing at all
+(Stealth) or an nginx welcome page over TLS (WSS). Unit tests cover the decoy
+across five kinds of probe, the ClientHello difference, and — for every new
+listener — that a connection which says nothing does not delay a real peer.
+
 ## [2.1.0] — 2026-08-11
 
 A fifth section, **Backpack**, and the fix for a whole class of silent
