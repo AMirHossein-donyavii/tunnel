@@ -4,6 +4,88 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] — 2026-08-11
+
+A new transport, one protocol that turns out never to have worked, and the
+socket tuning that every obfuscated protocol was silently missing.
+
+### Added
+
+- **QUIC transport (Backpack → QUIC).** Every other stream transport rides on
+  TCP, where a single lost packet stalls everything behind it until the resend
+  arrives, and the loss is read as congestion even when the link was merely
+  flaky — the behaviour that turns a fast international route into a slow
+  tunnel. QUIC carries independent streams over one UDP flow: a loss holds up
+  only its own stream and recovery is a modern loss detector rather than a
+  duplicate-ACK rule. The engine's several links become several streams on one
+  connection, so there is one congestion controller that sees the whole path
+  and one 4-tuple on the wire. It handshakes with TLS 1.3 and announces the
+  ALPN HTTP/3 uses, so it reads as a browser talking to a modern website.
+  **It is UDP** — the tunnel port must be open for UDP on both servers.
+
+### Fixed
+
+- **The reliable-UDP transport carried no data at all.** Its SYN was handled as
+  stream data, so it took sequence number 0 on the receiver and moved the
+  expected number to 1; the first real segment, whose number is also 0 because
+  senders start there, was then rejected as already seen — and acknowledged
+  anyway, so it was never resent. Every connection established, was accepted,
+  and then carried nothing: the tunnel handshake timed out on one side and read
+  EOF on the other. This affected the Basic UDP tunnel and Backpack's UDP+FEC.
+
+  Nothing caught it because the package tested its ARQ and FEC against
+  simulated links and never dialed its own transport. That round trip now
+  exists, together with a test in the shape the engine really uses — several
+  sessions over one listener socket.
+
+- **Socket tuning never reached ws, wss or stealth.** The tuner asked for a raw
+  TCP connection and quietly did nothing when it got a wrapper, which is what
+  every obfuscated transport returns. The costliest part is TCP_NODELAY:
+  without it Nagle's algorithm holds a small write back until the previous
+  segment is acknowledged, so on exactly the protocols people choose when the
+  path is hostile, an interactive packet could wait a round trip before it was
+  even sent. They also lost BBR, the bufferbloat guard, and the keepalive that
+  makes a dead link fail fast. The tuner now unwraps to the socket underneath,
+  and the test reads the setting back off it rather than trusting the call.
+
+### Performance
+
+- **Reliable UDP is roughly seven times faster.** Its ARQ was driven only by an
+  interval timer, which made the tick period the effective round trip in both
+  directions: an acknowledgement waited for a tick before being sent, and the
+  window it re-opened waited another before being used. Arrivals now drive it —
+  ACK clocking, as TCP has always done. Dead-link detection had to stop counting
+  fast retransmits to suit: a fast retransmit is caused by acknowledgements
+  arriving, which is proof the path is alive; only a timeout means it is not.
+  Measured end to end, bytes actually delivered: resource 39 → 225, balance
+  54 → 291, fast 78 → 436 Mbit/s.
+
+- **No allocation per packet on any carrier's listener.** The UDP carrier
+  formatted the peer address into a string for every datagram's flow key and
+  allocated an address per read; the ICMP carrier built its key with Sprintf;
+  the SPF codec marshalled and parsed each packet through a library. All now use
+  comparable keys and caller-owned buffers, with the ICMP wire format shared in
+  one file rather than duplicated. The zero is asserted directly, because a
+  correctness test cannot see an allocation.
+
+### Measured
+
+On a two-namespace bed at the resource profile — a CPU-bound loopback, so these
+compare protocols against each other and do not predict a real path:
+
+| protocol | before | after |
+|---|---|---|
+| Backpack QUIC | — | 907 |
+| Basic/Backpack UDP | 39 | 272 |
+| TUN ICMP | 438 | 686 |
+| Basic TCP · WS · WSS · Stealth | — | 1580 · 1544 · 1233 · 1069 |
+
+Idle tunnel ping is 0.5 ms over a 0.07 ms baseline with no loss on every TUN
+carrier. Saturating the tunnel raises it to 1.7–3.7 ms with 0–2.5% loss on the
+ping itself, the TCP carrier being the worst; that is a tunnel being driven past
+its capacity on purpose, and this environment cannot reproduce a real path's
+delay or loss to tell how much of it would remain there.
+
 ## [2.3.1] — 2026-08-11
 
 The ICMP/BIP carrier gets the socket sizing and the per-packet budget the other

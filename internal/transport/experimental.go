@@ -16,8 +16,8 @@ type experimental struct {
 }
 
 func (e experimental) Name() string       { return e.name }
-func (e experimental) Experimental() bool  { return true }
-func (e experimental) Summary() string     { return e.summary }
+func (e experimental) Experimental() bool { return true }
+func (e experimental) Summary() string    { return e.summary }
 
 func (e experimental) NewDialer(*config.Config, *logx.Logger) (Dialer, error) {
 	return nil, ErrNotImplemented{Transport: e.name}

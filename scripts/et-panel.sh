@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.4.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -544,18 +544,51 @@ section_backpack() {
     echo
     item 1 "Stealth"   "TCP with no fingerprint — a wrong token gets no reply"
     item 2 "WSS"       "HTTPS with a Chrome fingerprint — serves a decoy website"
-    item 3 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
+    item 3 "QUIC"      "HTTP/3 over UDP — best on a lossy path; looks like a browser"
+    item 4 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
     echo
-    note "Stealth looks like nothing at all; WSS looks like an ordinary website."
-    note "Where the traffic pattern is being matched, either works — WSS is the"
-    note "one that also passes a CDN, Stealth the one with nothing to match."
-    local c; c="$(ask_choice "Method" "1" 1 2 3)"
+    note "Stealth looks like nothing at all; WSS and QUIC look like a website."
+    note "Where the traffic pattern is being matched, any of them works — WSS is"
+    note "the one that also passes a CDN, Stealth the one with nothing to match."
+    note "QUIC is the one to pick when the path LOSES packets: the others ride on"
+    note "TCP, where a single loss stalls everything behind it and is mistaken for"
+    note "congestion, so the speed drops for a whole round trip. QUIC keeps the"
+    note "other streams moving and recovers without that collapse. It needs UDP"
+    note "to the tunnel port to be open, which is the one thing to check first."
+    local c; c="$(ask_choice "Method" "1" 1 2 3 4)"
     cfg_reset
     case "$c" in
         1) backpack_stealth ;;
         2) backpack_wss ;;
-        3) backpack_fec ;;
+        3) backpack_quic ;;
+        4) backpack_fec ;;
     esac
+}
+
+backpack_quic() {
+    optimise basic wsmux
+    cfg_set engine "mux"
+    cfg_set transport "quic"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    echo
+    note "QUIC carries the tunnel the way HTTP/3 carries a website: TLS 1.3 over"
+    note "UDP, announcing the same protocol a browser does."
+    warn "This is UDP. If the tunnel port is only open for TCP on either server,"
+    warn "nothing will connect — open UDP ${CFG[tunnel_port]:-<port>} on both."
+    local h; h="$(ask "Hostname to present (a domain you own, or blank)" "")"
+    [ -n "$h" ] && cfg_set tls_sni "$h"
+    if [ -n "$h" ] && yesno "Do you have a certificate for ${h}?" "n"; then
+        cfg_set tls_cert "$(ask_req "Path to fullchain.pem")"
+        cfg_set tls_key  "$(ask_req "Path to privkey.pem")"
+        cfg_set tls_verify true
+    else
+        note "Using a generated self-signed certificate. The tunnel is unaffected —"
+        note "its own handshake is what secures it — but a probe that checks the"
+        note "chain will see it is not signed. A real certificate is better."
+    fi
+    common_endpoint
+    forwards_prompt
+    finish_tunnel
 }
 
 backpack_wss() {
@@ -880,7 +913,7 @@ new_tunnel_menu() {
         item 2 "TUN"    "private subnet between servers — TCP, UDP, ICMP, BIP"
         item 3 "Gaming" "latency-first — UDP tunnel or kernel WireGuard"
         item 4 "SPF"    "spoofed-source carrier — ICMP, TCP (beta)"
-        item 5 "Backpack" "filtering-resistant — Stealth, and the coded carriers"
+        item 5 "Backpack" "filtering-resistant — Stealth, WSS, QUIC, coded carriers"
         item 0 "Back"   ""
         echo
         case "$(ask "Section" "1")" in
