@@ -56,6 +56,7 @@ type options struct {
 	rcvWnd   uint32
 	interval uint32
 	nodelay  bool
+	fec      FECParams
 }
 
 func (o options) mode() string {
@@ -79,6 +80,10 @@ func optionsFor(cfg *config.Config) options {
 	case config.ProfileResource:
 		o.sndWnd, o.rcvWnd, o.interval = 256, 256, 20
 	}
+	// FEC trades a fixed share of the bandwidth for not spending a round trip on
+	// each isolated loss. Both ends must configure the same split.
+	o.fec = FECParams{Data: cfg.FECData, Parity: cfg.FECParity}
+
 	// A gaming tunnel asks for latency: flush more often and back off gently.
 	if cfg.LowLatency {
 		o.nodelay = true
@@ -106,21 +111,44 @@ type Conn struct {
 
 	rdl, wdl time.Time
 	start    time.Time
+
+	fecEnc *fecEncoder
+	fecDec *fecDecoder
+	send   func([]byte)
 }
 
 func newConn(pc *net.UDPConn, remote *net.UDPAddr, conv uint32, owned bool, opt options) *Conn {
 	c := &Conn{pc: pc, remote: remote, owned: owned,
 		readable: make(chan struct{}, 1), closed: make(chan struct{}), start: time.Now()}
-	c.arq = newARQ(conv, func(b []byte) {
-		if len(b) == 0 {
-			return
-		}
+
+	// Bad parameters disable FEC rather than fail the tunnel: a link that runs
+	// without error correction is worth far more than one that will not start.
+	c.fecEnc, _ = newFECEncoder(opt.fec)
+	c.fecDec, _ = newFECDecoder(opt.fec)
+
+	raw := func(b []byte) {
 		if owned {
 			_, _ = pc.Write(b)
 		} else {
 			_, _ = pc.WriteToUDP(b, remote)
 		}
-	})
+	}
+	// Every datagram leaves through here, the handshake included. Framing that
+	// applies to some packets and not others cannot be undone by a receiver that
+	// has no way to tell which it is holding.
+	c.send = func(b []byte) {
+		if len(b) == 0 {
+			return
+		}
+		if c.fecEnc == nil {
+			raw(b)
+			return
+		}
+		for _, out := range c.fecEnc.encode(b) {
+			raw(out)
+		}
+	}
+	c.arq = newARQ(conv, func(b []byte) { c.send(b) })
 	c.arq.SetMTU(opt.mtu)
 	c.arq.SetWindow(opt.sndWnd, opt.rcvWnd)
 	c.arq.SetNoDelay(opt.nodelay, opt.interval)
@@ -159,9 +187,23 @@ func (c *Conn) signal() {
 	}
 }
 
-// input feeds a datagram received for this connection.
+// input feeds a datagram received for this connection. With FEC on, one
+// datagram can yield several packets: the one that arrived, plus any the parity
+// let us rebuild.
 func (c *Conn) input(b []byte) {
-	if c.arq.Input(b) && c.arq.PendingRecv() {
+	if c.fecDec == nil {
+		if c.arq.Input(b) && c.arq.PendingRecv() {
+			c.signal()
+		}
+		return
+	}
+	fed := false
+	for _, pkt := range c.fecDec.decode(b) {
+		if c.arq.Input(pkt) {
+			fed = true
+		}
+	}
+	if fed && c.arq.PendingRecv() {
 		c.signal()
 	}
 }
@@ -331,11 +373,7 @@ func (c *Conn) handshake(ctx context.Context) error {
 	b := make([]byte, hdrLen)
 	s.encode(b)
 	for attempt := 0; attempt < 100 && time.Now().Before(deadline); attempt++ {
-		if c.owned {
-			_, _ = c.pc.Write(b)
-		} else {
-			_, _ = c.pc.WriteToUDP(b, c.remote)
-		}
+		c.send(b)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -388,7 +426,8 @@ func (l *listener) route() {
 			// A transient error must not strand every connection on this socket.
 			continue
 		}
-		if n < hdrLen {
+		seg, ok := firstSegment(buf[:n], l.opt.fec.Enabled())
+		if !ok {
 			continue
 		}
 		key := src.String()
@@ -399,10 +438,10 @@ func (l *listener) route() {
 		if c == nil {
 			// Only a SYN opens a connection; anything else from an unknown peer is
 			// a stray or a scan and is ignored.
-			if buf[4] != cmdSyn {
+			if seg[4] != cmdSyn {
 				continue
 			}
-			conv := binary.BigEndian.Uint32(buf[0:])
+			conv := binary.BigEndian.Uint32(seg[0:])
 			c = newConn(l.pc, src, conv, false, l.opt)
 			l.mu.Lock()
 			l.conns[key] = c

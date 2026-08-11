@@ -4,6 +4,37 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Forward error correction for the reliable-UDP carrier** (`fec_data` /
+  `fec_parity`, both ends must match). Every `fec_data` packets carry
+  `fec_parity` Reed-Solomon parity packets; any `fec_data` of the group rebuild
+  it, so an isolated loss is repaired from packets already in flight instead of
+  costing a round trip. Segments below 128 bytes bypass the code — a pure
+  acknowledgement sharing a group with full-sized data makes the parity almost
+  entirely padding, which measured worse than the retransmissions it saved.
+
+  **Off by default, and it should stay off until the note below is resolved.**
+
+### Measured, and not yet worth enabling
+
+Across 1/3/8/15% loss over a 100ms round trip, coded throughput came out at
+0.43x, 0.82x, 0.90x and 0.32x of the plain carrier — never a win.
+
+The likely cause is that parity is generated below the congestion control that
+paces the connection: the ARQ sizes its window against what the path will carry,
+and the encoder then adds 30% more packets to that path without telling it. At a
+bottleneck those displace the data they were meant to protect. Fixing it means
+accounting for parity inside the congestion window, which is a change to the
+ARQ rather than to the codec.
+
+The test harness — a userspace relay with a timer per packet — also caps
+throughput well below what the carrier reaches on a clean socket, so the
+absolute numbers understate everything and the comparison is suggestive rather
+than conclusive. Enough to keep the feature off; not enough to call it useless.
+
 ## [2.0.5] — 2026-08-10
 
 ### Fixed

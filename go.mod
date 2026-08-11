@@ -8,3 +8,8 @@ require (
 	golang.org/x/net v0.21.0
 	golang.org/x/sys v0.26.0
 )
+
+require (
+	github.com/klauspost/cpuid/v2 v2.1.1 // indirect
+	github.com/klauspost/reedsolomon v1.12.0 // indirect
+)

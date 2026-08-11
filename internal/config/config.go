@@ -75,6 +75,14 @@ type Config struct {
 	Engine string `toml:"engine"`
 
 	// TUN / tuning knobs (ignored by the mux engine).
+	// FECData/FECParity split the reliable-UDP carrier's forward error
+	// correction: every FECData packets carry FECParity parity packets, and any
+	// FECData of the group rebuild it. Repairs an isolated loss without the
+	// round trip a retransmission costs, at a fixed FECParity/FECData bandwidth
+	// premium. Both servers must set the SAME values. 0 disables it.
+	FECData   int `toml:"fec_data"`
+	FECParity int `toml:"fec_parity"`
+
 	HeartbeatInterval int `toml:"heartbeat_interval"` // seconds; 0 = default
 	HeartbeatTimeout  int `toml:"heartbeat_timeout"`  // seconds; 0 = default
 	BatchSize         int `toml:"batch_size"`         // packets per batch; 0 = auto
@@ -197,6 +205,9 @@ func (c *Config) Validate() error {
 	}
 	if c.TunnelPort < 1 || c.TunnelPort > 65535 {
 		return fmt.Errorf("tunnel_port out of range: %d", c.TunnelPort)
+	}
+	if err := c.validateFEC(); err != nil {
+		return err
 	}
 	if c.Pool < 1 || c.Pool > 1024 {
 		return fmt.Errorf("pool out of range (1..1024): %d", c.Pool)
@@ -538,4 +549,33 @@ func (c *Config) Save(path string) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(c.Marshal()), 0o600)
+}
+
+// maxFECShards is the Reed-Solomon limit: data + parity shards must fit in a
+// byte's worth of positions.
+const maxFECShards = 256
+
+// validateFEC checks the error-correction split.
+//
+// Half a setting is the dangerous case: one value without the other reads like
+// FEC is on when it is off, so a route is left paying full retransmission
+// latency while its operator believes the losses are being repaired.
+func (c *Config) validateFEC() error {
+	d, p := c.FECData, c.FECParity
+	if d == 0 && p == 0 {
+		return nil
+	}
+	if d <= 0 || p <= 0 {
+		return fmt.Errorf("fec_data and fec_parity must both be set or both be zero (got %d and %d)", d, p)
+	}
+	if d+p > maxFECShards {
+		return fmt.Errorf("fec_data + fec_parity must be at most %d (got %d)", maxFECShards, d+p)
+	}
+	// Parity beyond the data it protects costs more bandwidth than it can ever
+	// return: at that point the link is losing more than half its packets and
+	// needs a different path, not a bigger code.
+	if p > d {
+		return fmt.Errorf("fec_parity (%d) above fec_data (%d) more than doubles the traffic for less than it returns", p, d)
+	}
+	return nil
 }
