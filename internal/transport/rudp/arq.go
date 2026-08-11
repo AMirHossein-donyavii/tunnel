@@ -115,6 +115,7 @@ type ARQ struct {
 
 	sndWnd, rcvWnd, rmtWnd uint32
 	cwnd                   uint32
+	fecData, fecParity     uint32 // parity the layer below adds per data group
 	incr                   uint32
 
 	interval uint32
@@ -605,6 +606,7 @@ func (a *ARQ) flush(current uint32) {
 	//    peer can hold). Ignoring either is how a tunnel collapses under load.
 	cwnd := min32(a.sndWnd, a.rmtWnd)
 	cwnd = min32(cwnd, a.cwnd)
+	cwnd = a.codedWindow(cwnd)
 	if cwnd < 1 {
 		cwnd = 1
 	}
@@ -709,4 +711,31 @@ func bound32(lo, v, hi uint32) uint32 {
 		return hi
 	}
 	return v
+}
+
+// SetFECOverhead tells the ARQ that the layer beneath it turns every data
+// packets into data+parity packets on the wire.
+//
+// Without this the congestion window means the wrong thing. It is sized against
+// what the path will carry, and the encoder then adds parity to that same path
+// without the window knowing — so the connection sends more than it measured the
+// path can take, and the extra displaces exactly the data the parity exists to
+// protect. Measured, that made error correction a net loss at every loss rate.
+func (a *ARQ) SetFECOverhead(data, parity int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if data <= 0 || parity <= 0 {
+		a.fecData, a.fecParity = 0, 0
+		return
+	}
+	a.fecData, a.fecParity = uint32(data), uint32(parity)
+}
+
+// codedWindow scales a window down by the share of it parity will occupy, so
+// that data plus parity together stay inside what congestion control allows.
+func (a *ARQ) codedWindow(w uint32) uint32 {
+	if a.fecData == 0 || a.fecParity == 0 {
+		return w
+	}
+	return w * a.fecData / (a.fecData + a.fecParity)
 }

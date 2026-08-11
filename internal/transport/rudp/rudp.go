@@ -152,6 +152,7 @@ func newConn(pc *net.UDPConn, remote *net.UDPAddr, conv uint32, owned bool, opt 
 	c.arq.SetMTU(opt.mtu)
 	c.arq.SetWindow(opt.sndWnd, opt.rcvWnd)
 	c.arq.SetNoDelay(opt.nodelay, opt.interval)
+	c.arq.SetFECOverhead(opt.fec.Data, opt.fec.Parity)
 	go c.updateLoop()
 	return c
 }

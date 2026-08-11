@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.0.5"
+SCRIPT_VERSION="2.1.0"
 CORE="/usr/local/bin/et-core"
 CONF_DIR="/etc/emergency-tunnel"
 LOG_DIR="/var/log/emergency-tunnel"
@@ -229,7 +229,7 @@ fetch_identity() {
 # 4. Tunnel registry + conflict-free allocation
 # ============================================================================
 list_tunnels() { [ -d "$CONF_DIR" ] && find "$CONF_DIR" -maxdepth 1 -name '*.toml' -printf '%f\n' 2>/dev/null | sed 's/\.toml$//' | sort || true; }
-tunnel_count() { list_tunnels | grep -c . || echo 0; }
+tunnel_count() { list_tunnels | grep -c . ; }
 svc_state()   { systemctl is-active "${SVC_PREFIX}$1" 2>/dev/null || echo unknown; }
 cfg_get()     { grep -E "^[[:space:]]*$2[[:space:]]*=" "${CONF_DIR}/$1.toml" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//'; }
 
@@ -304,7 +304,7 @@ write_config() {
         echo
         local k
         for k in name role engine transport mode peer tunnel_port \
-                 ws_path ws_host low_latency \
+                 ws_path ws_host low_latency token fec_data fec_parity \
                  tun_mode spf_profile encapsulation spoof_src_ip spoof_dst_ip \
                  tun_ip tun_ip6 peer_tun_ip tun_iface mtu tun_queues \
                  workers pool cipher profile health_port log_level \
@@ -315,7 +315,8 @@ write_config() {
                 # numeric / boolean / array — emitted bare
                 tunnel_port|mtu|workers|pool|health_port|tun_queues|\
                 heartbeat_interval|heartbeat_timeout|batch_size|channel_size|\
-                so_sndbuf|so_rcvbuf|proxy_protocol|forwards|low_latency)
+                so_sndbuf|so_rcvbuf|proxy_protocol|forwards|low_latency|\
+                fec_data|fec_parity)
                     echo "$k = ${CFG[$k]}" ;;
                 *)  echo "$k = \"${CFG[$k]}\"" ;;
             esac
@@ -519,6 +520,78 @@ section_tun() {
     cfg_set name "$(ask_name "Tunnel name" "tun$(tunnel_count)")"
     common_endpoint
     tun_addressing
+    forwards_prompt
+    finish_tunnel
+}
+
+# ---- Backpack ----------------------------------------------------------------
+# Carriers aimed at a path that is being filtered rather than merely slow. The
+# menu lists only what the core actually implements: a protocol here means a
+# working data plane, not a name.
+gen_token() {
+    if have openssl; then openssl rand -hex 24
+    else head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
+}
+
+section_backpack() {
+    banner
+    title "Backpack — for a path that is being filtered"
+    note "Where the connection itself is blocked or throttled by how it looks,"
+    note "a faster carrier does not help. These change what it looks like."
+    echo
+    item 1 "Stealth"   "TCP with no fingerprint — a wrong token gets no reply"
+    item 2 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
+    echo
+    note "Stealth wraps the whole tunnel, so the core handshake — which does"
+    note "carry a constant — never reaches the wire where a filter could match it."
+    note "Both servers need the SAME token."
+    local c; c="$(ask_choice "Method" "1" 1 2)"
+    cfg_reset
+    case "$c" in
+        1) backpack_stealth ;;
+        2) backpack_fec ;;
+    esac
+}
+
+backpack_stealth() {
+    optimise basic tcpmux
+    cfg_set engine "mux"
+    cfg_set transport "stealth"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    local tok; tok="$(gen_token)"
+    echo
+    note "Token for this tunnel (copy it to the OTHER server verbatim):"
+    printf "    ${B}${CYN}%s${R}\n\n" "$tok"
+    if yesno "Is this the first server of the pair?" "y"; then
+        cfg_set token "$tok"
+    else
+        cfg_set token "$(ask_req "Paste the token from the first server")"
+    fi
+    common_endpoint
+    forwards_prompt
+    finish_tunnel
+}
+
+backpack_fec() {
+    optimise basic udp
+    cfg_set engine "mux"
+    cfg_set transport "udp"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    echo
+    note "Error correction sends parity packets alongside the data, so an"
+    note "isolated loss is repaired without waiting a round trip for a resend."
+    warn "Measured on this build it has not yet paid for itself — parity is added"
+    warn "below congestion control, so it competes with the data it protects."
+    note "Offered because a real lossy path may differ from the test path; compare"
+    note "against a plain UDP tunnel before keeping it. Same values on BOTH servers."
+    if yesno "Enable error correction?" "n"; then
+        local d p
+        d="$(ask "Data packets per group" "10")"
+        p="$(ask "Parity packets per group" "3")"
+        cfg_set fec_data "$d"; cfg_set fec_parity "$p"
+        note "Bandwidth premium: about $(( 100 * p / (d>0?d:1) ))%."
+    fi
+    common_endpoint
     forwards_prompt
     finish_tunnel
 }
@@ -776,11 +849,13 @@ new_tunnel_menu() {
         item 2 "TUN"    "private subnet between servers — TCP, UDP, ICMP, BIP"
         item 3 "Gaming" "latency-first — UDP tunnel or kernel WireGuard"
         item 4 "SPF"    "spoofed-source carrier — ICMP, TCP (beta)"
+        item 5 "Backpack" "filtering-resistant — Stealth, and the coded carriers"
         item 0 "Back"   ""
         echo
         case "$(ask "Section" "1")" in
             1) section_basic ;; 2) section_tun ;;
             3) section_gaming ;; 4) section_spf ;;
+            5) section_backpack ;;
             0|q) return ;;
             *) bad "Unknown choice."; sleep 1 ;;
         esac

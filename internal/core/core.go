@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 // CoreVersion is the tunnel core version, surfaced to the panel via
 // `et-core version`. It is a var (not a const) so release builds can stamp the
 // exact version with: -ldflags "-X .../internal/core.CoreVersion=1.2.3".
-var CoreVersion = "2.0.5"
+var CoreVersion = "2.1.0"
 
 // LogDir is where per-tunnel logs are written when not attached to journald.
 const LogDir = "/var/log/emergency-tunnel"
@@ -57,6 +58,14 @@ func Run(path string) error {
 	// action instead of a guess.
 	for _, tip := range nettune.Advise() {
 		log.Warn("host tuning: %s", tip)
+	}
+
+	// Settings this build does not understand are not applied. An existing
+	// tunnel is not stopped over it — that would turn an upgrade into an outage
+	// — but it must be visible, because the symptom otherwise is a tunnel that
+	// runs correctly without the behaviour its config asked for.
+	if u := cfg.Unknown(); len(u) > 0 {
+		log.Warn("ignoring settings this core does not understand: %s", strings.Join(u, ", "))
 	}
 
 	// Select the data plane: mux = TCP Reverse Tunnel; tun/spf = virtual interface.

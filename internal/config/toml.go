@@ -110,8 +110,31 @@ func assign(c *Config, key, val string) error {
 			return err
 		}
 		c.Forwards = arr
+	case "ws_path":
+		c.WSPath = unquote(val)
+	case "ws_host":
+		c.WSHost = unquote(val)
+	case "token":
+		c.Token = unquote(val)
+	case "fec_data":
+		return intField(val, &c.FECData)
+	case "fec_parity":
+		return intField(val, &c.FECParity)
+	case "low_latency":
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err != nil {
+			return fmt.Errorf("expected true/false")
+		}
+		c.LowLatency = b
 	default:
-		// ignore unknown keys
+		// A key this build does not know is almost always a typo or an option
+		// from a newer version, and either way the setting does nothing. Silently
+		// dropping it is how ws_path, low_latency and the rest came to be written
+		// by the console and ignored by the core for releases at a time — the
+		// tunnel comes up looking correct and simply does not have the behaviour
+		// that was asked for. They are collected here and reported rather than
+		// discarded; see Config.Unknown.
+		c.unknown = append(c.unknown, key)
 	}
 	return nil
 }

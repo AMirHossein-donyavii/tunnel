@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/core"
@@ -26,6 +27,7 @@ import (
 	// Register transports. TCP is production; the rest register experimental
 	// placeholders from the transport package's init.
 	_ "github.com/emergency-tunnel/et/internal/transport/rudp"
+	_ "github.com/emergency-tunnel/et/internal/transport/stealth"
 	_ "github.com/emergency-tunnel/et/internal/transport/tcp"
 	_ "github.com/emergency-tunnel/et/internal/transport/ws"
 )
@@ -86,6 +88,15 @@ func cmdValidate(args []string) {
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid: %v\n", err)
+		os.Exit(1)
+	}
+	// A key this build does not understand does nothing at all, which is worse
+	// than a rejected config: the tunnel starts, looks right, and lacks the
+	// behaviour that was asked for. Fail here, where the console checks before
+	// writing, rather than let it through to be discovered on a live route.
+	if u := cfg.Unknown(); len(u) > 0 {
+		fmt.Fprintf(os.Stderr, "invalid: this build does not understand: %s\n", strings.Join(u, ", "))
+		fmt.Fprintln(os.Stderr, "        those settings would be ignored — remove them, or update the core")
 		os.Exit(1)
 	}
 	// The schema check cannot know which transports this build actually carries,

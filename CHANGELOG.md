@@ -4,6 +4,53 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-08-11
+
+A fifth section, **Backpack**, and the fix for a whole class of silent
+misconfiguration found while building it.
+
+### Added
+
+- **Stealth transport** (`transport = "stealth"`). Our core handshake opens with
+  the constant bytes `45 54 02 03 03` at offset zero of every connection, and any
+  peer that reached the port completed the exchange — so a scanner could both
+  recognise the tunnel and confirm it. Stealth removes both: an ephemeral X25519
+  exchange where each message is a public key plus a MAC keyed on a shared token,
+  with no header, version or constant anywhere, and the MAC checked before
+  anything is sent back. A peer without the token gets silence. The ordinary
+  tunnel runs inside, so the constant that used to be on the wire is now within
+  an encrypted stream where nothing can match it. Records carry random filler
+  with the length under the AEAD, because padding an observer can read and
+  subtract is not padding.
+
+  Verified end to end across two namespaces: a user reaches the far service
+  through the tunnel, while a scanner connecting to the tunnel port gets nothing
+  at all and times out. Tests assert no byte position is constant across 24
+  handshakes, that a wrong token draws no reply, that identical payloads produce
+  varying record lengths, and that a silent peer does not delay a real one.
+
+- **Backpack section in the console**, offering Stealth and the coded UDP
+  carrier, with the token generated for you and the honest note that error
+  correction has not yet paid for itself on this build.
+
+### Fixed
+
+- **The console wrote settings the core silently ignored.** The loader ended in
+  "ignore unknown keys", so any option without a matching case was dropped
+  without a word: the tunnel came up, looked correct, and simply did not have the
+  behaviour that was asked for. `ws_path`, `ws_host` and `low_latency` — the
+  Gaming section's entire latency mode — had been written and ignored for
+  releases. All are now read; unknown keys are collected and reported, `et-core
+  validate` fails on them so the console cannot write one, and a running tunnel
+  warns rather than being stopped. A test walks the schema so a new field cannot
+  be added without wiring it up.
+- `tunnel_count` printed `0` twice when no tunnels existed (`grep -c` prints its
+  zero *and* fails), so every section offered a default name like `bp0\n0`.
+- The reliable-UDP ARQ now accounts for the parity the FEC layer adds when
+  sizing its congestion window. Without it the encoder put 30% more packets on a
+  path the window had already measured, displacing the data the parity existed to
+  protect.
+
 ## [Unreleased]
 
 ### Added

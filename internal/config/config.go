@@ -90,6 +90,12 @@ type Config struct {
 	SoSndbuf          int `toml:"so_sndbuf"`          // bytes; 0 = OS default
 	SoRcvbuf          int `toml:"so_rcvbuf"`          // bytes; 0 = OS default
 
+	// Token is the pre-shared secret the stealth transport authenticates with.
+	// It must be identical on both servers. It is not the tunnel's encryption
+	// key — the core handshake still negotiates that per connection — it is what
+	// lets a listener tell a peer from a scanner before answering either.
+	Token string `toml:"token"`
+
 	// LowLatency switches latency-sensitive protocols (currently the reliable
 	// UDP transport) into their latency-first mode: shorter timers, shallower
 	// windows and gentler congestion backoff. The Gaming section sets it.
@@ -116,7 +122,15 @@ type Config struct {
 	//   "200-300"     listen 200..300 -> same remote ports
 	//   "2096@pp"     enable PROXY protocol v2 for this entry
 	Forwards []string `toml:"forwards"`
+
+	// unknown holds keys the loader did not recognise, so they can be reported
+	// instead of silently doing nothing.
+	unknown []string
 }
+
+// Unknown returns the configuration keys this build does not understand. A
+// non-empty result means the file asks for behaviour that will not happen.
+func (c *Config) Unknown() []string { return c.unknown }
 
 // Defaults returns a Config pre-filled with the recommended defaults.
 func Defaults() Config {
