@@ -284,8 +284,16 @@ func (c *Config) Marshal() string {
 		if c.TunQueues > 0 {
 			ki("tun_queues", c.TunQueues)
 		}
-		ki("heartbeat_interval", c.HeartbeatInterval)
-		ki("heartbeat_timeout", c.HeartbeatTimeout)
+		// Only when the operator actually chose one. Writing a zero back would
+		// put a meaningless explicit value in the file, and writing the engine's
+		// default would pin it — which is how the 25 s failover got frozen into
+		// every config in the first place.
+		if c.HeartbeatInterval > 0 {
+			ki("heartbeat_interval", c.HeartbeatInterval)
+		}
+		if c.HeartbeatTimeout > 0 {
+			ki("heartbeat_timeout", c.HeartbeatTimeout)
+		}
 		if c.BatchSize > 0 {
 			ki("batch_size", c.BatchSize)
 		}

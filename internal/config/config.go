@@ -161,14 +161,51 @@ func Defaults() Config {
 		ProxyProtocol: false,
 
 		// TCP Reverse Tunnel (multiplexed) is the primary, recommended engine.
-		Engine:            EngineMux,
-		TunMode:           TunModeTCP,
-		SpfProfile:        SpfProfileICMP,
-		Encapsulation:     "ipx",
-		HeartbeatInterval: 10,
-		HeartbeatTimeout:  25,
+		Engine:        EngineMux,
+		TunMode:       TunModeTCP,
+		SpfProfile:    SpfProfileICMP,
+		Encapsulation: "ipx",
+		// Heartbeat is deliberately NOT filled in here.
+		//
+		// It used to default to 10 s between beats and 25 s before a silent link
+		// was declared dead. Both engines carry their own, faster defaults — 3 s
+		// and 12 s — and neither was ever reached, because this ran first and a
+		// non-zero value is what "the operator chose this" looks like downstream.
+		// So every tunnel ever built took 25 seconds to notice a dead path, on
+		// both engines, and the console's migration that strips the old pinned
+		// values from existing configs restored them to exactly the same 25 s.
+		//
+		// Leaving these at zero is what lets an engine pick. It is safe to be far
+		// quicker than 25 s because liveness is refreshed by ANY frame that
+		// arrives, not only by heartbeats: a link carrying traffic never times
+		// out, and the timeout only measures real silence — four missed beats.
 	}
 }
+
+// Heartbeat defaults, shared by both engines.
+//
+// A link is declared dead after this much total silence. Any arriving frame
+// refreshes liveness, not just a heartbeat, so a link that is carrying traffic
+// never reaches the timeout — it measures a genuinely quiet path, four missed
+// beats deep. Detection is what stalls a tunnel after a network blip: until the
+// link is declared dead it is not redialed, and on the L3 engine every flow the
+// kernel has hashed to that queue goes nowhere in the meantime.
+const (
+	// Four missed beats before a link is declared dead. Four is what makes this
+	// robust — jitter has to swallow four in a row, not one — and the period is
+	// then free to be short, because a heartbeat is a couple of bytes and only
+	// travels on a link that has nothing else to say.
+	//
+	// A stream carrier does not wait for this: TCP reports a broken path and the
+	// link is redialed in a fraction of a second. A datagram carrier gets no such
+	// error — silence is the only signal there is — so this timeout is the whole
+	// of its detection, and every flow the kernel hashed to that queue goes
+	// nowhere until it fires. Measured end to end on a broken-then-restored path:
+	// the ICMP carrier recovered in 6.3 s at 3/12 and the UDP carrier in 10.1 s;
+	// both were 20 s before the default was reachable at all.
+	DefaultHeartbeatSec        = 2
+	DefaultHeartbeatTimeoutSec = 8
+)
 
 // Engine identifiers.
 const (
@@ -257,16 +294,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("peer is required on the dialing side (role=%s mode=%s)", c.Role, c.Mode)
 	}
 
-	// Heartbeat: compare EFFECTIVE values (after the runtime defaults of 10s/25s),
-	// so setting only the interval (e.g. 30) can't leave the timeout defaulted to
-	// 25 ≤ 30 and tear links down before the first heartbeat arrives. Applies to
-	// every engine (mux keepalive and L3 heartbeat share these fields).
+	// Heartbeat: compare EFFECTIVE values (after the engine defaults), so setting
+	// only the interval (e.g. 30) can't leave the timeout defaulted below it and
+	// tear links down before the first heartbeat arrives. Applies to every engine
+	// (mux keepalive and L3 heartbeat share these fields), and both engines use
+	// the same pair — see DefaultHeartbeat.
 	ei, et := c.HeartbeatInterval, c.HeartbeatTimeout
 	if ei <= 0 {
-		ei = 10
+		ei = DefaultHeartbeatSec
 	}
 	if et <= 0 {
-		et = 25
+		et = DefaultHeartbeatTimeoutSec
 	}
 	if et <= ei {
 		return fmt.Errorf("heartbeat_timeout (effective %ds) must be greater than heartbeat_interval (effective %ds)", et, ei)

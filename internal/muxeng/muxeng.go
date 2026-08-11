@@ -83,8 +83,8 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		routes:   map[int]target{},
 	}
 	e.muxCfg = mux.Config{
-		KeepAlive:        time.Duration(orDefault(cfg.HeartbeatInterval, 3)) * time.Second,
-		KeepAliveTimeout: time.Duration(orDefault(cfg.HeartbeatTimeout, 12)) * time.Second,
+		KeepAlive:        time.Duration(orDefault(cfg.HeartbeatInterval, config.DefaultHeartbeatSec)) * time.Second,
+		KeepAliveTimeout: time.Duration(orDefault(cfg.HeartbeatTimeout, config.DefaultHeartbeatTimeoutSec)) * time.Second,
 		AcceptBacklog:    512,
 		Window:           streamWindow(cfg.Profile),
 	}

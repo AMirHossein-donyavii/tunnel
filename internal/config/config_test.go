@@ -408,3 +408,44 @@ func TestBIPRejectsIPv4Peer(t *testing.T) {
 		t.Fatalf("tun_mode=icmp rejected an IPv4 peer: %v", err)
 	}
 }
+
+// The heartbeat defaults decide how long a dead path goes unnoticed. They must
+// come from the engines, which want 3 s between beats and 12 s of silence
+// before a link is redialed.
+//
+// Defaults() used to fill in 10 and 25 instead. A non-zero value is what "the
+// operator chose this" looks like to an engine, so the engine default was never
+// reached and every tunnel ever built — on either engine — took 25 seconds to
+// notice a dead link. On the L3 engine that is 25 seconds during which every
+// flow the kernel hashed to that queue goes nowhere. The console even shipped a
+// migration to strip the pinned 10/25 out of old configs so the good default
+// would apply; it restored them to exactly the same 25 s.
+//
+// Nothing failed, so nothing caught it. This asserts the effective value.
+func TestHeartbeatDefaultsAreLeftToTheEngine(t *testing.T) {
+	c := Defaults()
+	if c.HeartbeatInterval != 0 || c.HeartbeatTimeout != 0 {
+		t.Fatalf("Defaults() pins heartbeat to %d/%d; leave it at 0 so the engine's "+
+			"own default applies (an engine cannot tell a pinned default from an "+
+			"operator's choice)", c.HeartbeatInterval, c.HeartbeatTimeout)
+	}
+	if DefaultHeartbeatTimeoutSec <= DefaultHeartbeatSec {
+		t.Fatalf("timeout %ds must exceed interval %ds", DefaultHeartbeatTimeoutSec, DefaultHeartbeatSec)
+	}
+	// Enough missed beats that ordinary jitter cannot declare a live link dead.
+	if got := DefaultHeartbeatTimeoutSec / DefaultHeartbeatSec; got < 3 {
+		t.Fatalf("only %d missed beats before a link is declared dead — too few to "+
+			"survive jitter on a bad path", got)
+	}
+}
+
+// A config that says nothing about heartbeats must still validate, now that the
+// default no longer fills the pair in.
+func TestConfigWithoutHeartbeatValidates(t *testing.T) {
+	c := Defaults()
+	c.Name, c.Role, c.Peer = "t", RoleKharej, "198.51.100.7"
+	c.TunnelPort = 4000
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a config with no heartbeat set must validate: %v", err)
+	}
+}

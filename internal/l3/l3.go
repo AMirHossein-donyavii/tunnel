@@ -100,8 +100,8 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		batchSize:   orDefault(cfg.BatchSize, 64),
 		channelSize: orDefault(cfg.ChannelSize, channelDefault(cfg.Profile)),
 		pktLen:      cfg.MTU + 4,
-		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, defaultHeartbeatSec)) * time.Second,
-		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, defaultHeartbeatTimeoutSec)) * time.Second,
+		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, config.DefaultHeartbeatSec)) * time.Second,
+		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, config.DefaultHeartbeatTimeoutSec)) * time.Second,
 		nowSec:      func() int64 { return time.Now().Unix() },
 	}
 	if cfg.IsSPF() {
@@ -743,10 +743,8 @@ func datagramCarrier(cfg *config.Config) bool {
 // already being written — so they are frequent enough to cycle a dead link in
 // well under the old 25 s, which is the difference between a blip and a
 // noticeable outage on a flaky intercontinental path.
-const (
-	defaultHeartbeatSec        = 3
-	defaultHeartbeatTimeoutSec = 12
-)
+// The values themselves live in package config, shared with the mux engine, so
+// the two cannot drift apart: see config.DefaultHeartbeatSec.
 
 // channelDefault sizes the per-queue TX ring by profile. The ring only has to
 // absorb bursts: CoDel keeps the *occupied* depth near 5 ms of drain time

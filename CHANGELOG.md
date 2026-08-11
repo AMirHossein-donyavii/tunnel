@@ -4,6 +4,52 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.4.1] — 2026-08-11
+
+A dead path was taking 20 seconds to notice. It now takes 5.
+
+### Fixed
+
+- **The heartbeat defaults were unreachable, so every tunnel ever built used the
+  slow ones.** Both engines carry their own failover timings, and neither was
+  ever applied: the config layer filled in 10 s between beats and 25 s of
+  silence before a link was declared dead, and a non-zero value is exactly what
+  "the operator chose this" looks like to an engine. The console even shipped a
+  migration that strips the pinned 10/25 out of older configs so the faster
+  default would take over — and it restored them to the very same 25 s.
+
+  This matters most on the datagram carriers. A stream carrier does not wait for
+  the heartbeat at all: TCP reports a broken path and the link is redialed in a
+  fraction of a second. UDP, ICMP and BIP get no such error — silence is the only
+  signal there is — so the timeout *is* their detection, and on the TUN engine
+  every flow the kernel hashed to that queue goes nowhere until it fires.
+
+  The defaults now live in one place, shared by both engines, and are reached.
+  They are also shorter: four missed beats is what makes detection robust
+  against jitter, and four is unchanged — only the period is, from 3 s to 2 s, so
+  the wait is 8 s instead of 12. A heartbeat is a couple of bytes and only
+  travels on a link with nothing else to say.
+
+  Measured on a path broken and then restored, time until traffic flowed again:
+
+  | carrier | before | after |
+  |---|---|---|
+  | TUN UDP | 20.1 s | **5.0 s** |
+  | TUN ICMP | 20.1 s | **5.0 s** |
+  | TUN TCP | 0.3 s | 0.2 s |
+
+  Checked for the opposite failure too: no false disconnects on any carrier
+  under sustained saturation, and none on a tunnel left idle for 45 s.
+
+  Existing tunnels pick this up automatically — the console's migration finally
+  does what it always said it did. `heartbeat_interval` and `heartbeat_timeout`
+  still override it for a path that needs something else.
+
+- **Saved configs no longer get a meaningless `heartbeat_interval = 0`.** The
+  writer emitted the pair unconditionally; it now writes them only when they
+  were actually set, which is how the 25 s got frozen into every config to begin
+  with.
+
 ## [2.4.0] — 2026-08-11
 
 A new transport, one protocol that turns out never to have worked, and the
