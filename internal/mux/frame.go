@@ -9,7 +9,10 @@
 // windows, a two-class (priority) write scheduler, and PING-based RTT/health.
 package mux
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"time"
+)
 
 // Frame types.
 const (
@@ -59,6 +62,32 @@ const (
 	// peer never reaches it; it only bounds memory against a peer that ignores
 	// flow control (the receiver appends delivered data before the app reads it).
 	maxRecvBuffer = 16 * 1024 * 1024
+
+	// windowGrowthFactor is how far above its initial size a stream's receive
+	// window may auto-tune. Eight steps of doubling from the resource profile's
+	// 512 KiB reaches 4 MiB, which fills a 300 ms path at 110 Mbit/s — beyond
+	// what the routes this runs on deliver, and still small enough that a
+	// handful of streams fit in a 1 GB server.
+	windowGrowthFactor = 8
+
+	// maxStreamWindow is the hard ceiling on one stream's advertised window,
+	// independent of profile. It stays at half of maxRecvBuffer so a conformant
+	// peer filling its whole window cannot reach the guard meant for one that
+	// ignores flow control. At 8 MiB it fills a 100 ms path at 670 Mbit/s, well
+	// past what these routes carry.
+	maxStreamWindow = maxRecvBuffer / 2
+
+	// maxSessionWindow bounds the sum of every stream's advertised window. The
+	// per-stream ceiling alone does not bound the product, and the sum is what
+	// this host may have to hold at once. Kept under maxSessionRecvBuffer so a
+	// conformant peer filling every window cannot trip the buffer ceiling and
+	// have its session torn down for behaving correctly.
+	maxSessionWindow = 48 * 1024 * 1024
+
+	// growPeriod is how quickly a stream must turn over its whole window to be
+	// considered window-limited. Comfortably above any real round trip on the
+	// routes this runs on, so a slow path is not mistaken for a small window.
+	growPeriod = 500 * time.Millisecond
 )
 
 // header is the fixed 10-byte frame header.

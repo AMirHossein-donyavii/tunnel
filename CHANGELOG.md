@@ -4,6 +4,48 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-08-11
+
+Throughput, in the two places a fixed number was standing in for the path.
+
+### Changed
+
+- **The mux receive window now auto-tunes.** It was fixed per performance
+  profile, chosen from how much RAM the server has — but the window caps a
+  single stream at window/RTT no matter what the link carries. The small-server
+  profile's 512 KiB over a 100 ms route is 42 Mbit/s. Downloads hide that by
+  spreading over many streams; one upload does not, which is why upload felt far
+  worse than download on the same tunnel.
+
+  A stream that turns over its whole window inside 500 ms is window-limited by
+  definition, so its window doubles, up to 8× its initial size and never past
+  the per-stream buffer guard. Growth is also bounded across the session, so
+  many streams together cannot walk past the ceiling that protects this host's
+  RAM, and a closed stream returns its share. A stream that drains a window
+  slowly is left alone: that is the path being the limit, and growing would only
+  add buffering.
+
+- **TCP carriers leave SO_RCVBUF to the kernel.** Pinning it disables
+  `tcp_moderate_rcvbuf`, after which the receive window can never exceed what
+  was pinned — the resource profile pinned 256 KiB, a 21 Mbit/s ceiling per link
+  over a 100 ms route, landing on whichever direction flows *into* that server.
+  The send buffer was already left to autotuning for the mirror-image reason;
+  now both are. An explicit `so_rcvbuf` still pins it. Datagram carriers are
+  unchanged — UDP has no autotuning and still needs a real size.
+
+### Measured
+
+An existing test already showed the window is the binding constraint at only
+10 ms of RTT: 512 KiB window = 103 MiB/s, 4 MiB window = 252 MiB/s, a 2.5x gap
+that widens as latency grows.
+
+The socket-buffer change cannot be demonstrated here: this environment has no
+`sch_netem`, so the only available path is loopback, where the bandwidth-delay
+product is ~zero and no BDP fix can show. Three runs of a single-stream TUN/TCP
+transfer came out at 1476/1789/1622 Mbit/s against 1692 before — the same within
+noise, which establishes no regression and nothing more. The gain exists only
+where latency does, and belongs on a real route.
+
 ## [2.2.2] — 2026-08-11
 
 ### Fixed

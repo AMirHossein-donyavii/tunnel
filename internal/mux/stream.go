@@ -23,6 +23,15 @@ type Stream struct {
 	rFIN     bool   // peer sent FIN
 	consumed int    // bytes consumed since last WINDOW_UPDATE
 
+	// Receive-window auto-tuning. A fixed window caps a single stream at
+	// window/RTT no matter how fast the path is: 512 KiB over a 100 ms route is
+	// 42 Mbit/s, which is why one upload stream crawls on a link that measures
+	// far higher. The window has to follow the path, and the only thing the
+	// receiver can see of the path is how quickly it drains what it advertised.
+	win        int       // currently advertised receive window
+	drained    int       // bytes consumed since lastGrow
+	lastGrow   time.Time // when the window was last reconsidered
+
 	// send side
 	wmu     sync.Mutex
 	wcond   *sync.Cond
@@ -54,7 +63,9 @@ func newStream(id uint32, s *Session, hi bool) *Stream {
 	if win <= 0 {
 		win = defaultWindow
 	}
-	st := &Stream{id: id, s: s, hi: hi, sendWin: win, winGrip: win / 2}
+	st := &Stream{id: id, s: s, hi: hi, sendWin: win, winGrip: win / 2,
+		win: win, lastGrow: time.Now()}
+	s.winTotal.Add(int64(win))
 	st.rcond = sync.NewCond(&st.rmu)
 	st.wcond = sync.NewCond(&st.wmu)
 	return st
@@ -117,10 +128,12 @@ func (st *Stream) Read(p []byte) (int, error) {
 		st.rbuf = nil // release backing array
 	}
 	st.consumed += n
+	st.drained += n
 	var grant int
 	if st.consumed >= st.winGrip {
 		grant = st.consumed
 		st.consumed = 0
+		grant += st.growLocked()
 	}
 	st.rmu.Unlock()
 
@@ -132,6 +145,51 @@ func (st *Stream) Read(p []byte) (int, error) {
 		_ = st.s.queue(outFrame{typ: frameWinUp, id: st.id, ctl: uint32(grant)}, true)
 	}
 	return n, nil
+}
+
+// growLocked doubles the receive window when the reader is draining it faster
+// than the window allows, and returns the extra credit to hand the peer.
+//
+// Turning over a whole window inside growPeriod means the sender had more to
+// send and the window is what stopped it — the definition of window-limited.
+// Doubling then costs one more round trip to take effect and halves the number
+// of times it must happen, so a long path converges in a few steps.
+//
+// The growth is bounded twice: per stream, so one transfer cannot claim
+// unlimited memory; and across the session, so many streams together stay under
+// the ceiling that guards this host's RAM. Hitting either bound leaves the
+// window where it is, which is the old fixed behaviour rather than a failure.
+//
+// Callers hold rmu.
+func (st *Stream) growLocked() int {
+	now := time.Now()
+	if st.drained < st.win {
+		if now.Sub(st.lastGrow) > growPeriod {
+			// Not window-limited in this period; start a fresh one.
+			st.drained, st.lastGrow = 0, now
+		}
+		return 0
+	}
+	elapsed := now.Sub(st.lastGrow)
+	st.drained, st.lastGrow = 0, now
+	if elapsed > growPeriod {
+		return 0 // drained a window, but slowly: the path is the limit, not us
+	}
+
+	next := st.win * 2
+	if max := st.s.maxWindow(); next > max {
+		next = max
+	}
+	if next <= st.win {
+		return 0
+	}
+	extra := next - st.win
+	if !st.s.reserveWindow(extra) {
+		return 0
+	}
+	st.win = next
+	st.winGrip = next / 2
+	return extra
 }
 
 func (st *Stream) readErr() error {
@@ -227,3 +285,10 @@ func (st *Stream) setErr(err error) {
 // SetReadDeadline is a no-op shim; callers drive lifetime via Close/ctx. It
 // exists so a Stream can stand in where a minimal deadline setter is expected.
 func (st *Stream) SetReadDeadline(time.Time) error { return nil }
+
+// windowForTest reports the currently advertised receive window.
+func (st *Stream) windowForTest() int {
+	st.rmu.Lock()
+	defer st.rmu.Unlock()
+	return st.win
+}

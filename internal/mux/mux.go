@@ -73,6 +73,8 @@ type Session struct {
 
 	// rxBuffered is the total delivered-but-unread bytes across all streams.
 	rxBuffered atomic.Int64
+	// winTotal is the sum of every live stream's advertised receive window.
+	winTotal atomic.Int64
 
 	pingMu  sync.Mutex
 	pings   map[uint32]chan struct{}
@@ -253,6 +255,42 @@ func (s *Session) errOrClosed() error {
 // accountRecv adjusts the session-wide receive accounting and tears the session
 // down if a peer has pushed past the ceiling that per-stream flow control is
 // supposed to keep it under.
+// maxWindow is the ceiling a single stream's receive window may auto-tune to.
+// It is derived from the configured initial window rather than set separately,
+// so a small server stays small and a large one is allowed to fill a long path.
+func (s *Session) maxWindow() int {
+	w := s.cfg.Window
+	if w <= 0 {
+		w = defaultWindow
+	}
+	w *= windowGrowthFactor
+	// Never above the per-stream buffer guard. That guard exists to bound a peer
+	// that ignores flow control, but a window larger than it would let a peer
+	// that obeys flow control trip it — and be torn down for behaving correctly.
+	if w > maxStreamWindow {
+		w = maxStreamWindow
+	}
+	return w
+}
+
+// reserveWindow accounts for growth against the session's total advertised
+// window. Flow control bounds a conformant peer to its window per stream, so
+// the sum of the windows is what this host may have to hold; letting it grow
+// without limit would turn a throughput fix into an out-of-memory one.
+func (s *Session) reserveWindow(extra int) bool {
+	for {
+		cur := s.winTotal.Load()
+		if cur+int64(extra) > maxSessionWindow {
+			return false
+		}
+		if s.winTotal.CompareAndSwap(cur, cur+int64(extra)) {
+			return true
+		}
+	}
+}
+
+func (s *Session) releaseWindow(n int) { s.winTotal.Add(-int64(n)) }
+
 func (s *Session) accountRecv(delta int) {
 	if s.rxBuffered.Add(int64(delta)) > maxSessionRecvBuffer {
 		s.closeWithErr(errors.New("mux: peer exceeded the session receive buffer ceiling"))
@@ -310,8 +348,20 @@ func (s *Session) queue(f outFrame, hi bool) error {
 
 func (s *Session) removeStream(id uint32) {
 	s.mu.Lock()
+	st := s.streams[id]
 	delete(s.streams, id)
 	s.mu.Unlock()
+	// Hand the stream's advertised window back to the session budget. Without
+	// this a long-lived session leaks budget as streams come and go, and once it
+	// is exhausted no stream can ever auto-tune again — the fix would quietly
+	// stop working on exactly the sessions that run long enough to need it.
+	if st != nil {
+		st.rmu.Lock()
+		w := st.win
+		st.win = 0
+		st.rmu.Unlock()
+		s.releaseWindow(w)
+	}
 }
 
 // resetStream removes a stream AND discards whatever it still has queued. Used

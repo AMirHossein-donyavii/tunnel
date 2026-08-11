@@ -49,13 +49,24 @@ const notSentLowat = 128 << 10
 // seconds of already-buffered bytes — classic bufferbloat, and the direct cause
 // of the ~10 s tunnelled ping. Linux tcp_wmem autotuning tracks the BDP, so BBR
 // still gets at least a bandwidth-delay-product of buffer (no throughput loss)
-// without the standing queue. The receive buffer keeps its profile size — a
-// large RcvBuf does not cause sender-side bufferbloat.
+// without the standing queue.
+//
+// RcvBuf is left to autotuning for the opposite reason. Pinning SO_RCVBUF does
+// not cause bufferbloat, but it does switch off tcp_moderate_rcvbuf, and from
+// then on the receive window can never exceed what was pinned. The resource
+// profile pinned 256 KiB, which over a 100 ms route is a 21 Mbit/s ceiling on
+// one link no matter what the path can carry — and it lands on whichever
+// direction flows *into* that server, which is why upload suffered while
+// download, spread over many connections, did not. The kernel's autotuner
+// tracks the bandwidth-delay product and grows to tcp_rmem's ceiling, so it can
+// only do better than a fixed number chosen from how much RAM the box has.
+//
+// An explicit override still pins both, for an operator who has measured their
+// path and wants a specific size.
 func LinkOptions(profile string, sndOverride, rcvOverride int) Options {
-	_, rcv := BufSizes(profile, 0, rcvOverride)
 	o := Options{
-		SndBuf:      sndOverride, // 0 => kernel autotune; only an explicit override pins it
-		RcvBuf:      rcv,
+		SndBuf: sndOverride, // 0 => kernel autotune; only an explicit override pins it
+		RcvBuf: rcvOverride, // likewise: pinning it would cap the receive window
 		UserTimeout: 12 * time.Second,
 		Keepalive:   10 * time.Second,
 		BBR:         true,
