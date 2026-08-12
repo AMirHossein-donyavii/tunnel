@@ -43,9 +43,22 @@ func (icmpCodec) proto() int      { return 1 }
 // The echo message is built and read through the shared framing helpers rather
 // than golang.org/x/net/icmp, which allocated a message and a body per packet
 // in each direction. The bytes are identical — see the framing test.
+//
+// Each payload also carries a direction tag, for the same reason the TUN icmp
+// carrier does: the listener's kernel answers echo requests on its own, and its
+// reply repeats our payload with our echo id, which is everything this codec
+// matched on. The dialer accepted that mirror as if the peer had sent it, fed
+// its own ciphertext to the handshake, and the link never came up — this
+// profile carried no traffic at all unless echo replies were switched off
+// host-wide, which also stops the server answering ping.
 func (icmpCodec) encode(buf []byte, _, _ net.IP, key, _ int, seq int, data []byte, reply bool) []byte {
 	off := len(buf)
+	tag := byte(tagToListener)
+	if reply {
+		tag = tagToDialer
+	}
 	buf = appendEchoHeader(buf, false, reply, key, seq)
+	buf = append(buf, tag)
 	buf = append(buf, data...)
 	finishICMP(buf[off:], false)
 	return buf
@@ -56,11 +69,22 @@ func (icmpCodec) matchClient(p []byte, myKey, _ int) ([]byte, bool) {
 	if !ok || id != myKey {
 		return nil, false
 	}
-	return data, true
+	// Tagged for the listener means it is our own request coming back.
+	return stripTag(data, tagToDialer)
 }
 
 func (icmpCodec) parseServer(p []byte, _ int) ([]byte, int, bool) {
-	return parseEchoMsg(p, false, false)
+	data, id, ok := parseEchoMsg(p, false, false)
+	if !ok {
+		return nil, 0, false
+	}
+	// Also rejects ordinary ping traffic from strangers, which would otherwise
+	// open a flow per source and be offered to the handshake.
+	data, ok = stripTag(data, tagToListener)
+	if !ok {
+		return nil, 0, false
+	}
+	return data, id, true
 }
 
 // ---- TCP codec (bare segments, no handshake) -------------------------------

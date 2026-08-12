@@ -437,6 +437,26 @@ func (c *Config) validateSPF() error {
 	if src.Equal(dst) {
 		return fmt.Errorf("spoof_src_ip and spoof_dst_ip must differ (they are reversed on the two servers)")
 	}
+	// Both sides need peer, including the LISTENER — which is unusual, and is why
+	// it is checked here rather than left to the generic dialer-side rule.
+	//
+	// A spoofed-source packet carries a forged sender, so the listener cannot
+	// learn where its peer really is by looking at what arrives: every inbound
+	// packet claims to come from spoof_dst_ip. The real address it must send back
+	// to has to be configured. Without it the engine started and then failed at
+	// the first packet, which meant the whole SPF section produced tunnels that
+	// could never connect.
+	if strings.TrimSpace(c.Peer) == "" {
+		return fmt.Errorf("peer is required on BOTH servers for the SPF engine: " +
+			"packets carry a spoofed source, so this server cannot learn the other's " +
+			"real address from them — set peer to the other server's public IP")
+	}
+	if net.ParseIP(strings.TrimSpace(c.Peer)).To4() == nil {
+		return fmt.Errorf("peer %q must be an IPv4 address for the SPF engine", c.Peer)
+	}
+	if src.To4() == nil || dst.To4() == nil {
+		return fmt.Errorf("spoof_src_ip and spoof_dst_ip must be IPv4 addresses for the SPF engine")
+	}
 	return nil
 }
 

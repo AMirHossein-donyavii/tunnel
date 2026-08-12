@@ -36,24 +36,32 @@ func Apply(cfg *config.Config, iface string, log Logger) error {
 	if err != nil {
 		return err
 	}
-	if len(rules) == 0 {
+	needRST := SPFNeedsRSTDrop(cfg)
+	if len(rules) == 0 && !needRST {
 		return nil
 	}
 	ipt, err := locate()
 	if err != nil {
 		return err
 	}
-	enableForwarding(log) // global sysctl; best-effort (panel persists it)
+	if len(rules) > 0 {
+		enableForwarding(log) // global sysctl; best-effort (panel persists it)
+	}
 
 	tag := Tag(cfg.Name)
 	ipt.sweep(tag) // clear any prior/duplicate rules for this tunnel
 
-	all := make([]iptRule, 0, len(rules)*4+1)
+	all := make([]iptRule, 0, len(rules)*4+3)
 	for _, r := range rules {
 		all = append(all, rulesFor(r, iface, tag)...)
 	}
-	// One MSS clamp per tunnel guards TCP forwards against MTU blackholing.
-	all = append(all, mssClampRule(iface, tag))
+	if len(rules) > 0 {
+		// One MSS clamp per tunnel guards TCP forwards against MTU blackholing.
+		all = append(all, mssClampRule(iface, tag))
+	}
+	if needRST {
+		all = append(all, spfRSTRules(cfg.TunnelPort, tag)...)
+	}
 	for _, ir := range all {
 		if err := ipt.add(ir); err != nil {
 			ipt.sweep(tag) // roll back the partial set
@@ -61,7 +69,12 @@ func Apply(cfg *config.Config, iface string, log Logger) error {
 		}
 	}
 	if log != nil {
-		log.Info("Port forwarding enabled: %d rule(s) -> %s via %s (mss clamped to path mtu)", len(rules), cfg.PeerTunIP, iface)
+		if len(rules) > 0 {
+			log.Info("Port forwarding enabled: %d rule(s) -> %s via %s (mss clamped to path mtu)", len(rules), cfg.PeerTunIP, iface)
+		}
+		if needRST {
+			log.Info("SPF tcp: suppressing the kernel's resets on port %d (the carrier's segments belong to no socket)", cfg.TunnelPort)
+		}
 	}
 	return nil
 }
@@ -70,7 +83,7 @@ func Apply(cfg *config.Config, iface string, log Logger) error {
 // name (a comment sweep), so it is safe to call after an ungraceful kill when
 // the applying process — and its iface — are already gone.
 func Remove(cfg *config.Config, log Logger) {
-	if !Enabled(cfg) {
+	if !Enabled(cfg) && !SPFNeedsRSTDrop(cfg) {
 		return
 	}
 	ipt, err := locate()
@@ -78,7 +91,7 @@ func Remove(cfg *config.Config, log Logger) {
 		return
 	}
 	if n := ipt.sweep(Tag(cfg.Name)); n > 0 && log != nil {
-		log.Info("Port forwarding removed: %d rule(s)", n)
+		log.Info("Firewall rules removed: %d", n)
 	}
 }
 

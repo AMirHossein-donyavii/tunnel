@@ -38,13 +38,7 @@ import (
 	"golang.org/x/net/icmp"
 )
 
-// Direction tags. The first payload byte says which way a datagram is
-// travelling, so a packet that comes back to its own sender — a kernel echo
-// reply mirroring our request — is recognisable and dropped.
-const (
-	tagToListener = 0xE1 // dialer -> listener, rides in Echo Requests
-	tagToDialer   = 0xE2 // listener -> dialer, rides in Echo Replies
-)
+// Direction tags live in icmpframe.go: the SPF icmp profile needs them too.
 
 type icmpProto struct {
 	network string // "ip4:icmp" or "ip6:ipv6-icmp"
@@ -403,17 +397,6 @@ func (f *icmpFlow) LocalAddr() net.Addr                { return f.l.pc.LocalAddr
 func (f *icmpFlow) RemoteAddr() net.Addr               { return f.src }
 
 // ---- codec -----------------------------------------------------------------
-
-// stripTag accepts a payload only when it carries the expected direction tag,
-// and returns it with the tag removed. Traffic travelling the other way — our
-// own request mirrored back by a kernel echo reply, or a stray ping from a
-// stranger — fails here instead of reaching the AEAD as a peer frame.
-func stripTag(data []byte, want byte) ([]byte, bool) {
-	if len(data) < 1 || data[0] != want {
-		return nil, false
-	}
-	return data[1:], true
-}
 
 // parseEcho returns the echo payload when raw is an echo of the wanted id and
 // the wanted direction (reply when wantReply, else request). See icmpframe.go

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func baseTUN() Config {
 	c := Defaults()
@@ -105,7 +108,9 @@ func TestValidateL3Forwards(t *testing.T) {
 	// SPF forwards are validated the same way (shared validateTUN path).
 	s := baseSPF()
 	s.Role = RoleIran
-	s.Peer = ""
+	// The listening side of an SPF tunnel needs a peer too: spoofed packets carry
+	// a forged source, so it cannot learn the real return address from them.
+	s.Peer = "198.51.100.7"
 	s.TunIP = "10.10.10.1/24"
 	s.PeerTunIP = "10.10.10.2"
 	s.Forwards = []string{"51820"}
@@ -447,5 +452,40 @@ func TestConfigWithoutHeartbeatValidates(t *testing.T) {
 	c.TunnelPort = 4000
 	if err := c.Validate(); err != nil {
 		t.Fatalf("a config with no heartbeat set must validate: %v", err)
+	}
+}
+
+// SPF is the one engine whose LISTENER also needs a peer, and the console only
+// ever asked the dialing side for one. The resulting config validated, the
+// service started, and then the carrier refused the first packet — so every SPF
+// tunnel anyone built could never connect. Validation now rejects it up front,
+// where the message can explain why.
+func TestSPFRequiresPeerOnTheListeningSideToo(t *testing.T) {
+	c := baseSPF()
+	c.Role = RoleIran
+	c.TunIP, c.PeerTunIP = "10.10.10.1/24", "10.10.10.2"
+	c.Peer = ""
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("an SPF listener with no peer was accepted; it cannot send a single " +
+			"packet back, because a spoofed source tells it nothing about where the peer is")
+	}
+	if !strings.Contains(err.Error(), "peer") {
+		t.Fatalf("the error must name peer so the operator knows what to set: %v", err)
+	}
+
+	c.Peer = "198.51.100.7"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an SPF listener with a peer must validate: %v", err)
+	}
+}
+
+// The carrier is IPv4-only; saying so at load beats failing at the first packet.
+func TestSPFRejectsIPv6Addresses(t *testing.T) {
+	c := baseSPF()
+	c.Peer = "2001:db8::1"
+	if err := c.Validate(); err == nil {
+		t.Fatal("an IPv6 peer was accepted for the SPF engine, which carries IPv4 only")
 	}
 }

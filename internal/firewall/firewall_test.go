@@ -145,3 +145,66 @@ func TestMSSClampRule(t *testing.T) {
 		t.Fatalf("\n got  %q\n want %q", got, want)
 	}
 }
+
+// The SPF tcp carrier puts the link inside bare TCP segments that no socket is
+// listening for, so the kernel resets them and the carrier dies at its first
+// packet. The console used to print an iptables command and trust the operator
+// to run it on both servers; anyone who did not got a tunnel that handshaked
+// forever and moved nothing. The tunnel installs the rule itself now.
+func TestSPFTCPGetsRSTSuppression(t *testing.T) {
+	c := config.Defaults()
+	c.Name, c.Engine, c.SpfProfile = "spf1", config.EngineSPF, config.SpfProfileTCP
+	c.TunnelPort = 4321
+
+	if !SPFNeedsRSTDrop(&c) {
+		t.Fatal("the SPF tcp carrier needs its resets suppressed")
+	}
+
+	rules := spfRSTRules(c.TunnelPort, Tag(c.Name))
+	if len(rules) != 2 {
+		t.Fatalf("got %d rules, want 2 — the tunnel port is the source on one side "+
+			"and the destination on the other", len(rules))
+	}
+	var sawSport, sawDport bool
+	for _, r := range rules {
+		if r.table != "filter" || r.chain != "OUTPUT" {
+			t.Fatalf("rule lands in %s/%s; the kernel's resets leave through filter/OUTPUT", r.table, r.chain)
+		}
+		joined := strings.Join(r.args, " ")
+		// Narrow: only resets, only this port, and tagged for a clean teardown.
+		for _, want := range []string{"--tcp-flags RST RST", "-j DROP", "4321", Tag(c.Name)} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("rule %q is missing %q", joined, want)
+			}
+		}
+		sawSport = sawSport || strings.Contains(joined, "--sport")
+		sawDport = sawDport || strings.Contains(joined, "--dport")
+	}
+	if !sawSport || !sawDport {
+		t.Fatal("both directions must be covered: the listener's reset carries the " +
+			"tunnel port as its source, the dialer's as its destination")
+	}
+}
+
+// Only that one carrier. Every other protocol's traffic belongs to a real
+// socket, and dropping resets for them would hide genuine connection failures.
+func TestOtherCarriersGetNoRSTSuppression(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		engine  string
+		profile string
+	}{
+		{"spf icmp", config.EngineSPF, config.SpfProfileICMP},
+		{"tun", config.EngineTUN, ""},
+		{"mux", config.EngineMux, ""},
+		{"direct", config.EngineDirect, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := config.Defaults()
+			c.Engine, c.SpfProfile = tc.engine, tc.profile
+			if SPFNeedsRSTDrop(&c) {
+				t.Fatal("resets suppressed for a carrier whose traffic has a real socket")
+			}
+		})
+	}
+}

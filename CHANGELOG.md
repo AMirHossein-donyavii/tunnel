@@ -4,6 +4,61 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.4.2] — 2026-08-12
+
+Both SPF profiles were unusable. Every protocol the console offers has now been
+run end to end and carries traffic.
+
+### Fixed
+
+- **SPF never connected, on either profile: the listener was never given a
+  peer.** SPF is the one carrier whose *listening* side also needs the other
+  server's address — its packets carry a forged source, so nothing that arrives
+  says where the peer really is, and a reply has nowhere to go. The console only
+  ever asked the dialing side. The resulting config passed validation, the
+  service started, and the carrier then refused its first packet. It asks both
+  sides now, and validation rejects the missing peer up front with a message
+  that explains why instead of letting it fail at runtime.
+
+- **SPF icmp carried no traffic even once connected — the same kernel mirror
+  that broke TUN/ICMP.** A listener's kernel answers echo requests by itself,
+  and its reply repeats our payload with our echo id, which was everything this
+  codec matched on. The dialer accepted that mirror as peer traffic and fed its
+  own ciphertext to the handshake. The profile appeared to work only with
+  `net.ipv4.icmp_echo_ignore_all=1`, which also stops the server answering ping
+  on every interface. It now carries the same one-byte direction tag the TUN
+  carrier uses; the wire format lives in one file shared by both, so a fix to
+  one can no longer miss the other. Verified carrying 623 Mbit/s while the
+  server still answers ordinary ping normally.
+
+- **SPF tcp needed a firewall rule the operator had to add by hand.** That
+  profile puts the link inside bare TCP segments no socket is listening for, so
+  the kernel answers each with a reset and the carrier dies immediately. The
+  console printed an iptables command and trusted people to run it on both
+  servers — anyone who did not got a tunnel that handshaked forever. The tunnel
+  installs the rule itself now, scoped to the tunnel port and the reset flag,
+  tagged like every other rule it owns so it is removed on stop.
+
+### Measured
+
+Every protocol the console offers, run end to end on the two-namespace bed and
+required to carry real bytes (resource/balance profile, CPU-bound loopback):
+
+| | Mbit/s | | Mbit/s |
+|---|---|---|---|
+| Basic TCP (direct) | 6790 | TUN TCP | 2062 |
+| Basic TCPMUX | 2058 | TUN UDP | 1179 |
+| Basic WS (direct) | 1638 | TUN ICMP | 705 |
+| Basic WSMUX | 1861 | SPF ICMP | 623 |
+| Backpack WSS | 1687 | SPF TCP | 641 |
+| Backpack Stealth | 1471 | Backpack QUIC | 1253 |
+| Basic/Backpack UDP | 354 | | |
+
+BIP could not be exercised here — this environment refuses an ICMPv6 raw socket
+(`address family not supported`), which is a property of the container, not of
+the carrier. Its framing is covered by the byte-for-byte test against the
+library, and it shares every other code path with the ICMP carrier.
+
 ## [2.4.1] — 2026-08-11
 
 A dead path was taking 20 seconds to notice. It now takes 5.

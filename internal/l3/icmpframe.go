@@ -15,6 +15,33 @@ import "golang.org/x/net/ipv4"
 // which is why this file is shared rather than duplicated per carrier, and why
 // the framing test asserts these bytes against the library they replaced.
 
+// Direction tags. The first payload byte says which way a datagram is
+// travelling, so a packet that comes back to its own sender — a kernel echo
+// reply mirroring our own request — is recognisable and dropped.
+//
+// A listener's kernel answers echo requests by itself, and its reply repeats our
+// payload verbatim with the same ICMP id: by address and id alone it is
+// indistinguishable from a real reply from the peer. Both ICMP carriers here —
+// the TUN icmp/bip modes and the SPF icmp profile — are built on echo messages
+// and both are fooled by it. The alternative, switching off echo replies
+// host-wide, costs the server the ability to answer ping on any interface,
+// including its own tunnel address.
+const (
+	tagToListener = 0xE1 // dialer -> listener, rides in Echo Requests
+	tagToDialer   = 0xE2 // listener -> dialer, rides in Echo Replies
+)
+
+// stripTag accepts a payload only when it carries the expected direction tag,
+// and returns it with the tag removed. Traffic travelling the other way — our
+// own request mirrored back by a kernel echo reply, or a stray ping from a
+// stranger — fails here instead of reaching the AEAD as a peer frame.
+func stripTag(data []byte, want byte) ([]byte, bool) {
+	if len(data) < 1 || data[0] != want {
+		return nil, false
+	}
+	return data[1:], true
+}
+
 const (
 	icmpEchoHdr = 8 // type, code, checksum, id, seq
 

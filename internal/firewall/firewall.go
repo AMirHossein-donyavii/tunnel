@@ -116,6 +116,37 @@ func mssClampRule(iface, tag string) iptRule {
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}}
 }
 
+// spfRSTRules stop the kernel from tearing down the SPF tcp carrier.
+//
+// That profile puts the encrypted link inside bare TCP segments that no socket
+// on either host is listening for. The kernel does what it does for any segment
+// to a port nothing has open: it answers with a RST, and the carrier dies at the
+// first packet. The console has always told operators to add this rule by hand
+// on both servers, which means the profile silently failed for everyone who did
+// not — measured here as a tunnel that handshakes forever and moves nothing.
+//
+// Two rules, because the port sits on opposite ends depending on direction: the
+// listener's RST would carry the tunnel port as its SOURCE (it is answering
+// something addressed there), the dialer's as its DESTINATION. Both are matched
+// on the RST flag and the tunnel port alone, so nothing else on the host is
+// affected, and both carry the tunnel's tag so teardown removes exactly these.
+func spfRSTRules(port int, tag string) []iptRule {
+	p := strconv.Itoa(port)
+	comment := []string{"-m", "comment", "--comment", tag}
+	rule := func(dir string) iptRule {
+		args := append([]string{"-p", "tcp", dir, p, "--tcp-flags", "RST", "RST"}, comment...)
+		return iptRule{"filter", "OUTPUT", append(args, "-j", "DROP")}
+	}
+	return []iptRule{rule("--sport"), rule("--dport")}
+}
+
+// SPFNeedsRSTDrop reports whether this tunnel is the SPF tcp carrier, which
+// cannot survive the kernel's own resets. Unlike port forwarding this applies to
+// BOTH servers: each one's kernel resets what the other sends it.
+func SPFNeedsRSTDrop(cfg *config.Config) bool {
+	return cfg.IsSPF() && cfg.SpfProfile == config.SpfProfileTCP
+}
+
 // Tag is the iptables comment stamped on every rule this tunnel owns. Teardown
 // removes exactly the rules carrying this tag, so tunnels never disturb each
 // other's rules or anything the operator added by hand.

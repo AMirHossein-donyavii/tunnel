@@ -60,3 +60,52 @@ func TestTCPCodecRoundTrip(t *testing.T) {
 		t.Fatalf("tcp checksum should verify to 0, got %#04x", got)
 	}
 }
+
+// The SPF icmp profile is built on echo messages, so it has the same exposure
+// as the TUN icmp carrier: the listener's kernel answers echo requests by
+// itself, and its reply repeats our payload with our echo id — which was
+// everything this codec matched on. The dialer accepted that mirror as peer
+// traffic, fed its own ciphertext to the handshake, and the profile carried
+// nothing at all. It appeared to work only with net.ipv4.icmp_echo_ignore_all=1,
+// which costs the server ping on every interface.
+func TestSPFICMPRejectsTheKernelsMirroredRequest(t *testing.T) {
+	c := icmpCodec{}
+	const key = 4242
+	frame := []byte("encrypted frame")
+
+	// What the dialer put on the wire.
+	req := c.encode(nil, nil, nil, key, 0, 1, frame, false)
+
+	// The listener's kernel mirrors it back: same bytes, same id, but the type
+	// flipped to Echo Reply. That is indistinguishable from a real reply by
+	// address and id, so only the direction tag can reject it.
+	mirrored := append([]byte(nil), req...)
+	mirrored[0] = icmpTypeEchoReplyV4
+	if _, _, ok := parseEchoMsg(mirrored, false, true); !ok {
+		t.Fatal("the mirror no longer parses as a reply; the test has stopped exercising the case")
+	}
+	if got, ok := c.matchClient(mirrored, key, 0); ok {
+		t.Fatalf("dialer accepted its own request mirrored back as %q — the link "+
+			"carries no traffic and cycles forever", got)
+	}
+
+	// A genuine reply from the listener is still accepted, unchanged.
+	rep := c.encode(nil, nil, nil, key, 0, 2, frame, true)
+	got, ok := c.matchClient(rep, key, 0)
+	if !ok || !bytes.Equal(got, frame) {
+		t.Fatalf("genuine reply rejected or mistrimmed: %q ok=%v", got, ok)
+	}
+}
+
+// And the listener must ignore ordinary ping traffic, which would otherwise
+// open a flow per source and be offered to the handshake.
+func TestSPFICMPListenerIgnoresOrdinaryPing(t *testing.T) {
+	var ping []byte
+	ping = appendEchoHeader(ping, false, false, 7, 1)
+	ping = append(ping, []byte("abcdefgh")...) // a real ping's payload
+	finishICMP(ping, false)
+
+	if _, _, ok := (icmpCodec{}).parseServer(ping, 0); ok {
+		t.Fatal("a plain ping was accepted as a tunnel frame")
+	}
+}

@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.4.2"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -455,6 +455,15 @@ common_endpoint() {
         else
             cfg_set peer "$(ask_ip "Iran server public IP")"
         fi
+    elif [ "${CFG[engine]:-}" = "spf" ]; then
+        # SPF is the one carrier whose LISTENER also needs the peer address.
+        # Its packets carry a spoofed source, so nothing that arrives says where
+        # the other server actually is, and replies would have nowhere to go.
+        # Only the dialing side was ever asked, so every SPF tunnel built here
+        # failed at its first packet.
+        note "SPF spoofs the source address, so this server cannot learn where the"
+        note "other one is from the packets it receives — it has to be told."
+        cfg_set peer "$(ask_ip "Foreign (Kharej) server public IP")"
     fi
     cfg_set health_port "$(next_free_port 9090)"
 }
@@ -824,8 +833,9 @@ section_spf() {
     tun_addressing
     forwards_prompt
     if [ "$p" = "tcp" ]; then
-        echo; warn "For the TCP profile, drop the kernel's RSTs on BOTH servers:"
-        note "iptables -A OUTPUT -p tcp --sport ${CFG[tunnel_port]} --tcp-flags RST RST -j DROP"
+        echo; note "The tunnel installs the rule that stops the kernel resetting its own"
+        note "carrier (its segments belong to no socket, so the kernel would answer"
+        note "each one with a RST). It is scoped to port ${CFG[tunnel_port]} and removed on stop."
     fi
     finish_tunnel
 }

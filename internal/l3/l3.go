@@ -207,12 +207,16 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.log.Debug("tuning: batch=%d channel=%d hb=%s/%s sndbuf=%d rcvbuf=%d",
 		e.batchSize, e.channelSize, e.hbInterval, e.hbTimeout, e.sndbuf, e.rcvbuf)
 
-	// Port forwarding: DNAT the configured VPN/service ports across the tunnel to
-	// the peer. Applied once the interface is up and torn down on shutdown. A
-	// failure here is logged but never stops the data plane.
-	if firewall.Enabled(e.cfg) {
+	// Kernel rules this tunnel owns: the DNAT set for forwarded VPN/service
+	// ports, and — for the SPF tcp carrier — the drop that stops the kernel
+	// resetting its own link. Applied once the interface is up and torn down on
+	// shutdown. A failure here is logged but never stops the data plane.
+	//
+	// The SPF rules are needed whether or not anything is forwarded, so this can
+	// not be gated on forwarding alone.
+	if firewall.Enabled(e.cfg) || firewall.SPFNeedsRSTDrop(e.cfg) {
 		if err := firewall.Apply(e.cfg, dev.Name(), e.log); err != nil {
-			e.log.Warn("port forwarding not applied (tunnel continues): %v", err)
+			e.log.Warn("firewall rules not applied (tunnel continues): %v", err)
 		}
 		defer firewall.Remove(e.cfg, e.log)
 	}
