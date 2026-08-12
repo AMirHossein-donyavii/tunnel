@@ -4,6 +4,42 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.5.2] — 2026-08-12
+
+The UDP forwarding in 2.5.0/2.5.1 could crash the whole process. Fixed.
+
+### Fixed
+
+- **A tunnel carrying UDP could die outright and not come back.** Tearing a UDP
+  session down closed the queue the socket read loop was still writing to, and a
+  send on a closed channel panics — so the process died, taking every other
+  tunnel on that server with it. systemd restarted it and the next teardown
+  killed it again.
+
+  It needed traffic *and* a session ending, which is why it looked like the
+  tunnel worked, passed some data, then dropped completely and never
+  reconnected. The trigger is ordinary: an idle client reaped, a stream error,
+  or the carrier reconnecting — which closes every stream at once and so ends
+  every UDP session at once, while datagrams are still arriving.
+
+  A session now ends by signalling, and the queue is never closed. Proven both
+  ways: the old teardown fails the new test with `send on closed channel`, the
+  new one passes it, and the suite runs clean under `-race`. A churn test — 300
+  short-lived clients created and destroyed while traffic flows — completes
+  300/300 with the process alive and no panics.
+
+- **QUIC now says why it could not connect.** The library reports a handshake
+  that gets no answer as "no recent network activity", which sends people
+  looking for a fault that is not there. Since this transport is the only UDP
+  one, the message now names the causes in order: udp/port not open on both
+  servers (a rule for tcp alone is the usual reason), or a network that blocks
+  QUIC/HTTP-3 specifically even where TCP works — in which case Stealth or WSS
+  are the carriers to use, because they are TCP.
+
+  Worth stating plainly: QUIC was tested here over a 40-second idle session and
+  a full data transfer and behaved correctly, so a QUIC that never connects is
+  the path, not the build.
+
 ## [2.5.1] — 2026-08-12
 
 The UDP forwarding added in 2.5.0 had a flaw that showed up exactly where a VPN

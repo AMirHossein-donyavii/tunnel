@@ -199,10 +199,20 @@ func giveDgram(b []byte) {
 // port's traffic. Overflow drops, which is what the UDP path being replaced here
 // would have done anyway.
 type udpSession struct {
-	st   *mux.Stream
-	out  chan dgram
+	st  *mux.Stream
+	out chan dgram
+	// closed is how a session ends. The queue itself is NEVER closed.
+	//
+	// It was, once, and that was a crash: teardown ran on the reaper's goroutine
+	// or the return pump's while the socket read loop was still offering
+	// datagrams, and a send on a closed channel panics. The tunnel therefore
+	// carried traffic normally until the first session ended — an idle client, a
+	// stream error — and then the whole process died and took every other tunnel
+	// on the server with it. A signal that senders can watch has no such window.
+	closed  chan struct{}
+	closeOn sync.Once
+
 	last atomic.Int64 // unix nanos of the last datagram from this client
-	once sync.Once
 	// dropped counts what congestion cost this client, for the log line that
 	// tells an operator the carrier is the limit rather than the tunnel.
 	dropped atomic.Uint64
@@ -210,13 +220,25 @@ type udpSession struct {
 
 func (s *udpSession) touch() { s.last.Store(time.Now().UnixNano()) }
 
+// shutdown ends the session exactly once.
+func (s *udpSession) shutdown() {
+	s.closeOn.Do(func() { close(s.closed) })
+}
+
 // offer queues a datagram without ever blocking. A full queue means the carrier
 // cannot keep up; the newest datagram is dropped, exactly as a saturated network
 // path would drop it.
 func (s *udpSession) offer(p []byte) {
+	select {
+	case <-s.closed:
+		return
+	default:
+	}
 	d := dgram{b: takeDgram(p), enq: time.Now()}
 	select {
 	case s.out <- d:
+	case <-s.closed:
+		giveDgram(d.b)
 	default:
 		giveDgram(d.b)
 		s.dropped.Add(1)
@@ -228,10 +250,15 @@ func (s *udpSession) offer(p []byte) {
 func (s *udpSession) pump(done func()) {
 	defer done()
 	scratch := make([]byte, 0, 2048)
-	for d := range s.out {
-		stale := time.Since(d.enq) > udpStale
+	for {
+		var d dgram
+		select {
+		case <-s.closed:
+			return
+		case d = <-s.out:
+		}
 		b := d.b
-		if stale {
+		if time.Since(d.enq) > udpStale {
 			// Past its shelf life: sending it now would be a duplicate of
 			// something the inner transport already replaced.
 			s.dropped.Add(1)
@@ -284,18 +311,21 @@ func (e *Engine) serveUDPForward(ctx context.Context, port int, t target) {
 	var mu sync.Mutex
 	sessions := map[netip.AddrPort]*udpSession{}
 	drop := func(key netip.AddrPort, s *udpSession) {
-		s.once.Do(func() {
-			mu.Lock()
-			if sessions[key] == s {
-				delete(sessions, key)
-			}
-			mu.Unlock()
-			close(s.out)
-			_ = s.st.Close()
-			if n := s.dropped.Load(); n > 0 {
-				e.log.Info("udp/%d: %d datagram(s) dropped for one client — the carrier could not keep up", port, n)
-			}
-		})
+		select {
+		case <-s.closed:
+			return // already gone
+		default:
+		}
+		mu.Lock()
+		if sessions[key] == s {
+			delete(sessions, key)
+		}
+		mu.Unlock()
+		s.shutdown() // signals senders and pumps; never closes the queue
+		_ = s.st.Close()
+		if n := s.dropped.Load(); n > 0 {
+			e.log.Info("udp/%d: %d datagram(s) dropped for one client — the carrier could not keep up", port, n)
+		}
 	}
 	go e.reapUDP(ctx, &mu, sessions, drop)
 
@@ -317,7 +347,7 @@ func (e *Engine) serveUDPForward(ctx context.Context, port int, t target) {
 			if st == nil {
 				continue // no session available; the datagram is dropped, as UDP allows
 			}
-			s = &udpSession{st: st, out: make(chan dgram, udpQueueDepth)}
+			s = &udpSession{st: st, out: make(chan dgram, udpQueueDepth), closed: make(chan struct{})}
 			s.touch()
 			mu.Lock()
 			sessions[src] = s
@@ -445,7 +475,7 @@ func (e *Engine) serveExitUDP(st *mux.Stream, port int) {
 	// for the same reason: the stream blocks when the peer's window is full, and
 	// a blocked write here would stop this socket being read at all. The return
 	// direction is the download, so a stall here is what a user feels most.
-	back := &udpSession{st: st, out: make(chan dgram, udpQueueDepth)}
+	back := &udpSession{st: st, out: make(chan dgram, udpQueueDepth), closed: make(chan struct{})}
 	pumped := make(chan struct{})
 	go func() { defer close(pumped); back.pump(func() {}) }()
 
@@ -474,7 +504,7 @@ func (e *Engine) serveExitUDP(st *mux.Stream, port int) {
 	}
 	_ = pc.Close()
 	<-done
-	close(back.out)
+	back.shutdown()
 	<-pumped
 	if n := back.dropped.Load(); n > 0 {
 		e.log.Info("udp/%d: %d datagram(s) dropped on the return path — the carrier could not keep up", port, n)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -237,4 +238,43 @@ func TestRecycledDatagramBuffersDoNotLeakContents(t *testing.T) {
 		t.Fatalf("recycled buffer came back as %q, want %q", short, "hi")
 	}
 	giveDgram(short)
+}
+
+// The socket read loop offers datagrams while a session may be torn down by the
+// reaper, by a stream error, or by the return pump ending.
+//
+// Teardown used to close the queue. A send on a closed channel panics, so the
+// tunnel carried traffic normally until the FIRST session ended — an idle
+// client, one stream error — and then the process died, taking every other
+// tunnel on that server with it and not coming back. "Passed some data, then
+// dropped completely and never reconnected" is exactly what that looks like.
+//
+// A session now ends by signalling, and the queue is never closed.
+func TestOfferDuringTeardownDoesNotPanic(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		s := &udpSession{out: make(chan dgram, 4), closed: make(chan struct{})}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				s.offer([]byte("datagram"))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Microsecond)
+			s.shutdown()
+		}()
+		wg.Wait()
+	}
+}
+
+// Shutting a session down twice — the reaper and the pump can both decide it is
+// over — must be harmless.
+func TestShutdownIsIdempotent(t *testing.T) {
+	s := &udpSession{out: make(chan dgram, 1), closed: make(chan struct{})}
+	s.shutdown()
+	s.shutdown()
+	s.offer([]byte("after close")) // must not panic or block
 }

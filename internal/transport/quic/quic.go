@@ -26,6 +26,7 @@ package quic
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -132,6 +133,7 @@ func (*quicTransport) NewDialer(cfg *config.Config, log *logx.Logger) (transport
 	}
 	return &dialer{
 		addr:   net.JoinHostPort(cfg.Peer, fmt.Sprintf("%d", cfg.TunnelPort)),
+		port:   cfg.TunnelPort,
 		sni:    sni,
 		verify: cfg.TLSVerify,
 		qcfg:   tuning(cfg),
@@ -170,6 +172,20 @@ func (*quicTransport) NewListener(cfg *config.Config, log *logx.Logger) (transpo
 	return l, nil
 }
 
+// isNoReply reports whether the handshake failed because nothing came back, as
+// opposed to being refused or misconfigured. quic-go surfaces this as an idle
+// timeout, and a deadline from our own context looks the same from outside.
+func isNoReply(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return strings.Contains(err.Error(), "no recent network activity")
+}
+
 // ---- dialer -----------------------------------------------------------------
 
 // dialer holds ONE QUIC connection and opens a stream per Dial.
@@ -183,6 +199,7 @@ func (*quicTransport) NewListener(cfg *config.Config, log *logx.Logger) (transpo
 // single 4-tuple that looks like one browser session.
 type dialer struct {
 	addr   string
+	port   int
 	sni    string
 	verify bool
 	qcfg   *quicgo.Config
@@ -227,6 +244,21 @@ func (d *dialer) connection(ctx context.Context) (quicgo.Connection, error) {
 	}, d.qcfg)
 	if err != nil {
 		_ = pc.Close()
+		// A QUIC handshake that simply gets no answer is the common failure here,
+		// and the library's own wording for it ("no recent network activity")
+		// sends people looking for a fault that is not there. There are only a
+		// few real causes and they all have the same shape: nothing UDP is
+		// getting through. Say so, and say what to do, because the alternative is
+		// an operator watching a tunnel retry forever with no idea why.
+		if isNoReply(err) {
+			return nil, fmt.Errorf("quic: no reply from %s — this transport is UDP, "+
+				"so check that udp/%d is open on BOTH servers (a firewall rule for tcp "+
+				"alone is the usual cause), and be aware that some networks block or "+
+				"throttle QUIC/HTTP-3 specifically even where TCP works. If udp is open "+
+				"and it still does not connect, the path is dropping QUIC: use the "+
+				"Stealth or WSS carrier instead, which are TCP. (%w)",
+				d.addr, d.port, err)
+		}
 		return nil, fmt.Errorf("quic: handshake with %s: %w", d.addr, err)
 	}
 	d.conn = conn
