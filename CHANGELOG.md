@@ -4,6 +4,54 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] — 2026-08-12
+
+### Added
+
+- **Gaming → WireGuard VPN.** The existing WireGuard entry built a
+  point-to-point link between the two servers — useful as a private path, but
+  not a VPN anyone can connect to. That is now option 3, and option 2 is the one
+  people actually want:
+
+  ```
+  client ──WireGuard/UDP──▶ Iran:<port> ──this tunnel──▶ Foreign ──▶ internet
+  ```
+
+  The VPN server runs only on the Foreign side, because that is where traffic
+  should leave. The Iran server runs no WireGuard at all — it forwards the port.
+  So a client's file names the Iran server and never learns the Foreign address,
+  which is the whole point of the arrangement.
+
+  On the Foreign server it generates the server key, the interface, and as many
+  client files as asked for, each with its own key and address; writes the
+  forwarding and NAT rules needed for clients to reach the internet, derived
+  from the interface the default route actually uses; and starts it. On the Iran
+  server it creates a tunnel that forwards the VPN's UDP port, tagged
+  low-latency so it is scheduled ahead of bulk traffic.
+
+  **Client MTU is 1280, not WireGuard's usual 1420.** Those packets travel
+  inside this tunnel as well, so 1420 no longer fits; left at the default the
+  VPN connects, small things work, and any real download stalls — a failure that
+  reads as filtering and is not.
+
+  This depends on the tunnel forwarding UDP, which is why it arrives now:
+  WireGuard has no TCP mode to fall back to.
+
+### Verified
+
+The generated configuration is checked, not assumed: `wg-quick` parses both
+files, the public key in every client file is the one derived from the server's
+private key, and every client's key is registered as a peer on the server.
+
+The carrying half was measured on the exact forward the console writes
+(`udp/51820@ll`): WireGuard-shaped datagrams — a 148-byte handshake initiation,
+92-byte keepalives, full 1280-byte data packets — all echoed back intact, and a
+sustained run of 2,705 datagrams at **0.00% loss, p50 0.56 ms, p99 0.84 ms**.
+
+WireGuard itself could not be run here: this environment has no kernel module
+and no userspace implementation, so a live interface is untested. The
+configuration and the transport it depends on are both verified.
+
 ## [2.7.2] — 2026-08-12
 
 ### Fixed

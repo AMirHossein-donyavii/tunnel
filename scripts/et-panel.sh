@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.7.2"
+SCRIPT_VERSION="2.8.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -712,16 +712,21 @@ section_gaming() {
     banner
     title "Gaming — latency-first tunnel"
     echo
-    item 1 "UDP tunnel"  "encrypted TUN over UDP, tuned for latency over bulk"
-    item 2 "WireGuard"   "kernel WireGuard — lowest overhead available"
+    item 1 "UDP tunnel"     "encrypted TUN over UDP, tuned for latency over bulk"
+    item 2 "WireGuard VPN"  "a VPN your users connect to, carried by this tunnel"
+    item 3 "WireGuard link" "kernel WireGuard between the two servers only"
     echo
-    note "Both prioritise responsiveness over throughput. The UDP tunnel is part"
-    note "of this platform and shows up in the dashboard; WireGuard runs in the"
-    note "kernel, which costs less CPU per packet than anything in userspace can."
-    local c; c="$(ask_choice "Method" "1" 1 2)"
+    note "Option 2 is the one to pick if people will install a WireGuard app and"
+    note "connect: it builds the VPN server on the Foreign side, hands you ready"
+    note "client files, and carries the VPN's UDP through this tunnel so clients"
+    note "only ever talk to the Iran server."
+    note "Option 3 is a plain point-to-point link between YOUR two servers, with"
+    note "no clients — useful as a private path, not as a VPN to hand out."
+    local c; c="$(ask_choice "Method" "2" 1 2 3)"
     case "$c" in
         1) gaming_udp ;;
-        2) gaming_wireguard ;;
+        2) gaming_wg_vpn ;;
+        3) gaming_wireguard ;;
     esac
 }
 
@@ -768,6 +773,204 @@ next_free_wg_iface() {
     local i=0
     while [ -f "${WG_DIR}/wg${i}.conf" ] || ip link show "wg${i}" >/dev/null 2>&1; do i=$((i+1)); done
     printf 'wg%s' "$i"
+}
+
+# ---- Gaming / WireGuard VPN --------------------------------------------------
+#
+# A VPN people actually connect to, as opposed to a link between the two
+# servers. The shape is the one that works and is worth stating, because getting
+# it wrong is the usual reason a WireGuard-over-a-tunnel setup half-works:
+#
+#   client ──WireGuard/UDP──▶ Iran:<wg port> ──this tunnel──▶ Foreign ──▶ internet
+#
+# The WireGuard server runs ONLY on the Foreign side, because that is where the
+# traffic should leave. The Iran server runs no WireGuard at all — it forwards
+# the port, nothing more. So a client's config names the Iran server as its
+# endpoint and never learns the Foreign address, which is the whole point.
+#
+# WireGuard is UDP-only, so this depends on the tunnel forwarding UDP; that is
+# why the forward the Iran side creates carries both protocols.
+
+# wg_client_ip <subnet-octet> <index> — a client's address inside the VPN.
+# .1 is the server, so clients start at .2.
+wg_client_ip() { printf '10.10.%s.%s' "$1" "$(( $2 + 1 ))"; }
+
+# wg_vpn_mtu is what a client must use.
+#
+# WireGuard's usual 1420 assumes its packets travel over a plain 1500-byte path.
+# Here they travel inside this tunnel as well, which costs its own IP, TCP and
+# AEAD overhead, so 1420 no longer fits and the client's large packets are
+# fragmented or dropped outright — the failure where a VPN connects, small
+# things work, and any real download stalls. 1280 is IPv6's guaranteed minimum
+# and comfortably inside anything this tunnel adds.
+wg_vpn_mtu=1280
+
+# wg_default_iface — the interface a default route leaves by, for NAT.
+wg_default_iface() {
+    ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+gaming_wg_vpn() {
+    banner; title "Gaming — WireGuard VPN"
+    note "Your users install WireGuard and connect to the IRAN server."
+    note "The VPN server itself runs on the FOREIGN server, and this tunnel"
+    note "carries the VPN's UDP between the two. Clients never see the Foreign"
+    note "address."
+    echo
+    local role; role="$(role_prompt)"
+    if [ "$role" = "kharej" ]; then
+        wg_vpn_exit
+    else
+        wg_vpn_entry
+    fi
+}
+
+# ---- Foreign server: the VPN itself ------------------------------------------
+
+wg_vpn_exit() {
+    if ! wg_available; then
+        bad "wireguard-tools could not be installed on this system."
+        note "Install it manually, then re-run: apt install wireguard-tools"
+        pause; return
+    fi
+    if ! modprobe wireguard >/dev/null 2>&1 && [ ! -d /sys/module/wireguard ]; then
+        warn "The kernel WireGuard module is not loaded."
+        note "On most VPS kernels it is built in; on a container it may not be."
+    fi
+    install -d -m 0700 "$WG_DIR"
+
+    local iface subnet port n endpoint out
+    iface="$(next_free_wg_iface)"
+    subnet="$(next_free_wg_subnet)"
+    port="$(ask_port "WireGuard UDP port ${GRY}(the same number on BOTH servers)${R}" "$(next_free_port 51820)")"
+    echo
+    note "Clients will be told to connect to the Iran server, so its public"
+    note "address goes into every client file."
+    endpoint="$(ask_ip "Iran server public IP")"
+    n="$(ask "How many client files to create" "3")"
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || n=3
+    [ "$n" -gt 50 ] && n=50
+
+    local srvpriv srvpub
+    srvpriv="$(wg genkey)"; srvpub="$(printf '%s' "$srvpriv" | wg pubkey)"
+    local wan; wan="$(wg_default_iface)"
+
+    umask 077
+    out="${WG_DIR}/clients-${iface}"
+    install -d -m 0700 "$out"
+
+    # Server config first; peers are appended as each client is generated.
+    {
+        echo "# Emergency Tunnel — WireGuard VPN server, generated by et v${SCRIPT_VERSION}"
+        echo "# Clients reach this through the Iran server at ${endpoint}:${port}"
+        echo "[Interface]"
+        echo "PrivateKey = ${srvpriv}"
+        echo "Address    = 10.10.${subnet}.1/24"
+        echo "ListenPort = ${port}"
+        echo "MTU        = ${wg_vpn_mtu}"
+        # Clients' traffic has to reach the internet from here, which needs
+        # forwarding on and a source NAT out of whichever interface holds the
+        # default route. Without these the VPN connects and carries nothing.
+        echo "PostUp     = sysctl -qw net.ipv4.ip_forward=1"
+        if [ -n "$wan" ]; then
+            echo "PostUp     = iptables -t nat -A POSTROUTING -s 10.10.${subnet}.0/24 -o ${wan} -j MASQUERADE"
+            echo "PostUp     = iptables -A FORWARD -i %i -j ACCEPT"
+            echo "PostUp     = iptables -A FORWARD -o %i -j ACCEPT"
+            echo "PostDown   = iptables -t nat -D POSTROUTING -s 10.10.${subnet}.0/24 -o ${wan} -j MASQUERADE"
+            echo "PostDown   = iptables -D FORWARD -i %i -j ACCEPT"
+            echo "PostDown   = iptables -D FORWARD -o %i -j ACCEPT"
+        fi
+    } > "${WG_DIR}/${iface}.conf"
+
+    local i cpriv cpub cip
+    for (( i=1; i<=n; i++ )); do
+        cpriv="$(wg genkey)"; cpub="$(printf '%s' "$cpriv" | wg pubkey)"
+        cip="$(wg_client_ip "$subnet" "$i")"
+        {
+            echo
+            echo "# client ${i}"
+            echo "[Peer]"
+            echo "PublicKey  = ${cpub}"
+            echo "AllowedIPs = ${cip}/32"
+        } >> "${WG_DIR}/${iface}.conf"
+        {
+            echo "# Emergency Tunnel — WireGuard client ${i}"
+            echo "[Interface]"
+            echo "PrivateKey = ${cpriv}"
+            echo "Address    = ${cip}/32"
+            echo "DNS        = 1.1.1.1, 8.8.8.8"
+            echo "MTU        = ${wg_vpn_mtu}"
+            echo
+            echo "[Peer]"
+            echo "PublicKey  = ${srvpub}"
+            echo "Endpoint   = ${endpoint}:${port}"
+            echo "AllowedIPs = 0.0.0.0/0, ::/0"
+            # Holds the NAT mapping open, so the first packet after an idle
+            # moment is not the one that gets lost.
+            echo "PersistentKeepalive = 25"
+        } > "${out}/client${i}.conf"
+        chmod 0600 "${out}/client${i}.conf"
+    done
+    chmod 0600 "${WG_DIR}/${iface}.conf"
+
+    echo; title "WireGuard VPN created on this server"
+    kv "Interface"   "${iface}  (10.10.${subnet}.1/24, udp/${port})"
+    kv "Client files" "${out}/client1.conf … client${n}.conf"
+    kv "Client MTU"  "${wg_vpn_mtu}  (lower than WireGuard's usual 1420 — see below)"
+    [ -z "$wan" ] && warn "No default route found: NAT was not written, so clients will reach this server but not the internet."
+
+    systemctl enable --now "wg-quick@${iface}" >/dev/null 2>&1
+    sleep 1
+    if systemctl is-active --quiet "wg-quick@${iface}"; then
+        ok "${iface} is up"
+    else
+        bad "wg-quick@${iface} did not start"
+        systemctl --no-pager status "wg-quick@${iface}" 2>/dev/null | sed -n '1,6p' | sed 's/^/    /'
+    fi
+
+    echo
+    note "MTU: clients are set to ${wg_vpn_mtu}, not WireGuard's usual 1420. Their"
+    note "packets travel inside this tunnel as well, so 1420 no longer fits — left"
+    note "at the default the VPN connects, small things work, and any real"
+    note "download stalls."
+    echo
+    note "NOW, on the IRAN server: Gaming → WireGuard VPN → Iran, and give it the"
+    note "same port (${port}). That is what carries this VPN's traffic."
+    echo
+    note "To show a client file:   cat ${out}/client1.conf"
+    have qrencode && note "As a QR code:            qrencode -t ansiutf8 < ${out}/client1.conf"
+    pause
+}
+
+# ---- Iran server: carry the VPN's UDP ----------------------------------------
+
+wg_vpn_entry() {
+    note "This server runs no WireGuard. It forwards the VPN's UDP port to the"
+    note "Foreign server, which is where the VPN actually runs."
+    echo
+    local port; port="$(ask_port "WireGuard UDP port ${GRY}(the same number you used on the Foreign server)${R}" "51820")"
+
+    # A latency-first carrier, since this is the Gaming section: the VPN's own
+    # encryption is the security boundary here, so the carrier is chosen for
+    # speed rather than disguise.
+    optimise basic tcpmux
+    cfg_set _section gaming
+    cfg_set engine "mux"
+    cfg_set transport "tcp"
+    cfg_set name "$(ask_name "Tunnel name" "wgvpn$(tunnel_count)")"
+    cfg_set role "iran"
+    cfg_set mode reverse
+    cfg_set tunnel_port "$(ask_port "Tunnel port ${GRY}(same on BOTH servers)${R}" "$(next_free_port 1234)")"
+    cfg_set health_port "$(next_free_port 9090)"
+    # @ll marks it latency-first in the scheduler, which is what a VPN carrying
+    # games and calls wants.
+    cfg_set forwards "$(csv_to_toml_array "${port}@ll")"
+    cfg_set proxy_protocol false
+    echo
+    note "Forwarded on udp/${port} (and tcp/${port}), tagged low-latency."
+    warn "Open udp/${port} on this server's firewall — that is the port your"
+    warn "users' WireGuard clients connect to."
+    finish_tunnel
 }
 
 gaming_wireguard() {
