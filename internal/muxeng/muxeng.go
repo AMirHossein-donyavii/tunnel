@@ -47,6 +47,7 @@ type Engine struct {
 	isDialer bool
 	isEntry  bool
 	exitHost string // where the exit dials forwarded services (default 127.0.0.1)
+	rcvbuf   int    // receive buffer for forwarded UDP sockets (0 = OS default)
 	dialer   transport.Dialer
 	listener transport.Listener
 	tune     nettune.Options
@@ -82,6 +83,9 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		tune:     nettune.LinkOptions(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf),
 		routes:   map[int]target{},
 	}
+	// Forwarded UDP sockets get the datagram receive sizing, so a VPN's bursts
+	// are absorbed rather than dropped by the kernel before we see them.
+	_, e.rcvbuf = nettune.BufSizes(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
 	e.muxCfg = mux.Config{
 		KeepAlive:        time.Duration(orDefault(cfg.HeartbeatInterval, config.DefaultHeartbeatSec)) * time.Second,
 		KeepAliveTimeout: time.Duration(orDefault(cfg.HeartbeatTimeout, config.DefaultHeartbeatTimeoutSec)) * time.Second,
@@ -127,8 +131,16 @@ func (e *Engine) Run(ctx context.Context) error {
 	if e.isEntry {
 		for port := range e.routes {
 			p := port
+			// Every forward is served on BOTH protocols, which is what the
+			// firewall layer has always planned for the L3 engines and for the
+			// same reason: the things people tunnel — OpenVPN, WireGuard, game
+			// servers, voice — are UDP by preference, and a TCP-only forward
+			// quietly forces them onto their TCP fallback, where the carrier's
+			// retransmissions and their own fight each other.
 			wg.Add(1)
 			go func() { defer wg.Done(); e.serveForward(ctx, p) }()
+			wg.Add(1)
+			go func() { defer wg.Done(); e.serveUDPForward(ctx, p, e.routes[p]) }()
 		}
 	}
 
@@ -236,13 +248,15 @@ func (e *Engine) serveSession(ctx context.Context, sess *mux.Session) {
 // ---- exit side --------------------------------------------------------------
 
 func (e *Engine) serveExitStream(st *mux.Stream) {
-	dest := st.Dest()
-	if len(dest) < 2 {
+	isUDP, remote, pp, ok := parseDest(st.Dest())
+	if !ok {
 		_ = st.Close()
 		return
 	}
-	remote := int(binary.BigEndian.Uint16(dest[:2]))
-	pp := dest[2:]
+	if isUDP {
+		e.serveExitUDP(st, remote)
+		return
+	}
 
 	target := net.JoinHostPort(e.exitHost, strconv.Itoa(remote))
 	local, err := net.DialTimeout("tcp", target, dialLocalTO)

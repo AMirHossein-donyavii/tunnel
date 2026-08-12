@@ -4,6 +4,81 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] — 2026-08-12
+
+Forwards carry UDP, and Backpack gains an OpenVPN option built on it.
+
+### Added
+
+- **UDP port forwarding through the mux engine.** It forwarded TCP and nothing
+  else, which quietly decided what could be tunnelled: OpenVPN, WireGuard, game
+  servers and voice are all UDP by preference, and anyone who wanted them
+  through a Backpack transport had to fall back to the protocol's TCP mode.
+
+  Every forward is now served on both protocols, matching what the firewall
+  layer has always planned for the L3 engines. Each client of a forwarded UDP
+  port gets its own mux stream, datagrams are length-framed so their boundaries
+  survive an ordered byte stream, and idle clients are reaped after five minutes
+  — long enough that a laptop which sleeps keeps its session rather than
+  renegotiating.
+
+- **Backpack → 6) OpenVPN.** Carries an OpenVPN server on the Foreign side over
+  Stealth, QUIC or WSS. It allocates its own name, tunnel port and health port,
+  so several can run side by side without colliding, and it prints the OpenVPN
+  settings that matter on the exit — `proto udp`, `tun-mtu 1400`, `mssfix 1360`.
+
+### Why sessions were dying
+
+Worth stating plainly, because it changes what to configure. A carrier here
+never exposes OpenVPN's fingerprint: OpenVPN's bytes travel inside this tunnel's
+own AEAD, so an observer sees the carrier's shape and never the protocol's. A
+session that survives minutes and then dies for good is almost never a detector.
+
+It is TCP-over-TCP. Until this release the console could forward TCP only, so an
+OpenVPN tunnel had to run `proto tcp`, and OpenVPN/TCP inside a TCP carrier
+recovers every lost packet twice: OpenVPN's timer fires while the carrier is
+still retransmitting, each copy adds load, and the two feed each other until the
+session collapses and does not recover. It holds under light traffic and dies
+under real use — the reported symptom exactly. Carrying the datagrams as
+datagrams removes the inner reliability layer, leaving the user's own TCP as the
+only thing recovering losses, which is the layer that should be.
+
+MTU is the other half. OpenVPN's packets now travel inside the tunnel, so a
+1500-byte one no longer fits; left at the default, large transfers blackhole
+while small ones keep working, which also reads as detection and is not.
+
+### Measured
+
+A sustained OpenVPN-shaped session — 1200-byte datagrams, continuous, both
+directions — over each carrier:
+
+| carrier | datagrams | loss | rtt p50 / p99 | longest silence | reconnects |
+|---|---|---|---|---|---|
+| Stealth | 22,333 | 0.00% | 0.55 / 0.97 ms | 0 s | 0 |
+| QUIC | 21,010 | 0.00% | 0.71 / 1.15 ms | 0 s | 0 |
+| WSS | 16,493 | 0.00% | 0.57 / 1.00 ms | 0 s | 0 |
+
+Datagrams of 1 to 65,000 bytes were echoed back byte-identical over every
+transport, and TCP forwarding is unchanged (mux/tcp 1943, mux/stealth 1973
+Mbit/s). As always this is a loopback: it proves the framing, the session
+handling and the absence of drift, not what a real path will do.
+
+### Not done, and why
+
+The request listed packet-timing variation, random padding and traffic shaping.
+Those are not implemented. Each one costs throughput or latency — the things
+ranked first in the same request — and none of them would have addressed the
+cause of these drops, which is not what the traffic looks like. The Stealth
+carrier already pads inside its AEAD and has no wire constants to match; QUIC
+and WSS already imitate protocols too common to block. If a real path shows
+detection surviving all three carriers, that is the point to add shaping, with
+the measurement to justify what it costs.
+
+Automatic transport switching is also not implemented: switching carriers
+mid-session drops every client on it, so it needs evidence that a carrier is
+being blocked rather than the path being briefly bad, and this environment
+cannot produce either.
+
 ## [2.4.2] — 2026-08-12
 
 Both SPF profiles were unusable. Every protocol the console offers has now been

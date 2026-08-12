@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.4.2"
+SCRIPT_VERSION="2.5.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -555,6 +555,7 @@ section_backpack() {
     item 2 "WSS"       "HTTPS with a Chrome fingerprint — serves a decoy website"
     item 3 "QUIC"      "HTTP/3 over UDP — best on a lossy path; looks like a browser"
     item 4 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
+    item 6 "OpenVPN"   "carry an OpenVPN server — keeps its UDP as UDP"
     echo
     note "Stealth looks like nothing at all; WSS and QUIC look like a website."
     note "Where the traffic pattern is being matched, any of them works — WSS is"
@@ -564,14 +565,111 @@ section_backpack() {
     note "congestion, so the speed drops for a whole round trip. QUIC keeps the"
     note "other streams moving and recovers without that collapse. It needs UDP"
     note "to the tunnel port to be open, which is the one thing to check first."
-    local c; c="$(ask_choice "Method" "1" 1 2 3 4)"
+    local c; c="$(ask_choice "Method" "1" 1 2 3 4 6)"
     cfg_reset
     case "$c" in
         1) backpack_stealth ;;
         2) backpack_wss ;;
         3) backpack_quic ;;
         4) backpack_fec ;;
+        6) backpack_openvpn ;;
     esac
+}
+
+# ---- Backpack / OpenVPN ------------------------------------------------------
+#
+# The point of this option is not another disguise. Every carrier in this section
+# already hides what it carries: an observer sees the carrier's own shape, never
+# OpenVPN's, because OpenVPN's bytes are inside this tunnel's AEAD. If a session
+# survives a few minutes and then dies for good, that is almost never a detector
+# noticing OpenVPN — it is the shape of the tunnel underneath it.
+#
+# The usual cause is running OpenVPN in TCP mode. Until now this console could
+# only forward TCP, so anyone tunnelling OpenVPN had no choice, and OpenVPN/TCP
+# inside a TCP carrier recovers every lost packet twice: OpenVPN's timer fires
+# while the carrier is still retransmitting, each copy adds load, and the two
+# feed each other until the session collapses and will not recover. It holds
+# under light traffic and dies under real use — exactly the reported symptom.
+#
+# Forwards now carry UDP as UDP, so OpenVPN keeps its own transport and the only
+# layer recovering losses is the user's own TCP, end to end, which is the layer
+# that should be.
+backpack_openvpn() {
+    banner
+    title "Backpack — OpenVPN"
+    note "Carries an OpenVPN server that runs on the Foreign server. Users point"
+    note "their OpenVPN client at the Iran server; the traffic comes out there."
+    echo
+    warn "Use OpenVPN in UDP mode (proto udp). This is the single biggest cause of"
+    warn "sessions that work for minutes and then die: OpenVPN/TCP inside a TCP"
+    warn "tunnel retransmits every loss twice and collapses under real traffic."
+    note "This console used to forward TCP only, which forced that configuration."
+    note "Forwards now carry UDP as UDP, so 'proto udp' is the right choice."
+    echo
+    item 1 "Stealth" "no fingerprint at all — nothing for a filter to match"
+    item 2 "QUIC"    "looks like HTTP/3; best when the path loses packets"
+    item 3 "WSS"     "looks like an HTTPS website; passes a CDN"
+    echo
+    note "All three hide OpenVPN equally — its bytes are inside this tunnel's own"
+    note "encryption either way. They differ in what the CARRIER looks like."
+    local c; c="$(ask_choice "Carrier" "1" 1 2 3)"
+
+    optimise basic tcpmux
+    cfg_set engine "mux"
+    case "$c" in
+        1) cfg_set transport "stealth" ;;
+        2) cfg_set transport "quic" ;;
+        3) cfg_set transport "wss" ;;
+    esac
+    cfg_set name "$(ask_name "Tunnel name" "ovpn$(tunnel_count)")"
+
+    if [ "${CFG[transport]}" = "stealth" ]; then
+        local tok; tok="$(gen_token)"
+        echo
+        note "Token for this tunnel (copy it to the OTHER server verbatim):"
+        printf "    ${B}${CYN}%s${R}\n\n" "$tok"
+        if yesno "Is this the first server of the pair?" "y"; then
+            cfg_set token "$tok"
+        else
+            cfg_set token "$(ask_req "Paste the token from the first server")"
+        fi
+    else
+        local h; h="$(ask "Hostname to present (a domain you own, or blank)" "")"
+        [ -n "$h" ] && { cfg_set tls_sni "$h"; cfg_set ws_host "$h"; }
+        [ "${CFG[transport]}" = "wss" ] && cfg_set ws_path "/$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    fi
+
+    common_endpoint
+    echo
+    local vp
+    if [ "${CFG[role]}" = "iran" ]; then
+        # Entry: this is the port users aim their OpenVPN client at.
+        vp="$(ask_port "OpenVPN port (users connect to this port here)" "1194")"
+        cfg_set forwards "$(csv_to_toml_array "$vp")"
+        cfg_set proxy_protocol false
+        note "Forwarded on BOTH udp/$vp and tcp/$vp, so either OpenVPN mode works."
+        if [ "${CFG[transport]}" = "quic" ]; then
+            warn "QUIC is UDP: open udp/${CFG[tunnel_port]} on both servers."
+        fi
+        echo
+        note "Run the SAME option on the Foreign server, answering 'foreign' for the"
+        note "role and giving it the same OpenVPN port."
+    else
+        # Exit: this is where the OpenVPN server actually runs.
+        vp="$(ask_port "OpenVPN port (the port your OpenVPN server listens on here)" "1194")"
+        cfg_set exit_host "$(ask "OpenVPN server address on this server" "127.0.0.1")"
+        echo
+        note "Your OpenVPN server config on THIS server should have:"
+        note "  proto udp"
+        note "  port $vp"
+        note "  tun-mtu 1400"
+        note "  mssfix 1360"
+        note "MTU matters: OpenVPN's packets travel inside this tunnel, so a full"
+        note "1500-byte one no longer fits. Left at the default, large transfers"
+        note "blackhole while small ones keep working — which also reads as"
+        note "detection, and is not."
+    fi
+    finish_tunnel
 }
 
 backpack_quic() {
