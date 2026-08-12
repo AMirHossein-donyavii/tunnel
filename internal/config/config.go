@@ -47,15 +47,20 @@ type Config struct {
 	// SPF (TUN + IPX-style encapsulation with source-IP spoofing) settings.
 	SpfProfile    string `toml:"spf_profile"`   // SPF carrier: icmp | tcp
 	Encapsulation string `toml:"encapsulation"` // SPF: "ipx"
-	SpoofSrcIP    string `toml:"spoof_src_ip"`  // SPF: spoofed source IP for our packets
-	SpoofDstIP    string `toml:"spoof_dst_ip"`  // SPF: peer's spoofed source (inbound filter)
-	TunIP         string `toml:"tun_ip"`        // TUN engine: this host's tunnel address (CIDR)
-	TunIP6        string `toml:"tun_ip6"`       // TUN engine: optional IPv6 tunnel address (CIDR)
-	PeerTunIP     string `toml:"peer_tun_ip"`   // TUN engine: peer's tunnel address (for routing/logs)
-	TunIface      string `toml:"tun_iface"`
-	MTU           int    `toml:"mtu"`
-	Workers       int    `toml:"workers"` // 0 = auto
-	Pool          int    `toml:"pool"`
+	// OpenVPNPort is the TCP port the OpenVPN server listens on. The SAME value
+	// is used on both servers: clients connect to it on the Iran side, and the
+	// Foreign side dials it locally, so there is nothing to keep in step by hand.
+	OpenVPNPort int `toml:"openvpn_port"`
+
+	SpoofSrcIP string `toml:"spoof_src_ip"` // SPF: spoofed source IP for our packets
+	SpoofDstIP string `toml:"spoof_dst_ip"` // SPF: peer's spoofed source (inbound filter)
+	TunIP      string `toml:"tun_ip"`       // TUN engine: this host's tunnel address (CIDR)
+	TunIP6     string `toml:"tun_ip6"`      // TUN engine: optional IPv6 tunnel address (CIDR)
+	PeerTunIP  string `toml:"peer_tun_ip"`  // TUN engine: peer's tunnel address (for routing/logs)
+	TunIface   string `toml:"tun_iface"`
+	MTU        int    `toml:"mtu"`
+	Workers    int    `toml:"workers"` // 0 = auto
+	Pool       int    `toml:"pool"`
 	// TunQueues sets the number of TUN queues / carrier links for the L3 engines
 	// (0 = use Pool). It MUST be identical on both servers: the kernel steers
 	// flows across all queues, so a queue without a peer link silently blackholes
@@ -209,11 +214,12 @@ const (
 
 // Engine identifiers.
 const (
-	EngineMux    = "mux"    // TCP Reverse Tunnel (multiplexed streams over few links)
-	EngineDirect = "direct" // one tunnel connection per user connection
-	EngineTUN    = "tun"    // virtual network interface (L3, all IP protocols)
-	EngineSPF    = "spf"    // TUN + IPX-style encapsulation with source-IP spoofing
-	EngineL3     = "l3"     // deprecated alias for EngineTUN (normalised on load)
+	EngineMux     = "mux"     // TCP Reverse Tunnel (multiplexed streams over few links)
+	EngineDirect  = "direct"  // one tunnel connection per user connection
+	EngineTUN     = "tun"     // virtual network interface (L3, all IP protocols)
+	EngineSPF     = "spf"     // TUN + IPX-style encapsulation with source-IP spoofing
+	EngineOpenVPN = "openvpn" // dedicated OpenVPN/TCP carrier, one link per VPN connection
+	EngineL3      = "l3"      // deprecated alias for EngineTUN (normalised on load)
 )
 
 // IsTUN reports whether the config selects the TUN engine (accepts the "l3" alias).
@@ -285,9 +291,19 @@ func (c *Config) Validate() error {
 	if c.HealthPort != 0 && c.HealthPort == c.TunnelPort {
 		return fmt.Errorf("health_port (%d) must differ from the tunnel_port", c.HealthPort)
 	}
-	if c.Engine != EngineMux && c.Engine != EngineDirect && !c.IsTUN() && !c.IsSPF() {
-		return fmt.Errorf("engine must be %q (multiplexed), %q (per-connection), %q (TUN) or %q (SPF), got %q",
-			EngineMux, EngineDirect, EngineTUN, EngineSPF, c.Engine)
+	if c.Engine != EngineMux && c.Engine != EngineDirect && c.Engine != EngineOpenVPN && !c.IsTUN() && !c.IsSPF() {
+		return fmt.Errorf("engine must be %q (multiplexed), %q (per-connection), %q (OpenVPN/TCP), %q (TUN) or %q (SPF), got %q",
+			EngineMux, EngineDirect, EngineOpenVPN, EngineTUN, EngineSPF, c.Engine)
+	}
+	if c.Engine == EngineOpenVPN {
+		if c.OpenVPNPort <= 0 || c.OpenVPNPort > 65535 {
+			return fmt.Errorf("openvpn_port is required for the openvpn engine (the TCP port your OpenVPN server listens on, e.g. 1194)")
+		}
+		// The carrier and the VPN cannot share a port: the Iran server binds the
+		// VPN port for clients and the carrier port for the peer.
+		if c.OpenVPNPort == c.TunnelPort {
+			return fmt.Errorf("openvpn_port (%d) and tunnel_port must differ — one carries the VPN, the other carries the tunnel", c.OpenVPNPort)
+		}
 	}
 	// The dialer side needs to know where to connect.
 	if c.dialerSide() && strings.TrimSpace(c.Peer) == "" {
@@ -323,6 +339,13 @@ func (c *Config) Validate() error {
 	}
 	if c.IsSPF() {
 		return c.validateSPF()
+	}
+
+	// The OpenVPN engine has no forwards: the port it carries is openvpn_port,
+	// which both servers take from the same field, so there is nothing to keep
+	// in step between them and nothing to list here.
+	if c.Engine == EngineOpenVPN {
+		return nil
 	}
 
 	// --- mux engine: VPN/listen port forwarding rules --------------------

@@ -22,6 +22,7 @@ import (
 	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/muxeng"
 	"github.com/emergency-tunnel/et/internal/nettune"
+	"github.com/emergency-tunnel/et/internal/ovpneng"
 	"github.com/emergency-tunnel/et/internal/sysinfo"
 )
 
@@ -77,6 +78,8 @@ func Run(path string) error {
 		eng, err = muxeng.New(cfg, log)
 	case cfg.Engine == config.EngineDirect:
 		eng, err = directeng.New(cfg, log)
+	case cfg.Engine == config.EngineOpenVPN:
+		eng, err = ovpneng.New(cfg, log)
 	default:
 		return fmt.Errorf("unknown engine %q", cfg.Engine)
 	}

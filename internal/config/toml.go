@@ -86,6 +86,8 @@ func assign(c *Config, key, val string) error {
 		return intField(val, &c.SoRcvbuf)
 	case "tunnel_port":
 		return intField(val, &c.TunnelPort)
+	case "openvpn_port":
+		return intField(val, &c.OpenVPNPort)
 	case "listen_port": // deprecated alias for tunnel_port (backward compat)
 		return intField(val, &c.TunnelPort)
 	case "mtu":
@@ -252,6 +254,9 @@ func (c *Config) Marshal() string {
 		kv("peer", c.Peer)
 	}
 	ki("tunnel_port", c.TunnelPort)
+	if c.OpenVPNPort > 0 {
+		ki("openvpn_port", c.OpenVPNPort)
+	}
 	if c.IsTUN() {
 		kv("tun_mode", c.TunMode)
 	}

@@ -4,6 +4,66 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] — 2026-08-12
+
+A data plane built for one job: carrying OpenVPN over TCP.
+
+### Added
+
+- **`engine = "openvpn"` — a dedicated tunnel, not a port forward.**
+  Backpack → 6 now builds it. Three things make it different from forwarding a
+  port through the general engine, and each addresses a specific way the old
+  arrangement failed:
+
+  **Small relay buffers (16 KiB, against the general engine's 64).** This is the
+  central decision. OpenVPN/TCP inside a TCP carrier is two reliable layers
+  stacked, and what breaks them is not encryption — it is buffering. Every byte
+  held in the middle is delay the *inner* connection measures as round-trip
+  time, so its congestion control believes the path is fatter and slower than it
+  is, overshoots, and stalls for seconds. It looks fine on a quiet link and
+  falls apart when a real page loads. A big buffer benchmarks better and behaves
+  worse; the buffer here is sized so the inner connection's timers keep
+  describing the real path, and a test enforces that it stays small.
+
+  **One carrier connection per VPN connection.** No multiplexer, so no shared
+  window and no shared write queue: a bulk download cannot add delay to the
+  VPN's control channel, and no stream can hold up a neighbour. The VPN's
+  traffic can only ever be delayed by itself.
+
+  **Carriers opened before they are needed.** The Foreign server keeps warm,
+  authenticated carriers parked at the Iran server, so a connecting client finds
+  the handshake already done — two or three round trips removed from every
+  connect, on the long path this exists for. A client that arrives with none
+  ready is refused in two seconds rather than left hanging, because OpenVPN's
+  own retry is faster and cleaner than any wait.
+
+  The port is asked once and is the same number on both servers: clients connect
+  to it on the Iran side, the Foreign side dials it locally. Nothing to keep in
+  step by hand.
+
+### Measured
+
+Two-namespace bed, one VPN connection and then forty at once:
+
+| carrier | connect round trip (p50/p95) | one connection | 40 at once |
+|---|---|---|---|
+| Stealth | 0.34 / 0.60 ms | 1312 Mbit/s | 40/40 |
+| WSS | 0.57 / 1.32 ms | 1972 Mbit/s | 40/40 |
+| TCP | 0.25 / 0.47 ms | 3578 Mbit/s | 40/40 |
+
+Those round trips include establishing a fresh VPN connection each time, which
+is what the warm pool buys.
+
+A 50-second soak with continuous churn — one steady session while others connect
+and disconnect throughout: 4,631 probes with **0 failures** (p50 0.51 ms, p99
+1.26 ms) alongside 5,784 completed connections, **0 refused**, both processes
+alive, no panics. Pushed to ~850 connects/second the engine still carried 28,232
+with 0 refused; the failures at that rate are the listen backlog, far past what
+any OpenVPN deployment produces.
+
+As always this is a loopback: it proves the data path, the lifecycle and the
+absence of leaks, not what a real path will do.
+
 ## [2.6.0] — 2026-08-12
 
 ### Fixed
