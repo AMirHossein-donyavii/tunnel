@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.5.2"
+SCRIPT_VERSION="2.5.3"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -233,6 +233,21 @@ fetch_identity() {
 list_tunnels() { [ -d "$CONF_DIR" ] && find "$CONF_DIR" -maxdepth 1 -name '*.toml' -printf '%f\n' 2>/dev/null | sed 's/\.toml$//' | sort || true; }
 tunnel_count() { list_tunnels | grep -c . ; }
 svc_state()   { systemctl is-active "${SVC_PREFIX}$1" 2>/dev/null || echo unknown; }
+
+# svc_restarts <name> — how many times systemd has restarted this tunnel.
+#
+# A crash looks exactly like a network problem from the outside: the tunnel
+# stops carrying traffic and comes back seconds later, or keeps dying under
+# load. The one thing that tells them apart is whether the process is being
+# restarted, and that was invisible here — so a crash got diagnosed as
+# filtering, which sends people to change carriers that were never at fault.
+svc_restarts() { systemctl show -p NRestarts --value "${SVC_PREFIX}$1" 2>/dev/null | tr -dc '0-9'; }
+
+# svc_crashed <name> — non-empty when the last stop was NOT a clean exit.
+svc_crashed() {
+    local r; r="$(systemctl show -p Result --value "${SVC_PREFIX}$1" 2>/dev/null)"
+    case "$r" in ""|success) return 1 ;; *) printf '%s' "$r"; return 0 ;; esac
+}
 cfg_get()     { grep -E "^[[:space:]]*$2[[:space:]]*=" "${CONF_DIR}/$1.toml" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//'; }
 
 # next_free_port <start> — first port not used by a config or a live socket
@@ -1132,6 +1147,22 @@ health_check() {
     local n="$1"
     title "Health check — $n"
     [ "$(svc_state "$n")" = "active" ] && ok "service is running" || bad "service is not running"
+
+    # Restarts first, because a crashing tunnel is indistinguishable from a
+    # filtered one at the user's end — traffic stops, then comes back, then
+    # stops — and only this tells them apart. Diagnosing a crash as filtering
+    # sends people changing carriers that were never at fault.
+    local rs res
+    rs="$(svc_restarts "$n")"; res="$(systemctl show -p Result --value "${SVC_PREFIX}${n}" 2>/dev/null)"
+    if [ -n "$rs" ] && [ "$rs" -gt 0 ] 2>/dev/null; then
+        bad "the tunnel process has restarted $rs time(s) — it is being killed, not filtered"
+        [ -n "$res" ] && [ "$res" != "success" ] && note "  last stop reason: $res"
+        note "  see why:  journalctl -u ${SVC_PREFIX}${n} -n 50 --no-pager"
+        note "  a repeated restart under load is a bug in the tunnel, not your network —"
+        note "  make sure BOTH servers run the current version before changing anything else."
+    else
+        ok "no restarts — the process has stayed up"
+    fi
     local hp; hp="$(cfg_get "$n" health_port)"
     if [ -n "$hp" ] && curl -fsS --max-time 2 --noproxy '*' "http://127.0.0.1:${hp}/health" >/dev/null 2>&1; then
         ok "core health endpoint responds"
@@ -1200,9 +1231,12 @@ dashboard() {
             j="$(stats_json "$n")" || j=""
             rtt="$(jget "$j" rtt_ms)"; links="$(jget "$j" live_links)"
             [ -z "$links" ] && links="$(jget "$j" sessions)"
-            printf "  %b  ${B}%-14s${R} ${GRY}%-14s${R} links ${B}%-3s${R} rtt ${B}%-7s${R} ${GRY}%s${R}\n" \
+            local rs restart_note=""
+            rs="$(svc_restarts "$n")"
+            [ -n "$rs" ] && [ "$rs" -gt 0 ] 2>/dev/null && restart_note=" ${RED}restarts:${rs}${R}"
+            printf "  %b  ${B}%-14s${R} ${GRY}%-14s${R} links ${B}%-3s${R} rtt ${B}%-7s${R} ${GRY}%s${R}%b\n" \
                 "$(badge "$(svc_state "$n")")" "$n" "$kind" "${links:-0}" \
-                "${rtt:+${rtt}ms}" "$(cfg_get "$n" tun_ip)"
+                "${rtt:+${rtt}ms}" "$(cfg_get "$n" tun_ip)" "$restart_note"
         done < <(list_tunnels)
         [ "$any" = "0" ] && note "No tunnels yet — create one from the main menu."
 

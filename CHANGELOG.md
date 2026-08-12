@@ -4,6 +4,28 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.5.3] — 2026-08-12
+
+Makes a crashing tunnel say so, and hardens the UDP session lifecycle.
+
+### Added
+
+- **Restarts are now visible.** A crashing tunnel and a filtered one look
+  identical from the user's end — traffic stops, maybe comes back, stops again —
+  and nothing here distinguished them. So a crash got diagnosed as filtering,
+  which sends people changing carriers that were never at fault. The dashboard
+  now marks any tunnel whose process has restarted, and the health check leads
+  with it, names systemd's stop reason, and gives the journalctl line that shows
+  why.
+
+### Changed
+
+- **The UDP session lifecycle is covered by a contention test.** 50 rounds of
+  eight concurrent producers against a draining pump with teardown arriving from
+  two other goroutines, run under `-race`. This is the shape that produced the
+  2.5.2 crash — a burst coinciding with a session ending — and it now has a test
+  that reproduces the conditions rather than the happy path.
+
 ## [2.5.2] — 2026-08-12
 
 The UDP forwarding in 2.5.0/2.5.1 could crash the whole process. Fixed.
