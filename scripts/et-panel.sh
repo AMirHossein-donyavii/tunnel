@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.5.3"
+SCRIPT_VERSION="2.6.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -1179,6 +1179,36 @@ health_check() {
     fi
     local tp; tp="$(cfg_get "$n" tunnel_port)"
     [ -n "$tp" ] && { port_in_use "$tp" && ok "tunnel port $tp is bound" || warn "tunnel port $tp is not bound"; }
+
+    # What the UDP forward — the thing that carries a VPN — has actually done.
+    # A VPN that stops working leaves no trace in bytes moved, so without these
+    # the only way to tell a drop from a stall from a teardown was to guess.
+    local j uin uout udrop ustale uopen ufail
+    j="$(stats_json "$n")" || j=""
+    uin="$(jget "$j" udp_in)"
+    if [ -n "$uin" ] && [ "$uin" != "0" ]; then
+        uout="$(jget "$j" udp_out)"; udrop="$(jget "$j" udp_dropped)"
+        ustale="$(jget "$j" udp_stale)"; uopen="$(jget "$j" udp_sessions_opened)"
+        ufail="$(jget "$j" udp_sessions_failed)"
+        echo
+        note "UDP forwarding (this is what carries a VPN):"
+        note "  in ${uin} · back ${uout:-0} · sessions ${uopen:-0}"
+        local shed=$(( ${udrop:-0} + ${ustale:-0} ))
+        if [ "$shed" -gt 0 ]; then
+            local pct=$(( 100 * shed / uin ))
+            if [ "$pct" -ge 5 ]; then
+                bad "  ${pct}% of the VPN's datagrams were shed here (${udrop:-0} queue-full, ${ustale:-0} too late)"
+                note "  that much loss will make a VPN renegotiate and then give up."
+                note "  it means the carrier could not keep up — a slower path than the VPN was offered."
+            else
+                ok "  ${pct}% shed (${udrop:-0} queue-full, ${ustale:-0} too late) — normal under bursts"
+            fi
+        else
+            ok "  nothing shed — the carrier kept up with everything offered"
+        fi
+        [ -n "$ufail" ] && [ "$ufail" != "0" ] && \
+            bad "  ${ufail} session(s) never got a carrier stream — the tunnel was down when a client arrived"
+    fi
 }
 
 edit_config() {

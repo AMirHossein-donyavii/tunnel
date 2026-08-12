@@ -19,7 +19,7 @@ func TestSessionLifecycleUnderContention(t *testing.T) {
 		var wg sync.WaitGroup
 
 		wg.Add(1)
-		go func() { defer wg.Done(); s.st = nil; _ = nopWriter{}; pumpTo(s, nopWriter{}) }()
+		go func() { defer wg.Done(); pumpTo(s, nopWriter{}) }()
 
 		for i := 0; i < 8; i++ { // many producers, as a busy socket loop bursts
 			wg.Add(1)

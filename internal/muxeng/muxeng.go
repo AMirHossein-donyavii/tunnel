@@ -64,6 +64,16 @@ type Engine struct {
 		txBytes       uint64
 		sessionErrs   uint64
 		forwardsUp    int64 // client-facing ports currently bound (entry side)
+		// UDP forwarding counters. A VPN that stops working leaves no trace in
+		// bytes moved — the question is always whether its datagrams were
+		// dropped here, never arrived, or the session was torn down, and without
+		// these the only way to tell was to guess.
+		udpIn      uint64 // datagrams accepted from clients
+		udpOut     uint64 // datagrams delivered back to clients
+		udpDropped uint64 // shed because the carrier could not keep up
+		udpStale   uint64 // shed because they waited past being useful
+		udpOpened  uint64 // client sessions started
+		udpFailed  uint64 // client sessions that never got a carrier stream
 	}
 }
 
@@ -407,6 +417,15 @@ type Stats struct {
 	RTTms              int64  `json:"rtt_ms"`
 	ForwardsConfigured int    `json:"forwards_configured"` // entry: VPN/listen ports configured
 	ForwardsUp         int64  `json:"forwards_up"`         // entry: of those, currently bound
+
+	// UDP forwarding, which is what carries a VPN. Reported so a session that
+	// dies can be attributed instead of guessed at.
+	UDPIn      uint64 `json:"udp_in"`
+	UDPOut     uint64 `json:"udp_out"`
+	UDPDropped uint64 `json:"udp_dropped"`
+	UDPStale   uint64 `json:"udp_stale"`
+	UDPOpened  uint64 `json:"udp_sessions_opened"`
+	UDPFailed  uint64 `json:"udp_sessions_failed"`
 	// QueuedBytes / PeakQueuedBytes show the egress scheduler's backlog. Sitting
 	// near the budget means the carrier is the bottleneck and streams are being
 	// backpressured — the intended behaviour, not a fault.
@@ -431,6 +450,12 @@ func (e *Engine) Snapshot() any {
 		RTTms:              e.set.bestRTT().Milliseconds(),
 		ForwardsConfigured: len(e.routes),
 		ForwardsUp:         atomic.LoadInt64(&e.stats.forwardsUp),
+		UDPIn:              atomic.LoadUint64(&e.stats.udpIn),
+		UDPOut:             atomic.LoadUint64(&e.stats.udpOut),
+		UDPDropped:         atomic.LoadUint64(&e.stats.udpDropped),
+		UDPStale:           atomic.LoadUint64(&e.stats.udpStale),
+		UDPOpened:          atomic.LoadUint64(&e.stats.udpOpened),
+		UDPFailed:          atomic.LoadUint64(&e.stats.udpFailed),
 		QueuedBytes:        queued,
 		PeakQueuedBytes:    peak,
 	}

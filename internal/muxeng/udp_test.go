@@ -195,7 +195,7 @@ func TestStaleDatagramsAreDroppedRatherThanSentLate(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
-	s := &udpSession{st: nil, out: make(chan dgram, 8)}
+	s := &udpSession{out: make(chan dgram, 8), closed: make(chan struct{})}
 	// Queue one datagram that is already past its shelf life, then a fresh one.
 	s.out <- dgram{b: takeDgram([]byte("stale")), enq: time.Now().Add(-2 * udpStale)}
 	s.out <- dgram{b: takeDgram([]byte("fresh")), enq: time.Now()}
@@ -277,4 +277,50 @@ func TestShutdownIsIdempotent(t *testing.T) {
 	s.shutdown()
 	s.shutdown()
 	s.offer([]byte("after close")) // must not panic or block
+}
+
+// Opening a carrier stream waits for a live session, and while the carrier is
+// down or reconnecting that wait runs to seconds. It used to happen inside the
+// socket read loop, so a hiccup under load stopped the port being read for
+// exactly as long — every client's traffic discarded by the kernel meanwhile,
+// which a VPN reads as the path vanishing.
+//
+// The open now happens off the loop. This asserts the property that makes that
+// safe: a session can be created, and datagrams accepted into it, before any
+// stream exists.
+func TestSessionAcceptsDatagramsBeforeItsStreamExists(t *testing.T) {
+	s := &udpSession{out: make(chan dgram, udpQueueDepth), closed: make(chan struct{})}
+	if s.stream.Load() != nil {
+		t.Fatal("a new session must start with no stream")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p := make([]byte, 1200)
+		for i := 0; i < udpQueueDepth*4; i++ {
+			s.offer(p) // must not block or panic with no stream present
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("accepting datagrams blocked while the stream was still being opened — " +
+			"the socket read loop would stall and the kernel would discard the port's traffic")
+	}
+	if len(s.out) == 0 {
+		t.Fatal("nothing was queued while the stream was being opened; those datagrams are lost")
+	}
+}
+
+// A session whose stream never arrives must tear down cleanly rather than
+// dereferencing a stream that was never set.
+func TestTeardownWithoutAStreamIsSafe(t *testing.T) {
+	s := &udpSession{out: make(chan dgram, 8), closed: make(chan struct{})}
+	s.offer([]byte("queued before the open failed"))
+	s.shutdown()
+	s.drain() // must not panic on a nil stream, and must release what was queued
+	if len(s.out) != 0 {
+		t.Fatalf("%d datagram(s) left queued after teardown", len(s.out))
+	}
 }

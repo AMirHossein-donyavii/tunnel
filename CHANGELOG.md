@@ -4,6 +4,53 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] — 2026-08-12
+
+### Fixed
+
+- **The UDP read loop could stall for seconds while the carrier reconnected.**
+  Opening a stream waits for a live session, and that wait runs to four seconds
+  while the tunnel is down. It happened inside the socket read loop, so a
+  carrier hiccup stopped the forwarded port being read for exactly that long —
+  every client's traffic discarded by the kernel meanwhile, which a VPN reads as
+  the path vanishing.
+
+  The session is now created immediately and its queue absorbs datagrams while
+  the stream is established off the loop; if it never is, the session is dropped
+  and its buffers released. The loop never blocks on anything now.
+
+  Stated honestly: this is a real defect and the right fix, but it could not be
+  shown to cause the reported symptom — eight simultaneous VPN users through two
+  deliberate carrier breaks behaved identically before and after (worst blackout
+  3.0 s in both, exactly the length of the break, full recovery).
+
+### Added
+
+- **The UDP forward now reports what it did**, in the stats endpoint and at the
+  top of the health check: datagrams in and back, sessions opened, sessions that
+  never got a carrier stream, and datagrams shed — split into queue-full and
+  arrived-too-late.
+
+  A VPN that stops working leaves no trace in bytes moved, so until now the only
+  way to tell a drop from a stall from a crash was to guess, and guessing sent
+  people changing carriers that were never at fault. Shedding above 5% is called
+  out directly, because that much loss is what makes OpenVPN renegotiate and
+  then give up.
+
+### What was tested and did not reproduce
+
+The reported failure — a VPN dying the moment a media-heavy app opens — was
+chased with: 360 parallel connections in six waves (all fine, tunnel usable
+after), a hard bidirectional burst of 37,750 datagrams (survived, 5/5 probes
+after), a VPN session alongside four saturating downloads (0.0% loss, no gaps),
+two carrier breaks mid-session (recovered fully), and the whole suite under the
+race detector. None reproduced it.
+
+That leaves the crash fixed in 2.5.2 as the only mechanism found that produces
+exactly this symptom, and it needs both traffic and a session ending — which is
+what a burst causes. If it recurs on 2.6.0, the health check now says which of
+the three it is.
+
 ## [2.5.3] — 2026-08-12
 
 Makes a crashing tunnel say so, and hardens the UDP session lifecycle.
