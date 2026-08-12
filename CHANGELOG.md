@@ -4,6 +4,40 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.7.1] — 2026-08-12
+
+### Fixed
+
+- **Backpack options 1–4 did nothing in 2.7.0.** Adding the OpenVPN entry
+  replaced a span of the console that happened to contain four other builders,
+  deleting Stealth, WSS, QUIC and UDP+FEC outright. Picking any of them called a
+  function that no longer existed, so the screen returned to the menu with
+  nothing having happened. All four are restored verbatim from 2.6.0.
+
+- **A release can no longer be packaged with a broken console.** This class of
+  bug is invisible to every check that existed: the shell is syntactically
+  perfect, `bash -n` passes, the Go tests pass, and the fault only appears when
+  a person picks that menu entry. `scripts/check-panel.sh` now verifies that
+  every menu action resolves to a defined function, that no builder is
+  orphaned, and that every config key the console writes is one the core
+  actually parses. The release build refuses to package if it fails, and it was
+  confirmed to catch precisely the deletion above.
+
+### Removed
+
+- **The OpenVPN engine.** It was not good enough, and carrying a half-solved
+  thing is worse than not carrying it. `engine = "openvpn"`, `openvpn_port` and
+  the Backpack entry are gone.
+
+  UDP port forwarding stays — that is general (WireGuard, game servers, voice)
+  and independently tested.
+
+### Verified after the removal
+
+Every protocol the console offers, end to end: Basic TCP 6395 · WS 4185 ·
+TCPMUX 1877 · WSMUX 1451 · UDP 357, Backpack WSS 1635 · Stealth 1452 · QUIC
+1112, TUN TCP 2027 · UDP 1056 · ICMP 548, SPF ICMP 554 · TCP 623 Mbit/s.
+
 ## [2.7.0] — 2026-08-12
 
 A data plane built for one job: carrying OpenVPN over TCP.

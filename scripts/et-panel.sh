@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="2.7.1"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -324,7 +324,6 @@ write_config() {
                  ws_path ws_host low_latency token fec_data fec_parity \
                  tls_cert tls_key tls_sni tls_verify \
                  tun_mode spf_profile encapsulation spoof_src_ip spoof_dst_ip \
-                 openvpn_port \
                  tun_ip tun_ip6 peer_tun_ip tun_iface mtu tun_queues \
                  workers pool cipher profile health_port log_level \
                  heartbeat_interval heartbeat_timeout batch_size channel_size \
@@ -332,7 +331,7 @@ write_config() {
             [ -n "${CFG[$k]:-}" ] || continue
             case "$k" in
                 # numeric / boolean / array — emitted bare
-                tunnel_port|openvpn_port|mtu|workers|pool|health_port|tun_queues|\
+                tunnel_port|mtu|workers|pool|health_port|tun_queues|\
                 heartbeat_interval|heartbeat_timeout|batch_size|channel_size|\
                 so_sndbuf|so_rcvbuf|proxy_protocol|forwards|low_latency|\
                 fec_data|fec_parity|tls_verify)
@@ -571,7 +570,6 @@ section_backpack() {
     item 2 "WSS"       "HTTPS with a Chrome fingerprint — serves a decoy website"
     item 3 "QUIC"      "HTTP/3 over UDP — best on a lossy path; looks like a browser"
     item 4 "UDP + FEC" "reliable UDP with error correction — for lossy paths"
-    item 6 "OpenVPN"   "dedicated OpenVPN/TCP tunnel — its own data plane"
     echo
     note "Stealth looks like nothing at all; WSS and QUIC look like a website."
     note "Where the traffic pattern is being matched, any of them works — WSS is"
@@ -581,111 +579,108 @@ section_backpack() {
     note "congestion, so the speed drops for a whole round trip. QUIC keeps the"
     note "other streams moving and recovers without that collapse. It needs UDP"
     note "to the tunnel port to be open, which is the one thing to check first."
-    local c; c="$(ask_choice "Method" "1" 1 2 3 4 6)"
+    local c; c="$(ask_choice "Method" "1" 1 2 3 4)"
     cfg_reset
     case "$c" in
         1) backpack_stealth ;;
         2) backpack_wss ;;
         3) backpack_quic ;;
         4) backpack_fec ;;
-        6) backpack_openvpn ;;
     esac
 }
 
-# ---- Backpack / OpenVPN ------------------------------------------------------
-#
-# The point of this option is not another disguise. Every carrier in this section
-# already hides what it carries: an observer sees the carrier's own shape, never
-# OpenVPN's, because OpenVPN's bytes are inside this tunnel's AEAD. If a session
-# survives a few minutes and then dies for good, that is almost never a detector
-# noticing OpenVPN — it is the shape of the tunnel underneath it.
-#
-# The usual cause is running OpenVPN in TCP mode. Until now this console could
-# only forward TCP, so anyone tunnelling OpenVPN had no choice, and OpenVPN/TCP
-# inside a TCP carrier recovers every lost packet twice: OpenVPN's timer fires
-# while the carrier is still retransmitting, each copy adds load, and the two
-# feed each other until the session collapses and will not recover. It holds
-# under light traffic and dies under real use — exactly the reported symptom.
-#
-# Forwards now carry UDP as UDP, so OpenVPN keeps its own transport and the only
-# layer recovering losses is the user's own TCP, end to end, which is the layer
-# that should be.
-backpack_openvpn() {
-    banner
-    title "Backpack — OpenVPN (dedicated tunnel)"
-    note "A data plane built only for OpenVPN over TCP. Not a port forward: it"
-    note "gives every VPN connection its own carrier connection, opened before"
-    note "the client arrives, and keeps the relay buffers deliberately small."
+backpack_quic() {
+    optimise basic wsmux
+    cfg_set engine "mux"
+    cfg_set transport "quic"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
     echo
-    note "Why that matters: OpenVPN/TCP inside a TCP carrier is two reliable"
-    note "layers stacked. What breaks them is not encryption, it is buffering —"
-    note "bytes held in the middle become round-trip time the inner connection"
-    note "measures, so it overshoots and then stalls for seconds. That is the"
-    note "'fine for a while, then dies when a real page loads' everyone hits."
-    echo
-    item 1 "Stealth" "no fingerprint at all — nothing for a filter to match"
-    item 2 "WSS"     "looks like an HTTPS website; passes a CDN"
-    item 3 "TCP"     "plain — fastest, for a path that is not filtered"
-    echo
-    local c; c="$(ask_choice "Carrier" "1" 1 2 3)"
-
-    optimise basic tcpmux
-    cfg_set engine "openvpn"
-    case "$c" in
-        1) cfg_set transport "stealth" ;;
-        2) cfg_set transport "wss" ;;
-        3) cfg_set transport "tcp" ;;
-    esac
-    cfg_set name "$(ask_name "Tunnel name" "ovpn$(tunnel_count)")"
-
-    if [ "${CFG[transport]}" = "stealth" ]; then
-        local tok; tok="$(gen_token)"
-        echo
-        note "Token for this tunnel (copy it to the OTHER server verbatim):"
-        printf "    ${B}${CYN}%s${R}\n\n" "$tok"
-        if yesno "Is this the first server of the pair?" "y"; then
-            cfg_set token "$tok"
-        else
-            cfg_set token "$(ask_req "Paste the token from the first server")"
-        fi
-    elif [ "${CFG[transport]}" = "wss" ]; then
-        local h; h="$(ask "Hostname to present (a domain you own, or blank)" "")"
-        [ -n "$h" ] && { cfg_set tls_sni "$h"; cfg_set ws_host "$h"; }
-        cfg_set ws_path "/$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    fi
-
-    common_endpoint
-    echo
-    # ONE port question, and the same answer on both servers: clients connect to
-    # it on the Iran side and the Foreign side dials it locally, so there is
-    # nothing to keep in step by hand and nothing to get wrong.
-    local vp; vp="$(ask_port "OpenVPN port (the SAME number on both servers)" "1194")"
-    while [ "$vp" = "${CFG[tunnel_port]}" ]; do
-        bad "That is the tunnel port. The VPN needs its own."
-        vp="$(ask_port "OpenVPN port (the SAME number on both servers)" "1194")"
-    done
-    cfg_set openvpn_port "$vp"
-
-    if [ "${CFG[role]}" = "kharej" ]; then
-        cfg_set exit_host "$(ask "OpenVPN server address on this server" "127.0.0.1")"
-        echo
-        note "Your OpenVPN server config on THIS server needs:"
-        note "  proto tcp-server"
-        note "  port $vp"
-        note "  tun-mtu 1400"
-        note "  mssfix 1360"
-        warn "MTU matters: OpenVPN's packets travel inside this tunnel, so a full"
-        warn "1500-byte one no longer fits. Left at the default, large transfers"
-        warn "stall while small ones work — which reads as detection and is not."
+    note "QUIC carries the tunnel the way HTTP/3 carries a website: TLS 1.3 over"
+    note "UDP, announcing the same protocol a browser does."
+    warn "This is UDP. If the tunnel port is only open for TCP on either server,"
+    warn "nothing will connect — open UDP ${CFG[tunnel_port]:-<port>} on both."
+    local h; h="$(ask "Hostname to present (a domain you own, or blank)" "")"
+    [ -n "$h" ] && cfg_set tls_sni "$h"
+    if [ -n "$h" ] && yesno "Do you have a certificate for ${h}?" "n"; then
+        cfg_set tls_cert "$(ask_req "Path to fullchain.pem")"
+        cfg_set tls_key  "$(ask_req "Path to privkey.pem")"
+        cfg_set tls_verify true
     else
-        echo
-        note "Point your users' OpenVPN clients at THIS server on port $vp:"
-        note "  proto tcp-client"
-        note "  remote <this server> $vp"
-        note "  tun-mtu 1400"
-        note "  mssfix 1360"
-        note "Run the same option on the Foreign server with the same port."
+        note "Using a generated self-signed certificate. The tunnel is unaffected —"
+        note "its own handshake is what secures it — but a probe that checks the"
+        note "chain will see it is not signed. A real certificate is better."
     fi
+    common_endpoint
+    forwards_prompt
+    finish_tunnel
+}
+
+backpack_wss() {
+    optimise basic wsmux
+    cfg_set engine "mux"
+    cfg_set transport "wss"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    echo
+    note "Anything that is not a tunnel connection — a browser, a scanner, a"
+    note "probe — is served an ordinary nginx welcome page over TLS."
+    local h; h="$(ask "Hostname to present (a domain you own, or blank)" "")"
+    [ -n "$h" ] && { cfg_set tls_sni "$h"; cfg_set ws_host "$h"; }
+    cfg_set ws_path "/$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    note "Tunnel path: ${CFG[ws_path]}  (must match on BOTH servers)"
+    if [ -n "$h" ] && yesno "Do you have a certificate for ${h}?" "n"; then
+        cfg_set tls_cert "$(ask_req "Path to fullchain.pem")"
+        cfg_set tls_key  "$(ask_req "Path to privkey.pem")"
+        cfg_set tls_verify true
+    else
+        note "Using a generated self-signed certificate. The tunnel is unaffected —"
+        note "its own handshake is what secures it — but a probe that checks the"
+        note "chain will see it is not signed. A real certificate is better."
+    fi
+    common_endpoint
+    forwards_prompt
+    finish_tunnel
+}
+
+backpack_stealth() {
+    optimise basic tcpmux
+    cfg_set engine "mux"
+    cfg_set transport "stealth"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    local tok; tok="$(gen_token)"
+    echo
+    note "Token for this tunnel (copy it to the OTHER server verbatim):"
+    printf "    ${B}${CYN}%s${R}\n\n" "$tok"
+    if yesno "Is this the first server of the pair?" "y"; then
+        cfg_set token "$tok"
+    else
+        cfg_set token "$(ask_req "Paste the token from the first server")"
+    fi
+    common_endpoint
+    forwards_prompt
+    finish_tunnel
+}
+
+backpack_fec() {
+    optimise basic udp
+    cfg_set engine "mux"
+    cfg_set transport "udp"
+    cfg_set name "$(ask_name "Tunnel name" "bp$(tunnel_count)")"
+    echo
+    note "Error correction sends parity packets alongside the data, so an"
+    note "isolated loss is repaired without waiting a round trip for a resend."
+    warn "Measured on this build it has not yet paid for itself — parity is added"
+    warn "below congestion control, so it competes with the data it protects."
+    note "Offered because a real lossy path may differ from the test path; compare"
+    note "against a plain UDP tunnel before keeping it. Same values on BOTH servers."
+    if yesno "Enable error correction?" "n"; then
+        local d p
+        d="$(ask "Data packets per group" "10")"
+        p="$(ask "Parity packets per group" "3")"
+        cfg_set fec_data "$d"; cfg_set fec_parity "$p"
+        note "Bandwidth premium: about $(( 100 * p / (d>0?d:1) ))%."
+    fi
+    common_endpoint
+    forwards_prompt
     finish_tunnel
 }
 

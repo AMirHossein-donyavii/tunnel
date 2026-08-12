@@ -57,6 +57,17 @@ for t in "${TARGETS[@]}"; do
 done
 
 # Ship the panel and unit alongside the binaries so the installer fetches one set.
+# The console is shell, so a broken menu path is invisible to the compiler and
+# to `bash -n`: an option that calls a function which no longer exists simply
+# does nothing when a user picks it. That shipped once. Refuse to package a
+# release whose console does not pass its own checks.
+if [ -x scripts/check-panel.sh ]; then
+    bash scripts/check-panel.sh scripts/et-panel.sh || {
+        echo "refusing to build: the console failed its checks (see above)" >&2
+        exit 1
+    }
+fi
+
 cp scripts/et-panel.sh "${RELDIR}/et-panel.sh"
 # Stamp the panel the same way the core is stamped. Without this, building an
 # explicit version out of a tree whose VERSION says something else ships a
