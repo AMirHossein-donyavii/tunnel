@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.1"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -641,8 +641,8 @@ backpack_openvpn() {
 
     common_endpoint
     echo
-    local vp
     if [ "${CFG[role]}" = "iran" ]; then
+        local vp
         # Entry: this is the port users aim their OpenVPN client at.
         vp="$(ask_port "OpenVPN port (users connect to this port here)" "1194")"
         cfg_set forwards "$(csv_to_toml_array "$vp")"
@@ -655,13 +655,15 @@ backpack_openvpn() {
         note "Run the SAME option on the Foreign server, answering 'foreign' for the"
         note "role and giving it the same OpenVPN port."
     else
-        # Exit: this is where the OpenVPN server actually runs.
-        vp="$(ask_port "OpenVPN port (the port your OpenVPN server listens on here)" "1194")"
+        # Exit: this side is NOT asked for the OpenVPN port, and should not be.
+        # The port travels with every stream the entry opens, so this server
+        # already knows where to deliver each one; asking again would only create
+        # a second place for the two to disagree.
         cfg_set exit_host "$(ask "OpenVPN server address on this server" "127.0.0.1")"
         echo
-        note "Your OpenVPN server config on THIS server should have:"
+        note "The OpenVPN port comes from the Iran server automatically — nothing"
+        note "to set here. Your OpenVPN server config on THIS server should have:"
         note "  proto udp"
-        note "  port $vp"
         note "  tun-mtu 1400"
         note "  mssfix 1360"
         note "MTU matters: OpenVPN's packets travel inside this tunnel, so a full"

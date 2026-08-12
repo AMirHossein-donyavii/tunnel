@@ -47,6 +47,43 @@ const (
 	// find its session still there, since losing it means a full renegotiation.
 	udpIdleTimeout = 5 * time.Minute
 
+	// udpQueueDepth is how many datagrams may wait for one client while the
+	// carrier is busy.
+	//
+	// It exists because a mux stream blocks its writer once the peer's window is
+	// full. Writing straight from the socket loop meant that when the carrier
+	// congested, the loop stopped reading — so EVERY client on the port stalled
+	// behind whichever one was blocked, and the kernel's receive queue overflowed
+	// and discarded the lot. Each client now has its own queue and its own writer,
+	// so congestion costs that client and nobody else.
+	//
+	// Deep enough to ride out a burst, shallow enough that the delay it can add
+	// stays small: 64 full-size datagrams is about 90 KB.
+	udpQueueDepth = 64
+
+	// udpSafeDatagram is the largest forwarded datagram that still fits inside
+	// the tunnel without the outer path having to fragment it.
+	//
+	// A forwarded datagram travels inside the carrier, which adds its own
+	// headers and AEAD overhead on top of the usual IP and TCP or UDP. A VPN
+	// left at the default 1500-byte MTU therefore produces packets the outer
+	// path must fragment, and a lost fragment destroys the whole datagram — so
+	// small packets keep working while large transfers stall, which is what
+	// "the tunnel is fine but downloads break" looks like, and reads to most
+	// people as detection. It is worth naming precisely once rather than
+	// leaving the operator to guess.
+	udpSafeDatagram = 1400
+
+	// udpStale is how long a datagram may wait before it is thrown away instead
+	// of sent.
+	//
+	// A VPN datagram has a shelf life. Once it is this late the inner TCP has
+	// already decided it was lost and sent another, so delivering it adds load
+	// and a duplicate without helping anyone — the same reasoning the TUN
+	// scheduler uses for its express class. Dropping is also what the UDP path
+	// this replaces would have done, which is the behaviour OpenVPN is built for.
+	udpStale = 100 * time.Millisecond
+
 	// protoUDP marks a stream as carrying datagrams. See udpDest.
 	protoUDP = 1
 )
@@ -123,14 +160,91 @@ func readDatagram(r io.Reader, buf []byte) ([]byte, error) {
 
 // ---- entry side --------------------------------------------------------------
 
+// warnOversize keeps the fragmentation warning to one line for the life of the
+// process: it is advice about configuration, and repeating it per packet would
+// bury the log it is meant to be found in.
+var warnOversize sync.Once
+
+// dgram is one queued datagram and the moment it was accepted, so the writer
+// can tell whether it is still worth sending.
+type dgram struct {
+	b   []byte
+	enq time.Time
+}
+
+// dgramPool recycles datagram buffers. A VPN session is tens of thousands of
+// packets a minute; without this each one would allocate.
+var dgramPool = sync.Pool{New: func() any { b := make([]byte, 0, 2048); return &b }}
+
+func takeDgram(p []byte) []byte {
+	bp := dgramPool.Get().(*[]byte)
+	b := (*bp)[:0]
+	if cap(b) < len(p) {
+		b = make([]byte, 0, len(p))
+	}
+	return append(b, p...)
+}
+
+func giveDgram(b []byte) {
+	if cap(b) <= 1<<16 {
+		b = b[:0]
+		dgramPool.Put(&b)
+	}
+}
+
 // udpSession is one client of a forwarded UDP port, bound to its own stream.
+//
+// out decouples the socket reader from the carrier: the reader never blocks, so
+// one congested client cannot stall the others or make the kernel drop the whole
+// port's traffic. Overflow drops, which is what the UDP path being replaced here
+// would have done anyway.
 type udpSession struct {
 	st   *mux.Stream
+	out  chan dgram
 	last atomic.Int64 // unix nanos of the last datagram from this client
 	once sync.Once
+	// dropped counts what congestion cost this client, for the log line that
+	// tells an operator the carrier is the limit rather than the tunnel.
+	dropped atomic.Uint64
 }
 
 func (s *udpSession) touch() { s.last.Store(time.Now().UnixNano()) }
+
+// offer queues a datagram without ever blocking. A full queue means the carrier
+// cannot keep up; the newest datagram is dropped, exactly as a saturated network
+// path would drop it.
+func (s *udpSession) offer(p []byte) {
+	d := dgram{b: takeDgram(p), enq: time.Now()}
+	select {
+	case s.out <- d:
+	default:
+		giveDgram(d.b)
+		s.dropped.Add(1)
+	}
+}
+
+// pump drains one client's queue into its stream. Stream.Write blocks when the
+// peer's window is full, which is precisely why this runs on its own goroutine.
+func (s *udpSession) pump(done func()) {
+	defer done()
+	scratch := make([]byte, 0, 2048)
+	for d := range s.out {
+		stale := time.Since(d.enq) > udpStale
+		b := d.b
+		if stale {
+			// Past its shelf life: sending it now would be a duplicate of
+			// something the inner transport already replaced.
+			s.dropped.Add(1)
+			giveDgram(b)
+			continue
+		}
+		err := writeDatagram(s.st, &scratch, b)
+		giveDgram(b)
+		if err != nil {
+			return
+		}
+	}
+}
 
 // serveUDPForward binds a forwarded UDP port and relays each client's datagrams
 // over its own mux stream.
@@ -176,13 +290,16 @@ func (e *Engine) serveUDPForward(ctx context.Context, port int, t target) {
 				delete(sessions, key)
 			}
 			mu.Unlock()
+			close(s.out)
 			_ = s.st.Close()
+			if n := s.dropped.Load(); n > 0 {
+				e.log.Info("udp/%d: %d datagram(s) dropped for one client — the carrier could not keep up", port, n)
+			}
 		})
 	}
 	go e.reapUDP(ctx, &mu, sessions, drop)
 
 	buf := make([]byte, udpMaxDatagram)
-	scratch := make([]byte, 0, 2048)
 	for {
 		n, src, err := pc.ReadFromUDPAddrPort(buf)
 		if err != nil {
@@ -200,19 +317,30 @@ func (e *Engine) serveUDPForward(ctx context.Context, port int, t target) {
 			if st == nil {
 				continue // no session available; the datagram is dropped, as UDP allows
 			}
-			s = &udpSession{st: st}
+			s = &udpSession{st: st, out: make(chan dgram, udpQueueDepth)}
 			s.touch()
 			mu.Lock()
 			sessions[src] = s
 			mu.Unlock()
 			atomic.AddInt64(&e.stats.activeStreams, 1)
 			atomic.AddUint64(&e.stats.totalStreams, 1)
-			go e.udpReturn(pc, src, s, func() { drop(src, s) })
+			ses := s
+			key := src
+			go ses.pump(func() { drop(key, ses) })
+			go e.udpReturn(pc, src, s, func() { drop(key, ses) })
 		}
 		s.touch()
-		if err := writeDatagram(s.st, &scratch, buf[:n]); err != nil {
-			drop(src, s)
+		if n > udpSafeDatagram {
+			warnOversize.Do(func() {
+				e.log.Warn("udp/%d: this service is sending %d-byte datagrams; anything over %d "+
+					"has to be fragmented by the path outside the tunnel, and one lost fragment "+
+					"loses the whole packet — which shows up as large transfers stalling while "+
+					"small ones work. For OpenVPN set 'tun-mtu 1400' and 'mssfix 1360'.",
+					port, n, udpSafeDatagram)
+			})
 		}
+		// Never blocks: see udpSession.offer.
+		s.offer(buf[:n])
 	}
 }
 
@@ -313,20 +441,24 @@ func (e *Engine) serveExitUDP(st *mux.Stream, port int) {
 		_ = st.Close()
 	}()
 
+	// Service -> stream, through the same bounded queue the entry side uses and
+	// for the same reason: the stream blocks when the peer's window is full, and
+	// a blocked write here would stop this socket being read at all. The return
+	// direction is the download, so a stall here is what a user feels most.
+	back := &udpSession{st: st, out: make(chan dgram, udpQueueDepth)}
+	pumped := make(chan struct{})
+	go func() { defer close(pumped); back.pump(func() {}) }()
+
 	done := make(chan struct{})
-	// Service -> stream.
 	go func() {
 		defer close(done)
 		buf := make([]byte, udpMaxDatagram)
-		scratch := make([]byte, 0, 2048)
 		for {
 			n, err := pc.Read(buf)
 			if err != nil {
 				return
 			}
-			if err := writeDatagram(st, &scratch, buf[:n]); err != nil {
-				return
-			}
+			back.offer(buf[:n])
 		}
 	}()
 	// Stream -> service.
@@ -342,4 +474,9 @@ func (e *Engine) serveExitUDP(st *mux.Stream, port int) {
 	}
 	_ = pc.Close()
 	<-done
+	close(back.out)
+	<-pumped
+	if n := back.dropped.Load(); n > 0 {
+		e.log.Info("udp/%d: %d datagram(s) dropped on the return path — the carrier could not keep up", port, n)
+	}
 }

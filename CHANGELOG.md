@@ -4,6 +4,67 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.5.1] — 2026-08-12
+
+The UDP forwarding added in 2.5.0 had a flaw that showed up exactly where a VPN
+lives: under load.
+
+### Fixed
+
+- **One busy client stalled every client on the port.** A mux stream blocks its
+  writer once the peer's window is full, and datagrams were written to it
+  straight from the socket read loop. So the moment the carrier congested, the
+  loop stopped reading — every other client on that forwarded port stalled
+  behind whichever one was blocked, and the kernel's receive queue overflowed
+  and discarded the backlog. A VPN under real traffic is precisely when the
+  carrier congests, so this was reachable in normal use.
+
+  Each client now has its own bounded queue and its own writer. Accepting a
+  datagram never blocks: when the queue is full the newest is dropped, which is
+  what the UDP path being replaced would have done anyway, and what OpenVPN is
+  built to tolerate. The same fix applies to the return direction on the exit,
+  where a stall is what a user feels as a stalled download.
+
+- **Stale datagrams are dropped instead of delivered late.** A queued datagram
+  past ~100 ms is worthless: the inner transport has already decided it was lost
+  and sent another, so delivering it adds a duplicate and helps nobody. Dropping
+  it is the same reasoning the TUN scheduler applies to its express class.
+
+- **The exit no longer asks for the OpenVPN port.** It was never used — the port
+  travels with every stream the entry opens, so the exit already knows where to
+  deliver each one. Asking again only created a second place for the two servers
+  to disagree.
+
+### Added
+
+- **A named diagnosis for oversized datagrams.** A forwarded datagram travels
+  inside the carrier, which adds its own headers, so a VPN left at the default
+  1500-byte MTU produces packets the outer path must fragment — and one lost
+  fragment loses the whole datagram. Small packets keep working while large
+  transfers stall, which reads as detection and is not. The tunnel now says so
+  once, with the setting that fixes it.
+
+### Measured
+
+A sustained OpenVPN-shaped session over Stealth, with a bulk transfer saturating
+the same tunnel — the case that used to stall:
+
+| | datagrams | loss | rtt p50 / p99 | longest silence |
+|---|---|---|---|---|
+| idle carrier | 10,920 | 0.00% | 0.59 / 1.04 ms | 0 s |
+| carrier saturated | 6,979 | 0.00% | 1.52 / 9.07 ms | 0 s |
+
+Latency rises under load, as it must; nothing stalls and nothing is lost.
+
+### Still true, and worth saying
+
+Over Stealth or WSS the datagrams ride a *reliable* stream, so a lost carrier
+segment still holds up that client's later datagrams until TCP resends it. The
+queue and the stale-drop bound what this project can do about it; removing it
+entirely needs an unreliable carrier, which is what QUIC's datagram extension
+provides and this build does not yet use. On a path that loses packets, QUIC is
+the carrier to choose for a VPN.
+
 ## [2.5.0] — 2026-08-12
 
 Forwards carry UDP, and Backpack gains an OpenVPN option built on it.

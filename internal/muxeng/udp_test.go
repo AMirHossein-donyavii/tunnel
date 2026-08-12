@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 // A UDP protocol that receives two datagrams merged, or one split in half, is
@@ -149,4 +150,91 @@ func TestRelayRoundTripOverAPipe(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A mux stream blocks its writer once the peer's window is full. Writing to it
+// straight from the socket loop meant that when the carrier congested the loop
+// stopped reading — so every client on that port stalled behind whichever one
+// was blocked, and the kernel's receive queue overflowed and discarded all of
+// it. One slow peer took the whole forward down with it.
+//
+// Offering must therefore never block, whatever the carrier is doing.
+func TestOfferNeverBlocksWhenTheCarrierStalls(t *testing.T) {
+	s := &udpSession{out: make(chan dgram, 4)} // nothing draining it: a stalled carrier
+	p := bytes.Repeat([]byte("x"), 1400)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			s.offer(p)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("offering blocked while the carrier was stalled — the socket loop " +
+			"would stop reading and every client on this port would stall with it")
+	}
+	if got := s.dropped.Load(); got == 0 {
+		t.Fatal("nothing was recorded as dropped, so the queue silently grew without bound")
+	}
+	if got := len(s.out); got > 4 {
+		t.Fatalf("queue holds %d datagrams, past its depth of 4", got)
+	}
+}
+
+// A datagram that has waited too long is worthless: the inner transport has
+// already decided it was lost and sent another, so delivering it now is a
+// duplicate that costs bandwidth and helps nobody. The UDP path this replaces
+// would simply have dropped it.
+func TestStaleDatagramsAreDroppedRatherThanSentLate(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	s := &udpSession{st: nil, out: make(chan dgram, 8)}
+	// Queue one datagram that is already past its shelf life, then a fresh one.
+	s.out <- dgram{b: takeDgram([]byte("stale")), enq: time.Now().Add(-2 * udpStale)}
+	s.out <- dgram{b: takeDgram([]byte("fresh")), enq: time.Now()}
+	close(s.out)
+
+	// pump writes to the stream; substitute the pipe for it.
+	go func() {
+		scratch := make([]byte, 0, 64)
+		for d := range s.out {
+			if time.Since(d.enq) > udpStale {
+				s.dropped.Add(1)
+				giveDgram(d.b)
+				continue
+			}
+			_ = writeDatagram(a, &scratch, d.b)
+			giveDgram(d.b)
+		}
+		a.Close()
+	}()
+
+	buf := make([]byte, udpMaxDatagram)
+	got, err := readDatagram(b, buf)
+	if err != nil {
+		t.Fatalf("the fresh datagram never arrived: %v", err)
+	}
+	if string(got) != "fresh" {
+		t.Fatalf("got %q — a stale datagram was delivered late instead of dropped", got)
+	}
+	if s.dropped.Load() != 1 {
+		t.Fatalf("dropped %d, want 1 (the stale one)", s.dropped.Load())
+	}
+}
+
+// Buffers are recycled, so a short datagram must never inherit a long one's tail.
+func TestRecycledDatagramBuffersDoNotLeakContents(t *testing.T) {
+	long := takeDgram(bytes.Repeat([]byte("L"), 1400))
+	giveDgram(long)
+	short := takeDgram([]byte("hi"))
+	if string(short) != "hi" {
+		t.Fatalf("recycled buffer came back as %q, want %q", short, "hi")
+	}
+	giveDgram(short)
 }
