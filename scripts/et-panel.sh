@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.7.1"
+SCRIPT_VERSION="2.7.2"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -103,16 +103,36 @@ ask() {  # ask <prompt> [default]
     # command-substitution subshell and the menu would keep redrawing against a
     # closed stdin — an endless loop at full CPU. Signal the real shell instead;
     # the TERM trap installed at the top of the script turns it into a clean exit.
-    if ! read -r a; then printf "\n" >&2; kill -TERM "$$" 2>/dev/null; exit 0; fi
+    if ! read -r a; then
+        printf "\n" >&2
+        kill -TERM "$$" 2>/dev/null
+        # Status 3 says "stdin is gone" to the retry loops below. The signal
+        # above is what normally ends the session; this is what stops those
+        # loops spinning if it does not arrive — a prompt that re-asks forever
+        # against a closed stdin burns a core and never stops.
+        exit 3
+    fi
     printf '%s' "${a:-$d}"
 }
-ask_req() { local v; while :; do v="$(ask "$1" "${2:-}")"; [ -n "$v" ] && { printf '%s' "$v"; return; }; bad "A value is required." >&2; done; }
+
+# eof_status is the exit code ask uses to report a closed stdin.
+readonly eof_status=3
+ask_req() {
+    local v st
+    while :; do
+        v="$(ask "$1" "${2:-}")"; st=$?
+        [ "$st" = "$eof_status" ] && return "$eof_status"
+        [ -n "$v" ] && { printf '%s' "$v"; return; }
+        bad "A value is required." >&2
+    done
+}
 yesno() { local a; a="$(ask "$1 ${GRY}(y/n)${R}" "${2:-n}")"; case "$a" in [Yy]*) return 0;; *) return 1;; esac; }
 
 ask_port() {
-    local v
+    local v st
     while :; do
-        v="$(ask "$1" "${2:-}")"
+        v="$(ask "$1" "${2:-}")"; st=$?
+        [ "$st" = "$eof_status" ] && return "$eof_status"
         if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 65535 ]; then
             if port_in_use "$v"; then warn "Port $v is already in use on this server." >&2
                 yesno "Use it anyway?" "n" && { printf '%s' "$v"; return; }
@@ -125,9 +145,10 @@ ask_port() {
 }
 ask_choice() { # ask_choice <prompt> <default> <opt1> <opt2> ...
     local p="$1" d="$2"; shift 2
-    local v opts="$*"
+    local v opts="$*" st
     while :; do
-        v="$(ask "$p ${GRY}(${opts// /, })${R}" "$d")"
+        v="$(ask "$p ${GRY}(${opts// /, })${R}" "$d")"; st=$?
+        [ "$st" = "$eof_status" ] && return "$eof_status"
         for o in $opts; do [ "$v" = "$o" ] && { printf '%s' "$v"; return; }; done
         bad "Choose one of: ${opts// /, }" >&2
     done
@@ -139,9 +160,10 @@ valid_ipv4() {
     return 0
 }
 ask_ip() {
-    local v
+    local v st
     while :; do
-        v="$(ask "$1" "${2:-}")"
+        v="$(ask "$1" "${2:-}")"; st=$?
+        [ "$st" = "$eof_status" ] && return "$eof_status"
         valid_ipv4 "$v" && { printf '%s' "$v"; return; }
         # Accept a hostname too — the core resolves it at dial time.
         [[ "$v" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] && { printf '%s' "$v"; return; }
@@ -150,9 +172,10 @@ ask_ip() {
 }
 valid_ipv6() { [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$1" != *:::* ]]; }
 ask_ip6() {
-    local v
+    local v st
     while :; do
-        v="$(ask "$1" "${2:-}")"
+        v="$(ask "$1" "${2:-}")"; st=$?
+        [ "$st" = "$eof_status" ] && return "$eof_status"
         valid_ipv6 "$v" && { printf '%s' "$v"; return; }
         [[ "$v" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] && { printf '%s' "$v"; return; }
         bad "Enter an IPv6 address (e.g. 2a01:4f8::1) or a hostname with an AAAA record." >&2
@@ -166,9 +189,10 @@ host_has_ipv6() {
 }
 
 ask_name() {
-    local v
+    local v st
     while :; do
-        v="$(ask "$1" "${2:-}")"
+        v="$(ask "$1" "${2:-}")"; st=$?
+        [ "$st" = "$eof_status" ] && return "$eof_status"
         if [[ ! "$v" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,30}$ ]]; then
             bad "Use letters, digits, dash or underscore (max 31)." >&2; continue
         fi

@@ -66,5 +66,57 @@ if [ -n "$core_keys" ]; then
     [ "$unknown" = "0" ] && good "every config key the console writes is understood by the core"
 fi
 
+# 5. Drive each Backpack builder to completion and require that it produces a
+#    config the core accepts.
+#
+#    Checks 2 and 3 prove a builder EXISTS and is reachable. They cannot prove it
+#    RUNS: a prompt loop that spins against a closed stdin, or a builder that
+#    exits before writing anything, passes both and still leaves the user
+#    staring at a menu that does nothing. This actually answers the prompts.
+CORE_BIN="${ET_CORE_BIN:-$(dirname "$PANEL")/../et-core-test}"
+if [ -x "$CORE_BIN" ] && command -v timeout >/dev/null; then
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    harness="$tmp/panel.sh"
+    awk '/^# ---- non-interactive entry points/{exit} {print}' "$PANEL" > "$harness"
+    sed -i -e "s|^CONF_DIR=.*|CONF_DIR=\"$tmp/etc\"|" "$harness"
+    cat >> "$harness" <<'STUB'
+systemctl() { return 0; }
+port_in_use() { return 1; }
+svc_state() { echo active; }
+need_root() { return 0; }
+enable_ip_forwarding() { return 0; }
+STUB
+    drive() { # drive <builder> <answers...>
+        local fn="$1"; shift
+        rm -rf "$tmp/etc"; mkdir -p "$tmp/etc"
+        printf '%s\n' "$@" | timeout 25 bash -c "source $harness; $fn" >"$tmp/out" 2>&1
+        local f; f="$(ls "$tmp"/etc/*.toml 2>/dev/null | head -1)"
+        if [ -n "$f" ] && "$CORE_BIN" validate --config "$f" >/dev/null 2>&1; then
+            good "$fn runs and writes a config the core accepts"
+        else
+            bad "$fn did not produce a valid config — the option does nothing for a user"
+        fi
+    }
+    drive backpack_stealth t-stealth y 1 11234 15001 n
+    drive backpack_wss     t-wss "" n 1 11235 15002 n
+    drive backpack_quic    t-quic "" n 1 11236 15003 n
+    drive backpack_fec     t-fec  n 1 11237 15004 n
+
+    # 6. A prompt whose input runs out must stop, not spin. A loop that re-asks
+    #    forever against a closed stdin burns a core and never returns.
+    # The value must be one the prompt REJECTS, so the retry loop is entered and
+    # then meets a closed stdin — typing something invalid and pressing Ctrl-D.
+    # A valid answer exits cleanly through the signal path and proves nothing.
+    rm -rf "$tmp/etc"; mkdir -p "$tmp/etc"
+    start=$(date +%s)
+    printf '!!invalid\n' | timeout 10 bash -c "source $harness; backpack_stealth" >/dev/null 2>&1
+    if [ $(( $(date +%s) - start )) -ge 9 ]; then
+        bad "a prompt spun until it was killed when input ran out"
+    else
+        good "prompts stop when stdin closes instead of spinning"
+    fi
+fi
+
 [ "$fail" = "0" ] && say "panel checks passed" || say "panel checks FAILED"
 exit "$fail"

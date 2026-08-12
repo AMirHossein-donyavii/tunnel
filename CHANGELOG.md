@@ -4,6 +4,33 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.7.2] — 2026-08-12
+
+### Fixed
+
+- **A prompt could spin at full CPU instead of stopping.** Type something a
+  prompt rejects — a name with punctuation, a port out of range — and then close
+  stdin (Ctrl-D, or a session that drops), and the retry loop re-asked forever
+  against a stream that would never answer. The escape was a signal sent from
+  inside a command substitution, which does not reliably reach the loop; every
+  prompt now also learns from the read itself that stdin is gone, and returns.
+
+  Found by driving the console's own menus rather than reading them, which is
+  also how the checks below came about.
+
+### Changed
+
+- **The console's checks now run the menus, not just parse them.** Verifying
+  that a builder exists and is reachable cannot show whether it *works*: a
+  prompt that spins, or a builder that exits before writing anything, passes
+  both and still leaves a user staring at a menu that does nothing.
+
+  `check-panel.sh` now drives each Backpack builder to completion with scripted
+  answers and requires the config it writes to be one the core accepts, and it
+  reproduces the spin above and requires it not to happen. Both new checks were
+  confirmed to fail on the previous release and pass on this one. The release
+  build refuses to package a console that fails any of them.
+
 ## [2.7.1] — 2026-08-12
 
 ### Fixed
