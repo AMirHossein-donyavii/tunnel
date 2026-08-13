@@ -458,11 +458,26 @@ build_from_source() {
     # serve. Try mirrors after it. This is safe whichever answers: every module
     # is checked against the hashes in go.sum, so a proxy can serve the build or
     # fail, but it cannot change what gets compiled.
-    export GOPROXY="${ET_GOPROXY:-https://proxy.golang.org,https://goproxy.io,direct}"
+    #
+    # The separator is load-bearing and is NOT a comma. A comma-separated list
+    # falls through only on 404 and 410; every other status is fatal, so the
+    # mirrors are never reached. Google's proxy answers a blocked region with
+    # 403, which is precisely the case this list exists for — with commas the
+    # build dies there having never tried a single mirror. Pipes fall through on
+    # any error.
+    export GOPROXY="${ET_GOPROXY:-https://proxy.golang.org|https://goproxy.io|https://goproxy.cn|direct}"
+    # `direct` fetches with git over HTTPS, which against a filtered host has no
+    # timeout of its own — the same hang that used to stop the clone. Bound it.
+    export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}"
+    export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-30}"
+    export GIT_TERMINAL_PROMPT=0
     ( cd "$src" && CGO_ENABLED=0 "$GO_BIN" build -trimpath \
         -ldflags "-s -w -X github.com/emergency-tunnel/et/internal/core.CoreVersion=${VERSION}" \
         -o "${TMP}/et-core-linux-${ARCH}" ./cmd/et-core ) || {
         warn "the build could not fetch its dependencies or failed to compile."
+        info "If the errors above are 403s from a module proxy, this machine's"
+        info "region is blocked by it; set another and retry, e.g."
+        info "    ET_GOPROXY='https://goproxy.io|direct' bash install.sh"
         info "Copy a release tarball here and install it directly instead:"
         info "    bash install.sh --local /path/to/et-<version>.tar.gz"
         die "build failed"

@@ -4,6 +4,30 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.7] — 2026-08-13
+
+### Fixed
+
+- **The module-proxy fallback added in 2.8.5 never actually ran.** The separator
+  in `GOPROXY` is load-bearing and the list was written with commas: a
+  comma-separated list falls through only on 404 and 410, and every other status
+  is fatal. Google's module proxy answers a blocked region with **403** — exactly
+  the case the mirror list exists for — so the build died on the first module it
+  was refused, having never tried a single mirror. The list now uses pipes, which
+  fall through on any error.
+
+  Demonstrated both ways against a proxy that refuses everything with 403: with
+  commas the build fails on the first module, with pipes it falls through and
+  completes. The full installer path was then run end to end with that proxy
+  placed ahead of the real ones, and built the core.
+
+- **`direct`, the last entry in that list, fetches with git over HTTPS** and so
+  carried the same unbounded hang that used to stop the clone. It is now bounded
+  by git's low-speed limits, and git is told never to prompt.
+
+- A build that fails on 403s now says what a 403 from a module proxy means and
+  gives the one-line override for it.
+
 ## [2.8.6] — 2026-08-13
 
 ### Fixed
