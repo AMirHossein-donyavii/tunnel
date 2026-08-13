@@ -4,6 +4,49 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.9.0] — 2026-08-13
+
+### Changed
+
+- **The ICMP carrier no longer makes the listening server upload a copy of
+  everything it receives.** A kernel answers an Echo Request by itself, copying
+  the payload back verbatim. The dialer sent requests, so for every byte it sent,
+  the listening server's kernel sent that byte straight back — the tunnel's whole
+  download volume, as junk, on the server that usually has the smaller uplink.
+  The real traffic in the other direction then queued behind it, which is what a
+  tunnel that feels slow to update looks like from a chat app.
+
+  Frames now go out as Echo *Replies*, which no kernel answers. Nothing in the
+  protocol needed them to be requests: the direction tag, not the ICMP message
+  type, is what says which way a frame is travelling. Measured here on the
+  running kernel: a 1211-byte Echo Request draws 1211 bytes back, an Echo Reply
+  draws nothing.
+
+  A middlebox that drops an Echo Reply it has no matching request for would break
+  this, so the dialer tries replies, falls back to requests if the link does not
+  come up, and remembers which worked — no configuration, and a peer still on an
+  older core is handled by the same fallback. The listening side accepts both.
+
+- **The pool of links now shares one raw socket instead of opening one each.** A
+  raw ICMP socket has no port and no filter, so the kernel copies every ICMP
+  packet the host receives into every one of them: a pool of four meant four
+  copies of every packet, four wakeups, four parses and three discards — work
+  that grows with the square of the pool, on a server that is usually one core.
+  One socket, one read loop and a map from echo id costs one copy however many
+  links there are, which is how the listening side has always worked.
+
+  Verified end to end over loopback: four links dialed, each accepted, each
+  receiving its own frames and only its own.
+
+### Note
+
+The SPF `icmp` profile still sends Echo Requests and pays the same kernel copy.
+It spoofs its source address, so the copy is not sent back to the dialer, but the
+listening server's uplink still carries it. Separating the message type from the
+direction tag there means changing that codec's interface, and this build has no
+way to exercise SPF's spoofing end to end, so it was left alone rather than
+changed untested.
+
 ## [2.8.9] — 2026-08-13
 
 ### Fixed

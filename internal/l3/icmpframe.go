@@ -134,6 +134,21 @@ func parseEchoMsg(raw []byte, v6, wantReply bool) (payload []byte, id int, ok bo
 	return raw[icmpEchoHdr:], int(raw[4])<<8 | int(raw[5]), true
 }
 
+// parseEchoAny accepts an echo of either direction.
+//
+// The listening side needs this because the dialing side sends Echo Replies
+// where it used to send Echo Requests — see icmpConn.reply — and still has to
+// accept requests from a peer that had to fall back to them.
+func parseEchoAny(raw []byte, v6 bool) (payload []byte, id int, ok bool) {
+	if len(raw) < icmpEchoHdr {
+		return nil, 0, false
+	}
+	if raw[0] != echoType(v6, true) && raw[0] != echoType(v6, false) {
+		return nil, 0, false
+	}
+	return raw[icmpEchoHdr:], int(raw[4])<<8 | int(raw[5]), true
+}
+
 // icmpChecksum is the standard one's-complement sum.
 //
 // Unlike UDP, whose checksum the kernel (often the NIC) computes, a raw ICMP

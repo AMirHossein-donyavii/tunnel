@@ -2,22 +2,26 @@
 
 // ICMP / BIP (ICMPv6) carriers for the TUN engine — BETA.
 //
-// Each encrypted frame rides in the payload of an ICMP Echo message: the dialer
-// sends Echo Requests, the listener answers with Echo Replies carrying its own
-// frames. This mimics ping traffic, which some networks allow when TCP/UDP are
-// filtered. Requires a Linux host with CAP_NET_RAW.
+// Each encrypted frame rides in the payload of an ICMP Echo message. This mimics
+// ping traffic, which some networks allow when TCP/UDP are filtered. Requires a
+// Linux host with CAP_NET_RAW.
 //
-// The listener's kernel answers echo requests too, and its automatic reply
-// carries our own payload back verbatim with the same ICMP id — indistinguishable
-// from a real reply by address and id alone. A dialer that accepts those reads
-// its own ciphertext as if it came from the peer, and the link passes no traffic
-// at all until it times out and cycles. Disabling kernel replies host-wide
-// (net.ipv4.icmp_echo_ignore_all=1) does avoid it, but at the price of the server
-// no longer answering ping on any interface — including its tunnel address.
+// Both directions send Echo *Replies*. A kernel answers an Echo Request by
+// itself, copying the payload back verbatim, and that copy costs the listening
+// server an upload of everything the dialer sends — the tunnel's whole download
+// volume, on the server that usually has the smaller uplink. It also arrives at
+// the dialer indistinguishable by address and id from a real reply, so a dialer
+// that accepts it reads its own ciphertext as peer traffic. Sending replies
+// avoids both: no kernel answers an Echo Reply. Nothing in this protocol needs
+// requests — the direction tag below, not the ICMP type, says which way a frame
+// travels — and a path that drops unsolicited replies is detected at dial time
+// and falls back (see icmpLinkDialer.pick).
 //
-// So each payload carries a one-byte direction tag instead. A mirrored request
-// arrives tagged as a request and is discarded; only genuine peer traffic is
-// read. No sysctl is required and ping keeps working.
+// Each payload carries a one-byte direction tag and the tunnel port. The tag
+// rejects a mirrored request on the fallback path and stray ping traffic; the
+// tunnel port separates two ICMP tunnels on one host, which otherwise read each
+// other's frames because a raw ICMP socket receives every ICMP packet the host
+// gets. No sysctl is required and ping keeps working.
 //
 // This carrier reuses the same datagram AEAD, handshake, and link framing as the
 // UDP carrier; only the packet envelope differs.
@@ -30,6 +34,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emergency-tunnel/et/internal/config"
@@ -56,7 +61,8 @@ func protoFor(mode string) icmpProto {
 func newICMPCarrier(mode string, cfg *config.Config, isDialer bool, cipher string, log *logx.Logger) (linkDialer, linkListener, error) {
 	p := protoFor(mode)
 	if isDialer {
-		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher, cfg: cfg, tunnel: cfg.TunnelPort}, nil, nil
+		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher, cfg: cfg,
+			tunnel: cfg.TunnelPort, log: log}, nil, nil
 	}
 	pc, err := icmp.ListenPacket(p.network, "")
 	if err != nil {
@@ -81,6 +87,54 @@ type icmpLinkDialer struct {
 	// carrier therefore uses to tell its own traffic from another tunnel's on
 	// the same host. See icmpframe.go.
 	tunnel int
+	log    *logx.Logger
+
+	// One raw socket shared by every link of the pool; see socket().
+	mu       sync.Mutex
+	pc       *icmp.PacketConn
+	peerAddr net.Addr
+	conns    map[uint16]*icmpConn
+	dead     chan struct{}
+	deadOnce sync.Once
+
+	// mode records which ICMP message type reached the peer, so only the first
+	// link of the pool pays for finding out. See pick.
+	mode atomic.Int32
+}
+
+// ICMP message type the dialer sends. See pick.
+const (
+	icmpModeUnknown = 0
+	icmpModeReply   = 1
+	icmpModeRequest = 2
+)
+
+// pick returns the message types to try, best first.
+//
+// The dialer used to send Echo Requests, and the listener's kernel answers an
+// Echo Request all by itself with the payload copied back verbatim. That is not
+// merely the duplicate the direction tag already filters out — it is a full copy
+// of everything this side sends, leaving the listening server's uplink carrying
+// the tunnel's entire download volume for nothing. On the server that is usually
+// the one with the smaller uplink, that alone can saturate it, and the real
+// traffic in the other direction then queues behind junk. Measured on this
+// build: a 1208-byte Echo Request draws 1208 bytes back, an Echo Reply draws
+// nothing.
+//
+// So frames go out as Echo Replies. Nothing in the protocol needs them to be
+// requests — the direction tag, not the ICMP type, is what says which way a
+// frame is travelling. The risk is a stateful middlebox that drops an Echo Reply
+// it has no matching request for, so the old behaviour remains as a fallback and
+// is chosen automatically when the first attempt gets no answer.
+func (d *icmpLinkDialer) pick() []bool {
+	switch d.mode.Load() {
+	case icmpModeReply:
+		return []bool{true}
+	case icmpModeRequest:
+		return []bool{false}
+	default:
+		return []bool{true, false}
+	}
 }
 
 // tuneICMPSocket sizes the raw socket's buffers.
@@ -118,10 +172,24 @@ func tuneICMPSocket(pc *icmp.PacketConn, cfg *config.Config) {
 	}
 }
 
-func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
+// socket returns the dialer's shared raw socket, opening it on first use.
+//
+// Every link used to open its own. A raw ICMP socket has no port and no filter,
+// so the kernel copies every ICMP packet the host receives into every one of
+// them: with a pool of four links, four copies of every packet, four wakeups,
+// four parses, and three discards — work that scales with the square of the
+// pool and lands on a server that is usually one core. One socket, one read
+// loop, and a map from echo id to link costs one copy however many links there
+// are. The listening side has always worked this way.
+func (d *icmpLinkDialer) socket() (*icmp.PacketConn, net.Addr, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.pc != nil {
+		return d.pc, d.peerAddr, nil
+	}
 	pc, err := icmp.ListenPacket(d.proto.network, "")
 	if err != nil {
-		return nil, fmt.Errorf("icmp socket: %w (needs CAP_NET_RAW)", err)
+		return nil, nil, fmt.Errorf("icmp socket: %w (needs CAP_NET_RAW)", err)
 	}
 	tuneICMPSocket(pc, d.cfg)
 	ipnet := "ip4"
@@ -135,23 +203,147 @@ func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
 		// address" is "no suitable address found", which reads like a routing or
 		// DNS fault and sends people to the firewall. Say what is actually wrong.
 		if d.proto.v6 {
-			return nil, fmt.Errorf("peer %q has no IPv6 address: tun_mode=bip carries the link inside ICMPv6, so peer must be the other server's IPv6 address — use tun_mode=icmp to carry it over IPv4 (%w)", d.peer, err)
+			return nil, nil, fmt.Errorf("peer %q has no IPv6 address: tun_mode=bip carries the link inside ICMPv6, so peer must be the other server's IPv6 address — use tun_mode=icmp to carry it over IPv4 (%w)", d.peer, err)
 		}
-		return nil, fmt.Errorf("peer %q has no IPv4 address (%w)", d.peer, err)
+		return nil, nil, fmt.Errorf("peer %q has no IPv4 address (%w)", d.peer, err)
 	}
-	conn := &icmpConn{proto: d.proto, pc: pc, peer: peer, id: rand.Intn(0xfffe) + 1, tunnel: d.tunnel}
-	dg, err := crypto.ClientHandshakePacket(conn, d.cipher)
-	if err != nil {
-		_ = pc.Close()
-		return nil, err
-	}
-	return newDatagramLink(conn, dg), nil
+	d.pc, d.peerAddr = pc, peer
+	d.conns = map[uint16]*icmpConn{}
+	d.dead = make(chan struct{})
+	go d.route()
+	return pc, peer, nil
 }
 
-func (d *icmpLinkDialer) Close() error { return nil }
+// route is the dialer's single read loop: one copy of each packet, delivered to
+// the link whose echo id it carries.
+func (d *icmpLinkDialer) route() {
+	buf := make([]byte, 64*1024)
+	for {
+		n, _, err := d.pc.ReadFrom(buf)
+		if err != nil {
+			if isClosed(d.dead) || !isTransientReadErr(err) {
+				return
+			}
+			continue
+		}
+		data, id, ok := parseEchoMsg(buf[:n], d.proto.v6, true)
+		if !ok {
+			continue
+		}
+		payload, ok := stripTag(data, tagToDialer, d.tunnel)
+		if !ok {
+			continue // another tunnel's, our own output, or ordinary ping traffic
+		}
+		d.mu.Lock()
+		c := d.conns[uint16(id)]
+		d.mu.Unlock()
+		if c == nil {
+			continue
+		}
+		bp := getDgram(payload)
+		select {
+		case c.in <- bp:
+		case <-c.closed:
+			putDgram(bp)
+		default:
+			// The link is not keeping up. Dropping here is what the path would
+			// have done anyway, and is far better than stalling the loop and
+			// taking every other link down with it.
+			putDgram(bp)
+		}
+	}
+}
 
-// icmpConn is one client-side ICMP flow presented as a net.Conn.
+func (d *icmpLinkDialer) register(c *icmpConn) {
+	d.mu.Lock()
+	d.conns[uint16(c.id)] = c
+	d.mu.Unlock()
+}
+
+func (d *icmpLinkDialer) unregister(id int) {
+	d.mu.Lock()
+	if d.conns != nil {
+		delete(d.conns, uint16(id))
+	}
+	d.mu.Unlock()
+}
+
+func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
+	pc, peer, err := d.socket()
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, reply := range d.pick() {
+		conn := &icmpConn{d: d, proto: d.proto, pc: pc, peer: peer,
+			id: d.freeID(), tunnel: d.tunnel, reply: reply,
+			in: make(chan *[]byte, flowDepth), closed: make(chan struct{})}
+		d.register(conn)
+		dg, err := crypto.ClientHandshakePacket(conn, d.cipher)
+		if err == nil {
+			if d.mode.CompareAndSwap(icmpModeUnknown, modeFor(reply)) && d.log != nil {
+				if reply {
+					d.log.Info("icmp: sending Echo Replies — the peer's kernel will not copy our traffic back")
+				} else {
+					d.log.Warn("icmp: the path did not pass Echo Replies; falling back to Echo Requests. " +
+						"The peer's kernel will send a copy of everything we send straight back, " +
+						"which costs that server an upload copy of this tunnel's download traffic")
+				}
+			}
+			return newDatagramLink(conn, dg), nil
+		}
+		conn.Close()
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// freeID picks an echo id no live link on this dialer is using. Two links
+// sharing one would read each other's frames, which is the very thing the
+// shared socket demultiplexes by.
+func (d *icmpLinkDialer) freeID() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := 0; i < 64; i++ {
+		id := rand.Intn(0xfffe) + 1
+		if _, taken := d.conns[uint16(id)]; !taken {
+			return id
+		}
+	}
+	// 64 collisions in a 65535-wide space means the pool is implausibly large;
+	// take the first free id rather than loop forever.
+	for id := 1; id < 0xffff; id++ {
+		if _, taken := d.conns[uint16(id)]; !taken {
+			return id
+		}
+	}
+	return 1
+}
+
+func modeFor(reply bool) int32 {
+	if reply {
+		return icmpModeReply
+	}
+	return icmpModeRequest
+}
+
+func (d *icmpLinkDialer) Close() error {
+	d.mu.Lock()
+	pc, dead := d.pc, d.dead
+	d.mu.Unlock()
+	if dead != nil {
+		d.deadOnce.Do(func() { close(dead) })
+	}
+	if pc != nil {
+		return pc.Close()
+	}
+	return nil
+}
+
+// icmpConn is one client-side ICMP flow presented as a net.Conn. Its frames
+// arrive from the dialer's shared read loop, keyed by echo id.
 type icmpConn struct {
+	d     *icmpLinkDialer
 	proto icmpProto
 	pc    *icmp.PacketConn
 	peer  net.Addr
@@ -159,17 +351,26 @@ type icmpConn struct {
 	// tunnel is the configured tunnel port, carried in every frame so this link
 	// can tell its own traffic from another ICMP tunnel's on the same host.
 	tunnel int
+	// reply sends frames as Echo Replies instead of Echo Requests. See
+	// icmpLinkDialer.pick: an Echo Request makes the listener's kernel send the
+	// whole payload straight back, which costs that server an upload copy of
+	// everything this side sends.
+	reply bool
+
+	in     chan *[]byte
+	closed chan struct{}
+	once   sync.Once
+	dg     deadlineGate
 
 	mu      sync.Mutex
 	seq     uint32
 	scratch []byte
-	rbuf    []byte // receive buffer, owned by the single reader
 }
 
 func (c *icmpConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	c.seq++
-	c.scratch = appendEcho(c.scratch[:0], c.proto, c.id, int(c.seq&0xffff), tagToListener, c.tunnel, b)
+	c.scratch = appendTagged(c.scratch[:0], c.proto, c.reply, c.id, int(c.seq&0xffff), tagToListener, c.tunnel, b)
 	out := c.scratch
 	c.mu.Unlock()
 	if _, err := c.pc.WriteTo(out, c.peer); err != nil {
@@ -179,38 +380,31 @@ func (c *icmpConn) Write(b []byte) (int, error) {
 }
 
 func (c *icmpConn) Read(b []byte) (int, error) {
-	// One reader per connection (the datagram link pumps it), so a buffer owned
-	// by the conn is safe and removes an allocation from every packet — which on
-	// a single-core server is a measurable share of the CPU that could have been
-	// spent moving bytes.
-	if cap(c.rbuf) < len(b)+64 {
-		c.rbuf = make([]byte, len(b)+64)
+	bp, err := c.dg.wait(c.in, c.closed)
+	if err != nil {
+		return 0, err
 	}
-	buf := c.rbuf[:len(b)+64]
-	for {
-		n, _, err := c.pc.ReadFrom(buf)
-		if err != nil {
-			if isTransientReadErr(err) {
-				continue // transient under load: skip, don't cycle the link
-			}
-			return 0, err
-		}
-		data, ok := parseEcho(c.proto, buf[:n], c.id, true)
-		if !ok {
-			continue
-		}
-		// Drop anything tagged for the listener: that is our own request
-		// mirrored back by the peer's kernel, not a frame from the peer.
-		payload, ok := stripTag(data, tagToDialer, c.tunnel)
-		if !ok {
-			continue
-		}
-		return copy(b, payload), nil
-	}
+	n := copy(b, *bp)
+	putDgram(bp)
+	return n, nil
 }
 
-func (c *icmpConn) Close() error                       { return c.pc.Close() }
-func (c *icmpConn) SetReadDeadline(t time.Time) error  { return c.pc.SetReadDeadline(t) }
+// Close ends this link only. The socket belongs to the dialer and stays open
+// for the rest of the pool.
+func (c *icmpConn) Close() error {
+	c.once.Do(func() {
+		close(c.closed)
+		if c.d != nil {
+			c.d.unregister(c.id)
+		}
+	})
+	return nil
+}
+
+func (c *icmpConn) SetReadDeadline(t time.Time) error {
+	c.dg.set(t)
+	return nil
+}
 func (c *icmpConn) SetWriteDeadline(t time.Time) error { return nil }
 func (c *icmpConn) SetDeadline(t time.Time) error      { return c.SetReadDeadline(t) }
 func (c *icmpConn) LocalAddr() net.Addr                { return c.pc.LocalAddr() }
@@ -277,7 +471,7 @@ func (l *icmpLinkListener) route() {
 			}
 			continue
 		}
-		data, id, ok := parseEchoRequest(l.proto, buf[:n])
+		data, id, ok := parseEchoAny(buf[:n], l.proto.v6)
 		if !ok {
 			continue
 		}
@@ -449,10 +643,6 @@ func parseEcho(p icmpProto, raw []byte, wantID int, wantReply bool) ([]byte, boo
 		return nil, false
 	}
 	return payload, true
-}
-
-func parseEchoRequest(p icmpProto, raw []byte) ([]byte, int, bool) {
-	return parseEchoMsg(raw, p.v6, false)
 }
 
 // ---- framing ---------------------------------------------------------------
