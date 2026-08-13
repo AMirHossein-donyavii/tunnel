@@ -68,6 +68,15 @@ if [ -x scripts/check-panel.sh ]; then
     }
 fi
 
+# The installer carries its own version so it can tell a user when they are
+# running a cached copy of it. That is worth nothing if the number drifts from
+# the tree, and nothing about a stale constant fails on its own.
+iv="$(sed -n 's/^INSTALLER_VERSION="\(.*\)"$/\1/p' scripts/install.sh | head -n1)"
+[ "$iv" = "$VERSION" ] || {
+    echo "refusing to build: scripts/install.sh says INSTALLER_VERSION=\"${iv}\", tree is ${VERSION}" >&2
+    exit 1
+}
+
 cp scripts/et-panel.sh "${RELDIR}/et-panel.sh"
 # Stamp the panel the same way the core is stamped. Without this, building an
 # explicit version out of a tree whose VERSION says something else ships a

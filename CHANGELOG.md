@@ -4,6 +4,23 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.8] — 2026-08-13
+
+### Added
+
+- **The installer now says when it is an old cached copy of itself.**
+  `raw.githubusercontent.com` serves it with a five-minute cache, so a machine
+  re-running the published one-liner shortly after a fix is handed the previous
+  version and reproduces a bug that is already fixed — with nothing in the output
+  to suggest that is what happened, because the version it reports is the one it
+  knows about. It now carries its own version, compares it against the sources,
+  and prints the cache-busting command when it is behind. The version probe it
+  uses for that carries a cache-buster itself: without one, a stale script and a
+  stale probe agree with each other about a version that is no longer current.
+
+  The release build refuses to package a tree whose installer version has
+  drifted, since nothing about a stale constant fails on its own.
+
 ## [2.8.7] — 2026-08-13
 
 ### Fixed

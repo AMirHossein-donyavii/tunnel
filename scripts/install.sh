@@ -59,6 +59,12 @@ ET_REPO="${ET_REPO:-https://github.com/${ET_REPO_SLUG}.git}"
 # URL in this script is filtered, the files can still arrive by another route,
 # and the installer should be able to use them.
 ET_LOCAL="${ET_LOCAL:-}"
+# The version of this script. raw.githubusercontent.com serves it with a
+# five-minute cache, so a machine that re-runs the published one-liner shortly
+# after a fix can be handed the previous copy and hit a bug that is already
+# fixed — with no way to tell from the output that this is what happened.
+# Compared against the sources at startup; see check_installer_age.
+INSTALLER_VERSION="2.8.8"
 ET_GO_VERSION="${ET_GO_VERSION:-1.22.5}"
 
 PREFIX="/usr/local/bin"
@@ -191,7 +197,24 @@ ver_gt() {
 # been cut for it — an unreleased commit must never leave `et` stuck on an old
 # binary with no way forward.
 branch_version() {
-    probe_str "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/VERSION" 2>/dev/null | tr -d '[:space:]'
+    # The query string defeats the CDN cache. Without it this can report the same
+    # stale value as the cached copy of the script asking the question, and the
+    # two agree with each other about a version that is no longer current.
+    probe_str "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/VERSION?cb=$(date +%s)" \
+        2>/dev/null | tr -d '[:space:]'
+}
+
+# check_installer_age warns when this script is an old cached copy. A stale
+# installer reproduces bugs that are already fixed, and nothing in its output
+# says so — the version it prints is the one it knows about.
+check_installer_age() {
+    local bv; bv="$(branch_version)" || return 0
+    [ -n "$bv" ] && is_semver "$bv" && is_semver "$INSTALLER_VERSION" || return 0
+    ver_gt "$bv" "$INSTALLER_VERSION" || return 0
+    warn "this installer is v${INSTALLER_VERSION}; v${bv} is available."
+    info "You are running a cached copy — raw.githubusercontent.com caches for 5 minutes."
+    info "To force the current one:"
+    info "    bash <(curl -fsSL 'https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/scripts/install.sh?cb='\$(date +%s))"
 }
 
 # resolve_from <host|github> — sets VERSION and REL_URL, or fails.
@@ -605,6 +628,7 @@ main() {
     banner
     detect
     install_deps
+    check_installer_age
     if [ -n "$ET_LOCAL" ]; then
         install_from_local
     elif [ "$ET_FROM_SOURCE" = "1" ]; then
