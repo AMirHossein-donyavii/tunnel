@@ -79,7 +79,8 @@ if [ -x "$CORE_BIN" ] && command -v timeout >/dev/null; then
     trap 'rm -rf "$tmp"' EXIT
     harness="$tmp/panel.sh"
     awk '/^# ---- non-interactive entry points/{exit} {print}' "$PANEL" > "$harness"
-    sed -i -e "s|^CONF_DIR=.*|CONF_DIR=\"$tmp/etc\"|" "$harness"
+    sed -i -e "s|^CONF_DIR=.*|CONF_DIR=\"$tmp/etc\"|" \
+           -e "s|^WG_DIR=.*|WG_DIR=\"$tmp/wg\"|" "$harness"
     cat >> "$harness" <<'STUB'
 systemctl() { return 0; }
 port_in_use() { return 1; }
@@ -102,12 +103,43 @@ STUB
     drive backpack_wss     t-wss "" n 1 11235 15002 n
     drive backpack_quic    t-quic "" n 1 11236 15003 n
     drive backpack_fec     t-fec  n 1 11237 15004 n
-    # The Iran half of the WireGuard VPN: it writes a tunnel config like any
-    # other builder, so it is held to the same standard.
+    # Both halves of the WireGuard VPN write a tunnel config like any other
+    # builder, so they are held to the same standard. The Foreign half in
+    # particular shipped once creating WireGuard and no tunnel at all, so the
+    # pair could never connect: it passed every check above because the builder
+    # existed, was reachable, and ran — it just left out half its job.
     # users' port, the Foreign server's WireGuard port, name, tunnel port
     drive wg_vpn_entry     51820 51999 t-wgvpn 11238
+    # listen port here, Iran IP, users' port there, tunnel port, client count, name
+    if command -v wg >/dev/null; then
+        drive wg_vpn_exit  51999 203.0.113.9 51820 11239 1 t-wgvpn
+    fi
 
-    # 6. A prompt whose input runs out must stop, not spin. A loop that re-asks
+    # 6. The two halves of a paired builder must actually pair up. Each half can
+    #    write a config the core accepts and still never connect to the other:
+    #    that is precisely what shipped when the Foreign half wrote no tunnel at
+    #    all. Opposite roles on a matching tunnel port is the property that makes
+    #    a pair a pair, so assert it rather than the halves separately.
+    if command -v wg >/dev/null; then
+        pairport=11240
+        rm -rf "$tmp/etc" "$tmp/wg"; mkdir -p "$tmp/etc"
+        printf '%s\n' 51820 51999 pair-iran "$pairport" \
+            | timeout 25 bash -c "source $harness; wg_vpn_entry" >/dev/null 2>&1
+        printf '%s\n' 51999 203.0.113.9 51820 "$pairport" 1 pair-kharej \
+            | timeout 25 bash -c "source $harness; wg_vpn_exit" >/dev/null 2>&1
+        a="$tmp/etc/pair-iran.toml"; b="$tmp/etc/pair-kharej.toml"
+        if [ ! -f "$a" ] || [ ! -f "$b" ]; then
+            bad "the WireGuard VPN builders produced $( ls "$tmp"/etc/*.toml 2>/dev/null | wc -l ) of the 2 configs a working pair needs"
+        elif ! grep -q 'role = "iran"' "$a" || ! grep -q 'role = "kharej"' "$b"; then
+            bad "the WireGuard VPN halves do not take opposite roles"
+        elif [ "$(grep -c "^tunnel_port = ${pairport}$" "$a" "$b" | grep -c ':1$')" != "2" ]; then
+            bad "the WireGuard VPN halves disagree about the tunnel port, so they cannot connect"
+        else
+            good "the WireGuard VPN halves form a connectable pair"
+        fi
+    fi
+
+    # 7. A prompt whose input runs out must stop, not spin. A loop that re-asks
     #    forever against a closed stdin burns a core and never returns.
     # The value must be one the prompt REJECTS, so the retry loop is entered and
     # then meets a closed stdin — typing something invalid and pressing Ctrl-D.

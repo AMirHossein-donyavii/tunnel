@@ -4,6 +4,44 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.2] — 2026-08-13
+
+### Fixed
+
+- **The WireGuard VPN's Foreign half created no tunnel at all**, so the pair
+  could never connect. It set up WireGuard, wrote the client files, printed
+  instructions — and never created the tunnel that dials the Iran server. The
+  Iran side creates only its own half and then listens, so the result was the
+  worst shape a failure can take: both servers reporting a tunnel that is up,
+  the VPN port forwarded, and not one client able to connect.
+
+  The Foreign half now asks for the tunnel port and creates its matching
+  `role = "kharej"` tunnel in the same run, delivering to the WireGuard it just
+  started on loopback. Verified by driving both halves and checking the pair
+  that comes out: opposite roles, one tunnel port.
+
+- **A refused handshake now says which of the three causes it was.** "not an
+  emergency-tunnel peer (bad magic/version)" was the same line whether the other
+  server runs a different core version, is configured for a different transport,
+  or is not your server at all but a scanner off the internet — three problems
+  with three unrelated fixes. The first bytes of the rejected hello tell them
+  apart, so the log now names the peer's protocol version when it is a version
+  mismatch, says the transports differ when a TLS or WebSocket peer arrives on a
+  plain port, and keeps the old wording only for traffic that is genuinely not
+  ours.
+
+### Changed
+
+- The Iran half of the WireGuard VPN now states outright that it is one half of
+  a pair, that it will report itself running and carry nothing until the Foreign
+  half exists, and prints the three numbers that half needs.
+
+- The console's checks gained two that would have caught the above: the Foreign
+  half is driven to completion like every other builder, and the two halves are
+  driven together and required to come out as a connectable pair — opposite
+  roles, matching tunnel port. Both fail on the previous release's console and
+  pass on this one.
+
 ## [2.8.1] — 2026-08-13
 
 ### Fixed

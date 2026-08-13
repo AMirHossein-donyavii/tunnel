@@ -56,6 +56,50 @@ func deriveKey(shared, cpub, spub, label []byte) []byte {
 	return key
 }
 
+// describeHello turns a rejected client hello into something the operator can
+// act on.
+//
+// "not an emergency-tunnel peer" is true but useless: it is the same line
+// whether the other server is a version behind, is configured with a different
+// transport, or is not the other server at all but a scanner off the internet —
+// and those have completely different fixes. The first bytes distinguish them,
+// so say which one it is.
+func describeHello(hello []byte) error {
+	switch {
+	// Our own signature with a different version byte: the two servers are
+	// running different core builds and the wire format changed between them.
+	case hello[0] == 'E' && hello[1] == 'T':
+		return fmt.Errorf("handshake: peer is an emergency-tunnel of a different version "+
+			"(it speaks protocol v%d, this core speaks v%d) — update both servers to the same release",
+			hello[4], protoVer)
+
+	// A TLS record: content type 22 (handshake), version 3.x. This is what a
+	// peer configured for the stealth/wss/tls transports sends, and it reaches a
+	// plain-tcp listener only when the two sides disagree about the transport.
+	case hello[0] == 0x16 && hello[1] == 0x03:
+		return fmt.Errorf("handshake: peer opened with TLS on a plain tunnel port — " +
+			"the two sides are set to different transports; make transport match on both servers")
+
+	// An HTTP request line: either a wss/ws peer against a non-WebSocket
+	// listener, or a probe.
+	case looksHTTP(hello):
+		return fmt.Errorf("handshake: peer sent an HTTP request, not a tunnel handshake — " +
+			"if this is your other server, its transport is set to ws/wss while this one is not")
+
+	default:
+		return errBadMagic
+	}
+}
+
+func looksHTTP(b []byte) bool {
+	for _, m := range [...]string{"GET ", "POST", "HEAD", "PUT ", "OPTI", "CONN"} {
+		if len(b) >= len(m) && string(b[:len(m)]) == m {
+			return true
+		}
+	}
+	return false
+}
+
 // ClientHandshake performs the ephemeral X25519 exchange (dialing side) and
 // returns an encrypted SecureConn.
 func ClientHandshake(conn net.Conn, cipherName string) (*SecureConn, error) {
@@ -101,7 +145,7 @@ func ServerHandshake(conn net.Conn, cipherName string) (*SecureConn, error) {
 		return nil, fmt.Errorf("handshake: reading client hello: %w", err)
 	}
 	if binary.BigEndian.Uint32(hello) != magic || hello[4] != protoVer {
-		return nil, errBadMagic
+		return nil, describeHello(hello)
 	}
 	cpub := hello[5 : 5+pubLen]
 

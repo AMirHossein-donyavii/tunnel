@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.8.1"
+SCRIPT_VERSION="2.8.2"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -852,8 +852,9 @@ wg_vpn_exit() {
     note "Clients will be told to connect to the Iran server, so its public"
     note "address goes into every client file."
     endpoint="$(ask_ip "Iran server public IP")"
-    local pubport
+    local pubport tport
     pubport="$(ask_port "Port your users will connect to on the Iran server" "51820")"
+    tport="$(ask_port "Tunnel port ${GRY}(the server-to-server link; same on BOTH)${R}" "$(next_free_port 1234)")"
     n="$(ask "How many client files to create" "3")"
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || n=3
     [ "$n" -gt 50 ] && n=50
@@ -940,11 +941,34 @@ wg_vpn_exit() {
     note "packets travel inside this tunnel as well, so 1420 no longer fits — left"
     note "at the default the VPN connects, small things work, and any real"
     note "download stalls."
+
+    # The tunnel half. This side DIALS the Iran server, and without it nothing
+    # ever connects: the Iran server sits listening and the VPN is unreachable.
+    # It is created here, in the same run, so there is no second thing to
+    # remember and no way to end up with one half of a pair.
+    echo
+    title "Creating the tunnel that carries it"
+    cfg_reset
+    optimise basic tcpmux
+    cfg_set _section gaming
+    cfg_set engine "mux"
+    cfg_set transport "tcp"
+    cfg_set name "$(ask_name "Tunnel name" "wgvpn$(tunnel_count)")"
+    cfg_set role "kharej"
+    cfg_set mode reverse
+    cfg_set peer "$endpoint"
+    cfg_set tunnel_port "$tport"
+    cfg_set health_port "$(next_free_port 9090)"
+    # WireGuard listens on this machine, so the exit delivers to loopback.
+    cfg_set exit_host "127.0.0.1"
+    finish_tunnel
+
     echo
     title "What to do on the IRAN server"
-    note "Gaming → WireGuard VPN → Iran, and give it these two numbers:"
+    note "Gaming → WireGuard VPN → Iran, and give it these three numbers:"
     kv "  users connect to" "${pubport}   (the public port there)"
     kv "  forward to"       "${port}   (this server's WireGuard port)"
+    kv "  tunnel port"      "${tport}   (the same one used here)"
     [ "$pubport" != "$port" ] && note "They differ here, which is fine — the tunnel maps one to the other."
     echo
     note "To show a client file:   cat ${out}/client1.conf"
@@ -993,6 +1017,19 @@ wg_vpn_entry() {
     fi
     warn "Open udp/${port} on this server's firewall — that is the port your"
     warn "users' WireGuard clients connect to."
+    echo
+    # This half only listens. Without the Foreign half nothing ever dials in, and
+    # the symptom is the worst kind: the tunnel reports itself up, the port is
+    # forwarded, and no client can connect. Say plainly that a second step exists.
+    title "This is one half — the Foreign server needs the other"
+    note "Until it is created, this tunnel will show as running and still carry"
+    note "nothing: it is waiting to be dialled."
+    note "There, choose Gaming → WireGuard VPN → Foreign server and give it:"
+    kv "  its WireGuard port" "${fwd}   (what this server forwards to)"
+    kv "  users connect to"   "${port}   (this server's public port)"
+    kv "  tunnel port"        "${CFG[tunnel_port]}   (the same one, on both)"
+    note "It must run the same version of this console, or its connection is"
+    note "refused with 'not an emergency-tunnel peer' in this server's log."
     finish_tunnel
 }
 
