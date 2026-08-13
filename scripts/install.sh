@@ -12,19 +12,27 @@
 #   --base-url <u>   release host root                 (default below)
 #   --source <s>     host | github | source | auto     (default: auto)
 #   --from-source    build from Go source instead of downloading
+#   --local <path>   install a release directory or tarball already on this
+#                    machine — no network at all
 #   --force          reinstall even if already at the target version
 #   --no-tune        skip host network tuning (BBR/fq/buffers)
 #   --allow-downgrade  permit installing an older version than the one present
 #   --uninstall      remove the tunnel (configs are kept unless you confirm)
 #
 # Environment overrides: ET_SOURCE, ET_REPO_SLUG, ET_BASE_URL, ET_CHANNEL,
-# ET_VERSION, ET_PUBKEY, ET_FROM_SOURCE, ET_ALLOW_INSECURE, ET_FORCE, ET_NO_TUNE
+# ET_VERSION, ET_PUBKEY, ET_FROM_SOURCE, ET_ALLOW_INSECURE, ET_FORCE, ET_NO_TUNE,
+# ET_LOCAL
 #
 # Where the build comes from (auto): the release host first, then GitHub
 # Releases. Whichever answers, its version is compared against the VERSION file
 # on the default branch — if the branch is newer, the installer builds that from
 # source. An unreleased fix therefore still reaches you through `et` → Update;
 # it never silently reinstalls the last published binary.
+#
+# On a filtered path all of those can fail at once — the host times out, the
+# GitHub API does not answer, and a source build needs a Go toolchain from a
+# third host. --local takes the release straight off disk in that case; it is
+# checksum-verified exactly as a download would be.
 #
 # Upgrades are safe: configurations in /etc/emergency-tunnel are never
 # rewritten by the installer, running tunnels are restarted onto the new core,
@@ -47,6 +55,10 @@ ET_FORCE="${ET_FORCE:-0}"
 ET_NO_TUNE="${ET_NO_TUNE:-0}"
 ET_ALLOW_DOWNGRADE="${ET_ALLOW_DOWNGRADE:-0}"
 ET_REPO="${ET_REPO:-https://github.com/${ET_REPO_SLUG}.git}"
+# A release directory or tarball already on this machine. On a path where every
+# URL in this script is filtered, the files can still arrive by another route,
+# and the installer should be able to use them.
+ET_LOCAL="${ET_LOCAL:-}"
 ET_GO_VERSION="${ET_GO_VERSION:-1.22.5}"
 
 PREFIX="/usr/local/bin"
@@ -63,6 +75,7 @@ while [ $# -gt 0 ]; do
         --base-url)    ET_BASE_URL="$2"; ET_SOURCE="host"; shift 2 ;;
         --source)      ET_SOURCE="$2"; shift 2 ;;
         --from-source) ET_FROM_SOURCE=1; shift ;;
+        --local)       ET_LOCAL="$2"; shift 2 ;;
         --force)       ET_FORCE=1; shift ;;
         --no-tune)     ET_NO_TUNE=1; shift ;;
         --allow-downgrade) ET_ALLOW_DOWNGRADE=1; shift ;;
@@ -99,6 +112,16 @@ else
 fi
 dl()     { curl "${DL_OPTS[@]}" -o "$2" "$1"; }
 dl_str() { curl "${DL_OPTS[@]}" "$1"; }
+
+# Resolving a version fetches a few bytes and is allowed to fail: the whole
+# point of trying several sources is that one of them may be unreachable. Doing
+# that with the download options meant four attempts at fifteen seconds each
+# before the fallback was even considered — a minute of a frozen "Release" step
+# on a path where the host is blocked, which reads as a hung installer. Probes
+# get one quick attempt; only the actual download is patient.
+PROBE_OPTS=(--fail --silent --location --connect-timeout 5 --max-time 10)
+[ "$ET_ALLOW_INSECURE" = "1" ] || PROBE_OPTS+=(--proto '=https' --tlsv1.2)
+probe_str() { curl "${PROBE_OPTS[@]}" "$1"; }
 sha256_of() {
     if have sha256sum; then sha256sum "$1" | awk '{print $1}'
     elif have shasum;  then shasum -a 256 "$1" | awk '{print $1}'
@@ -168,7 +191,7 @@ ver_gt() {
 # been cut for it — an unreleased commit must never leave `et` stuck on an old
 # binary with no way forward.
 branch_version() {
-    dl_str "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/VERSION" 2>/dev/null | tr -d '[:space:]'
+    probe_str "https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/VERSION" 2>/dev/null | tr -d '[:space:]'
 }
 
 # resolve_from <host|github> — sets VERSION and REL_URL, or fails.
@@ -176,11 +199,11 @@ resolve_from() {
     case "$1" in
       host)
         if [ -n "$ET_VERSION" ]; then VERSION="$ET_VERSION"
-        else VERSION="$(dl_str "${ET_BASE_URL}/${ET_CHANNEL}" | tr -d '[:space:]')" || return 1; fi
+        else VERSION="$(probe_str "${ET_BASE_URL}/${ET_CHANNEL}" 2>/dev/null | tr -d '[:space:]')" || return 1; fi
         REL_URL="${ET_BASE_URL}/releases/v${VERSION}" ;;
       github)
         if [ -n "$ET_VERSION" ]; then VERSION="$ET_VERSION"
-        else VERSION="$(dl_str "https://api.github.com/repos/${ET_REPO_SLUG}/releases/latest" \
+        else VERSION="$(probe_str "https://api.github.com/repos/${ET_REPO_SLUG}/releases/latest" 2>/dev/null \
               | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/')" || return 1; fi
         REL_URL="https://github.com/${ET_REPO_SLUG}/releases/download/v${VERSION}" ;;
     esac
@@ -214,10 +237,18 @@ resolve_version() {
         host|github) resolve_from "$ET_SOURCE" || die "cannot resolve a version from '${ET_SOURCE}'" ;;
         source)      VERSION="${ET_VERSION:-}"; SOURCE_USED="source" ;;
         auto)
+            # Say which source is being tried before trying it. A blocked host
+            # shows up here as a pause, and a pause under a bare "Release"
+            # heading is indistinguishable from a hung installer.
+            info "checking ${ET_BASE_URL}"
             if resolve_from host; then :
-            elif warn "release host unreachable — falling back to GitHub Releases"; resolve_from github; then :
             else
-                VERSION=""; SOURCE_USED="source"
+                warn "release host unreachable — trying GitHub Releases"
+                if resolve_from github; then :
+                else
+                    warn "no GitHub release reachable either"
+                    VERSION=""; SOURCE_USED="source"
+                fi
             fi
             prefer_branch_source ;;
         *) die "unknown ET_SOURCE '${ET_SOURCE}' (host|github|source|auto)" ;;
@@ -257,6 +288,52 @@ download_release() {
     done
     ok "4 files downloaded and verified"
     CORE_BIN="${TMP}/${asset}"
+}
+
+# install_from_local takes a release that is already on this machine: either the
+# release directory itself, or the tarball it was packaged in.
+#
+# Every other path here depends on reaching a URL, and on a filtered path all of
+# them can fail at once — the host times out, the GitHub API does not answer, and
+# a source build needs a Go toolchain from a third host. The files themselves
+# travel fine by any other route, so accept them directly. They are checksummed
+# against the release's own SHA256SUMS exactly as a download would be.
+install_from_local() {
+    step "Local release"
+    TMP="$(mktemp -d)"
+    local dir="$ET_LOCAL" sums
+    if [ -f "$dir" ]; then
+        mkdir -p "${TMP}/unpack"
+        tar -xzf "$dir" -C "${TMP}/unpack" 2>/dev/null || die "cannot unpack ${ET_LOCAL}"
+        # A packaged tarball may hold several releases; take the newest.
+        sums="$(find "${TMP}/unpack" -type f -name SHA256SUMS | sort -V | tail -n1)"
+        [ -n "$sums" ] || die "${ET_LOCAL} contains no release (no SHA256SUMS inside)"
+        dir="$(dirname "$sums")"
+    fi
+    [ -d "$dir" ] || die "${ET_LOCAL} is neither a directory nor a tarball"
+    [ -f "${dir}/SHA256SUMS" ] || die "${dir} is not a release directory (no SHA256SUMS)"
+
+    local asset="et-core-linux-${ARCH}"
+    cp "${dir}/SHA256SUMS" "${TMP}/SHA256SUMS"
+    for f in "$asset" et-panel.sh emergency-tunnel@.service uninstall.sh; do
+        [ -f "${dir}/${f}" ] || die "${dir} has no ${f} — is this a release for ${ARCH}?"
+        cp "${dir}/${f}" "${TMP}/${f}"
+        verify_against_sums "$f"
+    done
+
+    # The release states its own version; never guess one that the binary then
+    # contradicts.
+    if [ -n "$ET_VERSION" ]; then VERSION="$ET_VERSION"
+    else
+        VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                   "${dir}/manifest.json" 2>/dev/null | head -n1)"
+        [ -n "$VERSION" ] || VERSION="$(basename "$dir")"
+        VERSION="${VERSION#v}"
+    fi
+    is_semver "$VERSION" || die "cannot tell which version the release in ${dir} is"
+    SOURCE_USED="local"
+    CORE_BIN="${TMP}/${asset}"
+    ok "v${VERSION} from ${ET_LOCAL} — 4 files verified against its SHA256SUMS"
 }
 
 # ---- source build ----------------------------------------------------------
@@ -415,12 +492,14 @@ main() {
     banner
     detect
     install_deps
-    if [ "$ET_FROM_SOURCE" = "1" ]; then
-        VERSION="${ET_VERSION:-}"; SOURCE_USED="source"
+    if [ -n "$ET_LOCAL" ]; then
+        install_from_local
+    elif [ "$ET_FROM_SOURCE" = "1" ]; then
+        VERSION="${ET_VERSION:-}"; SOURCE_USED="source"; build_from_source
     else
         resolve_version
+        if [ "$SOURCE_USED" = "source" ]; then build_from_source; else download_release; fi
     fi
-    if [ "$SOURCE_USED" = "source" ]; then build_from_source; else download_release; fi
     install_files
     tune_host
     migrate_and_restart

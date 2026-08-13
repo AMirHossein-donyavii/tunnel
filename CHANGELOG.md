@@ -4,6 +4,39 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.4] — 2026-08-13
+
+### Fixed
+
+- **The installer looked hung at "Release" for a minute on a path where the
+  release host is filtered.** Resolving a version fetches a few bytes and is
+  allowed to fail — that is the whole point of trying several sources — but it
+  was doing so with the download options: four attempts, fifteen seconds of
+  connect timeout each. Against a host that accepts TCP and never completes TLS,
+  measured here, that is 66 seconds of silence under a bare "Release" heading
+  before the fallback is even considered, and it ends in a raw
+  `curl: (28) SSL connection timeout`. Probes now get one quick attempt (5 s
+  connect, 10 s total, measured at 5 s in the same test); only the actual
+  download stays patient. The step also names each source before trying it, so a
+  pause is attributable rather than indistinguishable from a hang.
+
+### Added
+
+- **`--local <path>` installs a release directory or tarball already on the
+  machine, with no network at all.** Every other path depends on reaching a URL,
+  and on a filtered path they can fail together: the host times out, the GitHub
+  API does not answer, and a source build then wants a Go toolchain from a third
+  host. The files themselves travel fine by any other route. They are verified
+  against the release's own SHA256SUMS exactly as a download would be — a
+  tampered file is refused, a directory that is not a release is refused, and a
+  release built for another architecture says so.
+
+- **`scripts/publish-github-release.sh`** publishes a built release to GitHub
+  Releases, with the changelog section for that version as its notes. The
+  installer's GitHub fallback is only worth having if GitHub carries the current
+  release; with the newest tag months behind the sources, an install that cannot
+  reach the host falls all the way through to a source build instead.
+
 ## [2.8.3] — 2026-08-13
 
 ### Changed
