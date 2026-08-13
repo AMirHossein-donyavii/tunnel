@@ -4,6 +4,30 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.3] — 2026-08-13
+
+### Changed
+
+- **A rejected handshake that matches nothing known now prints its opening
+  bytes.** Two very different things reach that branch and their content cannot
+  separate them, because one of them is deliberately shapeless: the stealth
+  transport opens with 48 uniformly random bytes precisely so a scan finds
+  nothing to fingerprint, and a peer set to it dialing a plain-tcp listener looks
+  exactly like a bot probing the port. The bytes tell them apart by eye — a
+  scanner repeats a recognisable string, a stealth peer never sends the same
+  bytes twice.
+
+- **A source that keeps failing the handshake is logged once per five minutes,
+  with the number of attempts it stood in for.** A public tunnel port is found by
+  scanners within hours, and one retrying every few seconds writes thousands of
+  identical lines a day, burying everything that matters — including the line the
+  operator is actually looking for. Every rejection is still counted in the
+  engine's statistics; only the repeated line is collapsed. The count is the
+  point: a scanner and a peer stuck in a reconnect loop read the same in one line
+  and quite differently at "1 since" versus "312 since". Distinct sources stay
+  independent, and the table that tracks them is bounded so a scan from many
+  addresses cannot grow it.
+
 ## [2.8.2] — 2026-08-13
 
 ### Fixed

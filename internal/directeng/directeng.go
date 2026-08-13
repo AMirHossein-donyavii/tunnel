@@ -68,6 +68,10 @@ type Engine struct {
 	routes   map[int]target
 	parked   chan *parkedConn
 
+	// See muxeng: a public tunnel port attracts scanners, and one rejection
+	// line every few seconds buries everything else in the journal.
+	hsNoise *logx.Suppressor
+
 	stats struct {
 		active     int64
 		total      uint64
@@ -89,8 +93,9 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		cfg: cfg, log: log, cipher: cfg.Cipher,
 		isDialer: cfg.IsDialer(), isEntry: cfg.IsEntry(),
 		exitHost: cfg.ExitHost, tr: tr,
-		tune:   nettune.LinkOptions(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf),
-		routes: map[int]target{},
+		tune:    nettune.LinkOptions(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf),
+		routes:  map[int]target{},
+		hsNoise: logx.NewSuppressor(5*time.Minute, 256),
 	}
 	if e.exitHost == "" {
 		e.exitHost = "127.0.0.1"
@@ -260,7 +265,7 @@ func (e *Engine) acceptLinks(ctx context.Context) {
 			sc, err := crypto.ServerHandshake(raw, e.cipher)
 			if err != nil {
 				_ = raw.Close()
-				e.fail("handshake from %s: %v", raw.RemoteAddr(), err)
+				e.rejectedHandshake(raw.RemoteAddr(), err)
 				return
 			}
 			pc := &parkedConn{sc: sc, dead: make(chan struct{})}
@@ -408,6 +413,24 @@ func (e *Engine) copy(dst io.Writer, src io.Reader) uint64 {
 	defer bufPool.Put(bp)
 	n, _ := io.CopyBuffer(dst, src, *bp)
 	return uint64(n)
+}
+
+// rejectedHandshake counts every refused peer but logs a repeat from one source
+// only once per window. See muxeng for why.
+func (e *Engine) rejectedHandshake(remote net.Addr, err error) {
+	atomic.AddUint64(&e.stats.errs, 1)
+	key := remote.String()
+	if h, _, splitErr := net.SplitHostPort(key); splitErr == nil {
+		key = h
+	}
+	log, n := e.hsNoise.Allow(key)
+	switch {
+	case !log:
+	case n > 0:
+		e.log.Warn("handshake from %s: %v (and %d more from it since)", remote, err, n)
+	default:
+		e.log.Warn("handshake from %s: %v", remote, err)
+	}
 }
 
 func (e *Engine) fail(f string, a ...any) {

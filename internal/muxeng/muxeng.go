@@ -53,6 +53,11 @@ type Engine struct {
 	tune     nettune.Options
 	muxCfg   mux.Config
 
+	// A public tunnel port is found by scanners, and one that keeps retrying
+	// writes a rejection line every few seconds until nothing else in the log is
+	// findable. Rejections are always counted; the line is collapsed per source.
+	hsNoise *logx.Suppressor
+
 	routes map[int]target
 
 	set sessionSet
@@ -92,6 +97,7 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		exitHost: orDefaultStr(cfg.ExitHost, "127.0.0.1"),
 		tune:     nettune.LinkOptions(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf),
 		routes:   map[int]target{},
+		hsNoise:  logx.NewSuppressor(5*time.Minute, 256),
 	}
 	// Forwarded UDP sockets get the datagram receive sizing, so a VPN's bursts
 	// are absorbed rather than dropped by the kernel before we see them.
@@ -213,7 +219,7 @@ func (e *Engine) acceptSessions(ctx context.Context) {
 			link, err := crypto.ServerHandshake(raw, e.cipher)
 			if err != nil {
 				_ = raw.Close()
-				e.sessionErr("handshake from %s: %v", raw.RemoteAddr(), err)
+				e.rejectedHandshake(raw.RemoteAddr(), err)
 				return
 			}
 			e.serveSession(ctx, mux.Server(link, e.muxCfg))
@@ -399,6 +405,25 @@ func (e *Engine) copy(dst io.Writer, src io.Reader) uint64 {
 	defer bufPool.Put(bp)
 	n, _ := io.CopyBuffer(dst, src, *bp)
 	return uint64(n)
+}
+
+// rejectedHandshake counts every refused peer but logs a flood from one source
+// once per window, with the number it stood in for. The source's port changes
+// on every attempt and its address does not, so the address is the key.
+func (e *Engine) rejectedHandshake(remote net.Addr, err error) {
+	atomic.AddUint64(&e.stats.sessionErrs, 1)
+	key := remote.String()
+	if h, _, splitErr := net.SplitHostPort(key); splitErr == nil {
+		key = h
+	}
+	log, n := e.hsNoise.Allow(key)
+	switch {
+	case !log:
+	case n > 0:
+		e.log.Warn("handshake from %s: %v (and %d more from it since)", remote, err, n)
+	default:
+		e.log.Warn("handshake from %s: %v", remote, err)
+	}
 }
 
 func (e *Engine) sessionErr(f string, a ...any) {

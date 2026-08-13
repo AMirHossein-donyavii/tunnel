@@ -86,9 +86,32 @@ func describeHello(hello []byte) error {
 		return fmt.Errorf("handshake: peer sent an HTTP request, not a tunnel handshake — " +
 			"if this is your other server, its transport is set to ws/wss while this one is not")
 
+	// Anything else. Two very different things land here and the bytes cannot
+	// separate them, because one of them is deliberately shapeless: the stealth
+	// transport opens with 48 uniformly random bytes precisely so that a port
+	// scan finds nothing to fingerprint. A peer configured for it, dialing a
+	// plain-tcp listener, is therefore indistinguishable by content from a bot
+	// probing the port. Print the opening bytes so the two can at least be told
+	// apart by eye — a scanner repeats a recognisable string, a stealth peer
+	// never sends the same bytes twice.
 	default:
-		return errBadMagic
+		return fmt.Errorf("%w — opens with %s; if this is your other server its transport "+
+			"does not match this one (stealth and the other obfuscated carriers open with "+
+			"random bytes), otherwise it is unrelated traffic probing this port",
+			errBadMagic, hexPreview(hello[:8]))
 	}
+}
+
+func hexPreview(b []byte) string {
+	const digits = "0123456789abcdef"
+	out := make([]byte, 0, len(b)*3)
+	for i, c := range b {
+		if i > 0 {
+			out = append(out, ' ')
+		}
+		out = append(out, digits[c>>4], digits[c&0xf])
+	}
+	return string(out)
 }
 
 func looksHTTP(b []byte) bool {
