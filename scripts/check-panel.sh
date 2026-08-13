@@ -104,7 +104,8 @@ STUB
     drive backpack_fec     t-fec  n 1 11237 15004 n
     # The Iran half of the WireGuard VPN: it writes a tunnel config like any
     # other builder, so it is held to the same standard.
-    drive wg_vpn_entry     51820 t-wgvpn 11238
+    # users' port, the Foreign server's WireGuard port, name, tunnel port
+    drive wg_vpn_entry     51820 51999 t-wgvpn 11238
 
     # 6. A prompt whose input runs out must stop, not spin. A loop that re-asks
     #    forever against a closed stdin burns a core and never returns.

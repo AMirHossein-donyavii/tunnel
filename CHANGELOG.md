@@ -4,6 +4,28 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.1] — 2026-08-13
+
+### Fixed
+
+- **The WireGuard VPN insisted both servers use the same port, which is wrong.**
+  The Foreign server's WireGuard listen port is a purely local detail: nothing
+  outside reaches it, because the tunnel delivers to it. Demanding it match the
+  port users connect to on the Iran server meant that anyone already running
+  WireGuard on the Foreign server hit a collision — asked for a port, told it
+  was in use, with no way forward that made sense.
+
+  The two are now separate. The Foreign side asks only for its own listen port,
+  says plainly that it is local and need not match anything, and defaults to one
+  that is actually free. It then prints both numbers the Iran side needs. The
+  Iran side asks for the port users connect to and the port to deliver to,
+  defaulting to the same, and writes a mapped forward when they differ.
+
+  Verified end to end: `udp/51820` on the entry delivered to `udp/51999` on the
+  exit, WireGuard-shaped datagrams intact, 2,670 sustained at 0.00% loss
+  (p50 0.60 ms, p99 0.90 ms) — and the generated client file dials the Iran
+  server on the public port while the server config listens on its own.
+
 ## [2.8.0] — 2026-08-12
 
 ### Added
