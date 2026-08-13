@@ -21,7 +21,7 @@
 #
 # Environment overrides: ET_SOURCE, ET_REPO_SLUG, ET_BASE_URL, ET_CHANNEL,
 # ET_VERSION, ET_PUBKEY, ET_FROM_SOURCE, ET_ALLOW_INSECURE, ET_FORCE, ET_NO_TUNE,
-# ET_LOCAL
+# ET_LOCAL, ET_GOPROXY, ET_GO_MIN
 #
 # Where the build comes from (auto): the release host first, then GitHub
 # Releases. Whichever answers, its version is compared against the VERSION file
@@ -337,15 +337,58 @@ install_from_local() {
 }
 
 # ---- source build ----------------------------------------------------------
+# ET_GO_MIN is the oldest toolchain that can build this tree; keep it in step
+# with the `go` line in go.mod. A Go older than this fails deep in the build with
+# a message about language features, which reads as a broken source tree.
+ET_GO_MIN="${ET_GO_MIN:-1.22}"
+
+# go_ok <binary> — true when that Go is new enough to build this tree.
+go_ok() {
+    local v
+    v="$("$1" env GOVERSION 2>/dev/null | sed 's/^go//')" || return 1
+    [ -n "$v" ] || return 1
+    [ "$(printf '%s\n%s\n' "$ET_GO_MIN" "$v" | sort -V | head -n1)" = "$ET_GO_MIN" ]
+}
+
 ensure_go() {
-    have go && { GO_BIN="$(command -v go)"; return; }
+    if have go && go_ok "$(command -v go)"; then GO_BIN="$(command -v go)"; return; fi
     step "Go toolchain"
+
+    # The distribution's Go first. It comes over the package mirror, which this
+    # installer has already used successfully by the time it gets here, and it is
+    # signed. Downloading a toolchain from go.dev means a second host on a path
+    # where the first one was already unreachable — and on a filtered path the
+    # redirect to Google's download host is answered by the filter, which is why
+    # this step could fail with a bare 404 rather than a timeout.
+    if ! have go || ! go_ok "$(command -v go)"; then
+        info "installing the distribution's Go"
+        pkg_install golang-go || pkg_install go || true
+        hash -r 2>/dev/null || true
+    fi
+    if have go && go_ok "$(command -v go)"; then
+        GO_BIN="$(command -v go)"; ok "$("$GO_BIN" version)"; return
+    fi
+
     local tb="go${ET_GO_VERSION}.linux-${ARCH}.tar.gz"
     [ "$ARCH" = "armv7" ] && tb="go${ET_GO_VERSION}.linux-armv6l.tar.gz"
-    dl "https://go.dev/dl/${tb}" "${TMP}/${tb}" || die "cannot download Go"
-    rm -rf /usr/local/go && tar -C /usr/local -xzf "${TMP}/${tb}"
-    GO_BIN="/usr/local/go/bin/go"; export PATH="/usr/local/go/bin:${PATH}"
-    ok "$("$GO_BIN" version)"
+    info "fetching go${ET_GO_VERSION} from go.dev"
+    if dl "https://go.dev/dl/${tb}" "${TMP}/${tb}"; then
+        rm -rf /usr/local/go && tar -C /usr/local -xzf "${TMP}/${tb}"
+        GO_BIN="/usr/local/go/bin/go"; export PATH="/usr/local/go/bin:${PATH}"
+        ok "$("$GO_BIN" version)"
+        return
+    fi
+
+    # Out of options. Say what to do rather than what failed: there is a path
+    # left that needs no network at all, and the user cannot be expected to know
+    # it from "cannot download Go".
+    printf '\n'
+    warn "no Go toolchain available: the package mirror has none new enough (need ${ET_GO_MIN}+)"
+    warn "and go.dev could not be reached."
+    info "This machine cannot reach any of the release host, the GitHub API, or go.dev."
+    info "Install the release directly instead — copy the tarball to this machine and run:"
+    info "    bash install.sh --local /path/to/et-<version>.tar.gz"
+    die "no way to obtain a build"
 }
 
 build_from_source() {
@@ -357,7 +400,12 @@ build_from_source() {
         src="$(pwd)"; info "using the current checkout"
     else
         info "cloning ${ET_REPO}"
-        git clone --depth 1 "$ET_REPO" "$src" >/dev/null 2>&1 || die "git clone failed"
+        if ! git clone --depth 1 "$ET_REPO" "$src" >/dev/null 2>&1; then
+            warn "cannot clone ${ET_REPO} from this machine."
+            info "Copy a release tarball here and install it directly instead:"
+            info "    bash install.sh --local /path/to/et-<version>.tar.gz"
+            die "git clone failed"
+        fi
     fi
     # The tree being compiled is the authority on its own version — trust it over
     # anything guessed earlier, so the stamped core and the recorded VERSION can
@@ -366,9 +414,20 @@ build_from_source() {
         VERSION="$(tr -d '[:space:]' < "${src}/VERSION")"
     fi
     is_semver "${VERSION:-}" || VERSION="dev"
+    # Module downloads go through Google's proxy by default, which is one more
+    # host that can be unreachable on exactly the paths this fallback exists to
+    # serve. Try mirrors after it. This is safe whichever answers: every module
+    # is checked against the hashes in go.sum, so a proxy can serve the build or
+    # fail, but it cannot change what gets compiled.
+    export GOPROXY="${ET_GOPROXY:-https://proxy.golang.org,https://goproxy.io,direct}"
     ( cd "$src" && CGO_ENABLED=0 "$GO_BIN" build -trimpath \
         -ldflags "-s -w -X github.com/emergency-tunnel/et/internal/core.CoreVersion=${VERSION}" \
-        -o "${TMP}/et-core-linux-${ARCH}" ./cmd/et-core ) || die "build failed"
+        -o "${TMP}/et-core-linux-${ARCH}" ./cmd/et-core ) || {
+        warn "the build could not fetch its dependencies or failed to compile."
+        info "Copy a release tarball here and install it directly instead:"
+        info "    bash install.sh --local /path/to/et-<version>.tar.gz"
+        die "build failed"
+    }
     CORE_BIN="${TMP}/et-core-linux-${ARCH}"
     cp "$src/scripts/et-panel.sh" "$src/scripts/uninstall.sh" "${TMP}/"
     cp "$src/systemd/emergency-tunnel@.service" "${TMP}/"

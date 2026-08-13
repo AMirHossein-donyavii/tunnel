@@ -4,6 +4,33 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.5] — 2026-08-13
+
+### Fixed
+
+- **The source build — the installer's last resort — depended on two Google
+  hosts, on exactly the paths where it is the only option left.** The toolchain
+  came from `go.dev`, whose download redirects to Google's file host; on a
+  filtered path that redirect is answered by the filter, so the step failed with
+  a bare `404` and `cannot download Go` rather than anything an operator could
+  act on. Module downloads then went through Google's module proxy, which is a
+  second host with the same problem.
+
+  The distribution's Go is now tried first: it arrives over the package mirror
+  the installer has already used successfully by that point, and it is signed.
+  Its version is checked against what the sources actually need, so a toolchain
+  too old to build the tree is rejected here with a clear reason instead of
+  failing deep in the compiler. `go.dev` remains the fallback, and module
+  downloads fall back to mirrors after Google's proxy — safe whichever answers,
+  because every module is checked against the hashes in `go.sum`, so a proxy can
+  serve the build or fail but cannot change what gets compiled.
+
+- **A dead end now says what to do.** When the release host, the GitHub API and
+  `go.dev` are all unreachable — which is one machine's ordinary situation, not a
+  rare one — the installer used to stop at `cannot download Go`. It now names
+  the situation and points at `--local`, the path that needs no network at all.
+  The same guidance is attached to a failed clone and a failed build.
+
 ## [2.8.4] — 2026-08-13
 
 ### Fixed
