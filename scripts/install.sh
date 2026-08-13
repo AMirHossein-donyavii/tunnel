@@ -302,6 +302,13 @@ install_from_local() {
     step "Local release"
     TMP="$(mktemp -d)"
     local dir="$ET_LOCAL" sums
+    if [ ! -e "$dir" ]; then
+        warn "there is no ${ET_LOCAL} on this machine."
+        info "Copy the release tarball here first, from the computer that has it:"
+        info "    scp et-<version>.tar.gz root@<this server>:/root/"
+        info "then re-run with --local pointing at where you put it."
+        die "no such file: ${ET_LOCAL}"
+    fi
     if [ -f "$dir" ]; then
         mkdir -p "${TMP}/unpack"
         tar -xzf "$dir" -C "${TMP}/unpack" 2>/dev/null || die "cannot unpack ${ET_LOCAL}"
@@ -310,7 +317,7 @@ install_from_local() {
         [ -n "$sums" ] || die "${ET_LOCAL} contains no release (no SHA256SUMS inside)"
         dir="$(dirname "$sums")"
     fi
-    [ -d "$dir" ] || die "${ET_LOCAL} is neither a directory nor a tarball"
+    [ -d "$dir" ] || die "${ET_LOCAL} is neither a release directory nor a tarball"
     [ -f "${dir}/SHA256SUMS" ] || die "${dir} is not a release directory (no SHA256SUMS)"
 
     local asset="et-core-linux-${ARCH}"
@@ -391,21 +398,53 @@ ensure_go() {
     die "no way to obtain a build"
 }
 
+# fetch_source <dir> — put the sources in <dir>.
+#
+# A clone was the only route, and `git clone` against a filtered host has no
+# timeout of its own: the installer stopped dead under "cloning …" and never
+# came back, which is worse than any error. A source archive is an ordinary
+# HTTPS GET with the same bounded options as every other download here, it is a
+# tenth of the size of a clone, and codeload is a different host from github.com
+# — so it can answer where the clone hangs. The clone stays as the last try,
+# with a hard limit on how long it may take.
+fetch_source() {
+    local dest="$1" tb="${TMP}/src.tar.gz" u host
+    for u in "https://codeload.github.com/${ET_REPO_SLUG}/tar.gz/refs/heads/main" \
+             "https://github.com/${ET_REPO_SLUG}/archive/refs/heads/main.tar.gz"; do
+        host="${u#https://}"; host="${host%%/*}"
+        info "fetching sources from ${host}"
+        if dl "$u" "$tb"; then
+            mkdir -p "$dest"
+            # The archive wraps everything in one directory named for the branch.
+            if tar -xzf "$tb" -C "$dest" --strip-components=1 2>/dev/null && [ -f "${dest}/go.mod" ]; then
+                return 0
+            fi
+            rm -rf "$dest"
+        fi
+    done
+    if have git || pkg_install git; then
+        info "fetching sources with git"
+        if have timeout; then
+            timeout 180 git clone --depth 1 "$ET_REPO" "$dest" >/dev/null 2>&1 && return 0
+        else
+            git clone --depth 1 "$ET_REPO" "$dest" >/dev/null 2>&1 && return 0
+        fi
+        rm -rf "$dest"
+    fi
+    return 1
+}
+
 build_from_source() {
     step "Build from source"
     TMP="$(mktemp -d)"; ensure_go
-    have git || pkg_install git || die "git required"
     local src="${TMP}/src"
     if [ -f ./go.mod ] && grep -q emergency-tunnel ./go.mod 2>/dev/null; then
         src="$(pwd)"; info "using the current checkout"
-    else
-        info "cloning ${ET_REPO}"
-        if ! git clone --depth 1 "$ET_REPO" "$src" >/dev/null 2>&1; then
-            warn "cannot clone ${ET_REPO} from this machine."
-            info "Copy a release tarball here and install it directly instead:"
-            info "    bash install.sh --local /path/to/et-<version>.tar.gz"
-            die "git clone failed"
-        fi
+    elif ! fetch_source "$src"; then
+        warn "the sources cannot be fetched from this machine."
+        info "Copy a release tarball here and install it directly instead:"
+        info "    bash install.sh --local /path/to/et-<version>.tar.gz"
+        die "no way to obtain the sources"
     fi
     # The tree being compiled is the authority on its own version — trust it over
     # anything guessed earlier, so the stamped core and the recorded VERSION can

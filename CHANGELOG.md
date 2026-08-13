@@ -4,6 +4,25 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.6] — 2026-08-13
+
+### Fixed
+
+- **The source build hung indefinitely at "cloning …".** `git clone` against a
+  filtered host has no timeout of its own, so the installer stopped dead with
+  the cursor under that line and never came back — worse than any error, because
+  there is nothing to read and nothing to do. The sources now come as an archive
+  over ordinary HTTPS with the same bounded options as every other download here:
+  a tenth of the size of a clone, no `git` needed at all, and served by
+  `codeload.github.com`, a different host from the one the clone talks to, so it
+  can answer where the clone hangs. A clone remains the last try, now with a hard
+  time limit. Verified end to end: sources fetched, `v2.8.6` built, with `git`
+  forced to fail throughout.
+
+- **`--local` on a path that does not exist said the file was "neither a
+  directory nor a tarball"**, which describes the wrong problem — the file was
+  simply not there. It now says so and shows how to copy the release across.
+
 ## [2.8.5] — 2026-08-13
 
 ### Fixed
