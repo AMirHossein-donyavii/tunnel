@@ -78,11 +78,52 @@ func (l *streamLink) Close() error                      { return l.sc.Close() }
 // continuous stream means the peer's keys no longer match ours.
 const maxBadDatagrams = 64
 
-// badDatagrams counts every datagram the AEAD refused (corrupt, forged or
-// replayed) across all carriers. A process runs exactly one tunnel engine, so a
-// package counter is the simplest way to surface this on /stats without
-// threading engine state through every carrier constructor.
+// maxBadWrites bounds how many consecutive sends may fail transiently before
+// the link is given up on. A handful is a full interface queue; hundreds in a
+// row is a socket that is not going to recover.
+const maxBadWrites = 256
+
+// carrierWriteErrs counts sends the carrier socket refused for a transient
+// reason. Frames lost this way are lost locally, not on the path.
+var carrierWriteErrs atomic.Uint64
+
+// badDatagrams counts every datagram the AEAD refused (corrupt or forged)
+// across all carriers. A process runs exactly one tunnel engine, so a package
+// counter is the simplest way to surface this on /stats without threading
+// engine state through every carrier constructor.
 var badDatagrams atomic.Uint64
+
+// dupSent / dupDropped count the small-frame duplication below.
+var (
+	dupSent    atomic.Uint64
+	dupDropped atomic.Uint64
+)
+
+// carrierDropped counts datagrams a carrier's demultiplexer could not hand to
+// its link because the link was not draining fast enough. That is local
+// backpressure and has a different fix from path loss, so it is counted
+// separately rather than disappearing into the general loss figure.
+var carrierDropped atomic.Uint64
+
+// dupThreshold is the frame size below which a datagram carrier sends every
+// frame twice.
+//
+// A datagram carrier does not retransmit: what the path drops is gone. Inner TCP
+// recovers on its own, but three things do not. A ping through the tunnel shows
+// the loss directly, as a timeout. A pure ACK lost during a download costs the
+// sender a round trip. And a heartbeat lost is a step towards the liveness
+// monitor deciding the link is dead and cycling it — which drops everything in
+// flight and is by far the most visible failure a user meets on a path that
+// polices ICMP.
+//
+// All three are small: a heartbeat is a dozen bytes, a ping eighty-odd, a pure
+// ACK forty. Sending a small frame twice turns a loss rate of p into p² for
+// exactly the traffic whose loss is felt, and costs nothing on a busy tunnel,
+// where frames are full and never qualify. The receiver needs no new code to
+// discard the copy: the AEAD's replay window already rejects a counter it has
+// seen, which is what makes this safe rather than a source of duplicated
+// packets injected into the TUN device.
+const dupThreshold = 256
 
 type datagramLink struct {
 	conn net.Conn
@@ -91,7 +132,14 @@ type datagramLink struct {
 	rbuf []byte // raw ciphertext
 	pbuf []byte // plaintext scratch
 	bad  uint64 // consecutive undecryptable datagrams
+	// badWrites counts consecutive sends the socket refused for a transient
+	// reason. It resets on the first success, so a burst under load never
+	// accumulates into a teardown.
+	badWrites uint64
 }
+
+// dupWriter is implemented by carriers that lose frames silently, so the pump
+// can ask for a frame it considers critical to be sent more than once.
 
 func newDatagramLink(conn net.Conn, dg *crypto.Datagram) *datagramLink {
 	return &datagramLink{
@@ -106,8 +154,36 @@ var errBadDatagramFlood = errors.New("l3: too many undecryptable datagrams — p
 
 func (l *datagramLink) WriteFrame(p []byte) error {
 	l.wbuf = l.dg.Seal(l.wbuf[:0], p)
-	_, err := l.conn.Write(l.wbuf)
-	return err
+	if _, err := l.conn.Write(l.wbuf); err != nil {
+		// A send failing says nothing about the link. A raw ICMP socket meets
+		// ENOBUFS when the interface queue is momentarily full and EPERM when a
+		// firewall rate-limiter refuses one packet — both routine on the paths
+		// this carrier exists for. Returning the error here cycled the carrier:
+		// everything in flight lost, a re-dial, a visible stall, for something
+		// that costs one frame. Only a socket that keeps refusing is a real
+		// failure.
+		if !isTransientWriteErr(err) {
+			return err
+		}
+		l.badWrites++
+		carrierWriteErrs.Add(1)
+		if l.badWrites > maxBadWrites {
+			return err
+		}
+		return nil
+	}
+	l.badWrites = 0
+	// The same sealed bytes, not a re-seal: an identical counter is what lets the
+	// peer's replay window drop the copy for free. A second seal would produce a
+	// second valid frame and inject every small packet into the TUN device twice,
+	// which inner TCP reads as duplicate ACKs and reacts to by retransmitting.
+	if len(p) <= dupThreshold {
+		if _, err := l.conn.Write(l.wbuf); err != nil {
+			return err // the first copy is already away; the link is going anyway
+		}
+		dupSent.Add(1)
+	}
+	return nil
 }
 
 // ReadFrame returns the next authenticated frame. A datagram that fails to
@@ -122,6 +198,15 @@ func (l *datagramLink) ReadFrame() ([]byte, error) {
 		}
 		pt, err := l.dg.Open(l.pbuf[:0], l.rbuf[:n])
 		if err != nil {
+			// A replay is the expected case, not a fault: it is the second copy
+			// of a small frame arriving after the first. Counting it as an
+			// undecryptable datagram would both misreport the link's health and,
+			// on an idle tunnel whose frames are all small, walk the consecutive
+			// counter up to the flood limit and tear the link down.
+			if errors.Is(err, crypto.ErrReplay) {
+				dupDropped.Add(1)
+				continue
+			}
 			l.bad++
 			badDatagrams.Add(1)
 			if l.bad > maxBadDatagrams {

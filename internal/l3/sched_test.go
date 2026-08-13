@@ -127,23 +127,50 @@ func TestExpressJumpsTheQueue(t *testing.T) {
 
 // A latency-critical packet that has been waiting far too long is worthless:
 // delivering it late is worse than dropping it.
-func TestStaleExpressIsDropped(t *testing.T) {
-	q, pool, now := testQueue(t, 256)
+// A stale express packet is only worth dropping when something fresher is
+// waiting behind it. That is the whole justification — "delivering it late is
+// worse than sending what came after" — and it is false when the queue is
+// empty.
+func TestStaleExpressIsDroppedOnlyWhenSomethingFresherWaits(t *testing.T) {
+	t.Run("dropped when overtaken", func(t *testing.T) {
+		q, pool, now := testQueue(t, 256)
 
-	q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 56)))
-	q.pushBytes(pool, tcpSeg(0x10, 1300))
+		q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 56))) // old
+		*now = int64(expressStale) + 1
+		q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 20))) // fresh, behind it
 
-	*now = int64(expressStale) + 1
-	p := q.pop()
-	if p == nil {
-		t.Fatal("queue empty")
-	}
-	if isExpress(p.bytes()) {
-		t.Fatal("stale express packet should have been dropped")
-	}
-	if q.stats.dropped.Load() != 1 {
-		t.Errorf("dropped = %d, want 1", q.stats.dropped.Load())
-	}
+		p := q.pop()
+		if p == nil {
+			t.Fatal("queue empty")
+		}
+		if len(p.bytes()) != 20+20 {
+			t.Fatalf("got the %d-byte packet; the overtaken one should have been dropped",
+				len(p.bytes()))
+		}
+		if q.stats.dropped.Load() != 1 {
+			t.Errorf("dropped = %d, want 1", q.stats.dropped.Load())
+		}
+	})
+
+	t.Run("delivered when it is all there is", func(t *testing.T) {
+		q, pool, now := testQueue(t, 256)
+
+		q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 56)))
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+		*now = int64(expressStale) + 1
+
+		p := q.pop()
+		if p == nil {
+			t.Fatal("queue empty")
+		}
+		if !isExpress(p.bytes()) {
+			t.Fatal("the only express packet was dropped for being late, with nothing " +
+				"fresher to send instead — that turns a carrier hiccup into a ping timeout")
+		}
+		if q.stats.dropped.Load() != 0 {
+			t.Errorf("dropped = %d, want 0", q.stats.dropped.Load())
+		}
+	})
 }
 
 // CoDel must leave a queue alone while its sojourn time is under target — no

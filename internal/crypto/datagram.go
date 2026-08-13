@@ -91,6 +91,12 @@ func (w *replayWindow) accept(ctr uint64) bool {
 	return true
 }
 
+// NewDatagramForTest builds a Datagram from raw keys, without a handshake, so
+// carrier behaviour under loss can be exercised in a unit test.
+func NewDatagramForTest(cipherName string, sendKey, recvKey []byte) (*Datagram, error) {
+	return newDatagram(cipherName, sendKey, recvKey)
+}
+
 // DatagramOverhead is the per-packet expansion (counter + AEAD tag).
 const DatagramOverhead = dgNonceLen + tagOverhead
 

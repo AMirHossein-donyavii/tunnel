@@ -250,6 +250,7 @@ func (l *spfLinkListener) route() {
 		case <-f.closed:
 			putDgram(bp)
 		default:
+			carrierDropped.Add(1)
 			putDgram(bp)
 		}
 	}

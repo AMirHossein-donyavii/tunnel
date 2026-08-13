@@ -41,9 +41,21 @@ const (
 	// for this long before dropping starts, which keeps CoDel from reacting to
 	// ordinary bursts.
 	codelInterval = 100 * time.Millisecond
-	// expressStale bounds how long a latency-critical packet may wait. Past this
-	// it is worthless — delivering it late is worse than dropping it.
-	expressStale = 250 * time.Millisecond
+	// expressStale bounds how long a latency-critical packet may wait before it
+	// is considered overtaken.
+	//
+	// It used to be 250 ms and unconditional, which manufactured the very symptom
+	// it was meant to avoid: a carrier hiccup of a third of a second turned a
+	// ping through the tunnel into a timeout, when delivering it would have shown
+	// an honest 300 ms. The same drop costs a pure TCP ACK a full retransmission
+	// timeout on the peer.
+	//
+	// Two changes. The bound is a second, which is past the point where a voice
+	// or game packet is genuinely worthless; and a stale packet is only dropped
+	// when there is a fresher express packet behind it, since the whole
+	// justification for dropping — that something better is waiting — is false
+	// when the queue is empty.
+	expressStale = time.Second
 	// expressCap bounds the express ring. Express traffic is small and drained
 	// first, so this is only a guard against a flood of tiny packets.
 	expressCap = 512
@@ -231,13 +243,14 @@ func (q *txQueue) pop() *pbuf {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// Express first, skipping anything so stale it is no longer worth sending.
+	// Express first, skipping anything stale that something fresher is waiting
+	// behind.
 	for {
 		p := q.express.pop()
 		if p == nil {
 			break
 		}
-		if now-p.enq <= int64(expressStale) {
+		if now-p.enq <= int64(expressStale) || q.express.len() == 0 {
 			q.stats.depth.Store(int64(q.express.len() + q.bulk.len()))
 			return p
 		}

@@ -249,6 +249,7 @@ func (d *icmpLinkDialer) route() {
 			// The link is not keeping up. Dropping here is what the path would
 			// have done anyway, and is far better than stalling the loop and
 			// taking every other link down with it.
+			carrierDropped.Add(1)
 			putDgram(bp)
 		}
 	}
@@ -516,6 +517,7 @@ func (l *icmpLinkListener) route() {
 		case <-f.closed:
 			putDgram(bp)
 		default:
+			carrierDropped.Add(1)
 			putDgram(bp)
 		}
 	}

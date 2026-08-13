@@ -4,6 +4,69 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.9.1] — 2026-08-13
+
+Stability work on the packet carriers (TUN udp/icmp/bip and SPF). All of it comes
+from one observation: those carriers do not retransmit, so anything that made the
+tunnel drop a packet — or worse, tear the link down — showed up as a ping through
+the VPN timing out, with nothing in any log to say why.
+
+### Fixed
+
+- **One packet the TUN device refused killed the whole carrier link.** A device
+  write can fail for reasons that have nothing to do with the path: the kernel's
+  queue momentarily full (ENOBUFS), or one packet the device will not accept
+  (EINVAL). The reader treated any of them as the link being dead and returned,
+  which tore the carrier down and re-dialed it — hundreds of milliseconds in
+  which everything was lost. A rejected packet is now one packet; only a device
+  that refuses 128 in a row cycles the link, and the counter resets on the first
+  success so a burst under load never accumulates.
+
+- **A send the carrier socket refused killed the link the same way.** A raw ICMP
+  socket meets this routinely: ENOBUFS when the interface queue is full, EPERM
+  when a firewall rate-limiter drops one packet, EMSGSIZE for one frame the path
+  will not take. All three are now one lost frame rather than a re-dial. A socket
+  that refuses 256 sends in a row is still treated as broken.
+
+- **A late express packet was dropped even when there was nothing better to
+  send.** The rule was "past 250 ms, delivering it late is worse than dropping
+  it" — but that is only true when a fresher packet is waiting behind it. With an
+  empty queue it manufactured the exact symptom it existed to avoid: a carrier
+  hiccup of a third of a second turned a ping into a timeout where delivering it
+  would have shown an honest 300 ms, and cost a pure TCP ACK a full
+  retransmission timeout. A stale express packet is now dropped only when it has
+  been overtaken, and the bound is a second.
+
+### Added
+
+- **Small frames are sent twice on the packet carriers.** These carriers do not
+  retransmit. Inner TCP recovers from loss on its own, but three things do not: a
+  ping through the tunnel, which shows the loss directly as a timeout; a pure
+  ACK, which costs the sender a round trip; and a heartbeat, whose loss is a step
+  towards the liveness monitor deciding the link is dead and cycling it — the
+  most visible failure there is on a path that polices ICMP.
+
+  All three are small. Sending a frame of 256 bytes or less twice turns a loss
+  rate of p into p² for exactly the traffic whose loss is felt, and costs nothing
+  on a busy tunnel, where frames are full and never qualify. Measured against a
+  10% loss path: **10.45% of small frames lost with one copy, 0.93% with two.**
+
+  The copy is the same sealed bytes, not a re-seal, so the peer's replay window
+  discards it for free — no duplicate packets reach the TUN device, and a
+  duplicate no longer counts towards the "peer's keys do not match" limit, which
+  on an idle tunnel would have walked up and torn down a healthy link.
+
+- **A health line once a minute, silent when there is nothing to say.** Five
+  distinct causes produced the same "unstable" symptom and had five different
+  fixes; each was counted internally and none was ever shown. The line reports
+  what changed in the last minute: reconnects, packets the device refused, sends
+  the socket refused, datagrams dropped because a link was not draining, AQM
+  drops, bad frames, link RTT, and how many of the duplicate small frames the
+  path actually needed — which is a direct estimate of carrier loss.
+
+  The same figures are on the stats endpoint as `tun_write_errors`,
+  `carrier_write_errors`, `carrier_dropped`, `dup_sent` and `dup_dropped`.
+
 ## [2.9.0] — 2026-08-13
 
 ### Changed

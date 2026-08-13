@@ -18,6 +18,7 @@ package l3
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -65,10 +66,19 @@ type Engine struct {
 		rxBytes    uint64
 		reconnects uint64
 		badFrames  uint64
-		rttNs      int64 // EWMA of the measured link RTT
+		// tunWriteErrs counts packets the TUN device refused. They used to be
+		// invisible, and they used to end the link — see linkToTun.
+		tunWriteErrs uint64
+		rttNs        int64 // EWMA of the measured link RTT
 	}
 	qstats qstats
 }
+
+// maxTunWriteErrs bounds how many consecutive packets the TUN device may refuse
+// before the link is cycled. A handful is an overfull device queue or one
+// malformed packet; hundreds in a row is a device that has gone away, and
+// carrying on would spin against it.
+const maxTunWriteErrs = 128
 
 // safeDatagramMTU is the largest inner MTU that leaves room for the AEAD +
 // L4/IP wrapper to fit a ~1400-byte path (the Iranian underlays SPF/ICMP/UDP
@@ -231,6 +241,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		go func(i int) { defer readers.Done(); e.queueReader(ctx, dev.Queues()[i], txQueues[i]) }(i)
 	}
 
+	go e.healthReport(ctx)
+
 	var pumps sync.WaitGroup
 	if e.isDialer {
 		for i := 0; i < e.queues; i++ {
@@ -254,6 +266,61 @@ func (e *Engine) Run(ctx context.Context) error {
 	pumps.Wait()
 	readers.Wait()
 	return nil
+}
+
+// healthReport writes one line a minute naming every way this tunnel is losing
+// packets, and stays silent while there is nothing to say.
+//
+// "The tunnel is unstable" was unanswerable: reconnects, packets the TUN device
+// refused, frames the carrier socket refused, datagrams dropped because a link
+// was not draining, and AQM drops all produce the same symptom and have five
+// different fixes. Each was counted and none was ever shown. The line reports
+// what changed since the last one, so a rate is readable directly rather than
+// being the difference of two totals nobody recorded.
+func (e *Engine) healthReport(ctx context.Context) {
+	const every = time.Minute
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	var prev Stats
+	prev = e.Snapshot().(Stats)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		cur := e.Snapshot().(Stats)
+		d := func(now, before uint64) uint64 {
+			if now < before {
+				return 0
+			}
+			return now - before
+		}
+		reconnects := d(cur.Reconnects, prev.Reconnects)
+		tunErrs := d(cur.TunWriteErrors, prev.TunWriteErrors)
+		sockErrs := d(cur.CarrierWriteErrors, prev.CarrierWriteErrors)
+		demux := d(cur.CarrierDropped, prev.CarrierDropped)
+		aqm := d(cur.TxDropped, prev.TxDropped)
+		bad := d(cur.BadFrames, prev.BadFrames)
+		dups := d(cur.DupDropped, prev.DupDropped)
+		sent := d(cur.DupSent, prev.DupSent)
+		prev = cur
+
+		if reconnects == 0 && tunErrs == 0 && sockErrs == 0 && demux == 0 && aqm == 0 && bad == 0 {
+			continue // nothing worth a line
+		}
+		// A duplicate that did NOT arrive is a frame the path lost and the second
+		// copy covered, which is the most useful loss estimate available without
+		// instrumenting the peer.
+		covered := ""
+		if sent > 0 {
+			covered = fmt.Sprintf(" small-frame copies sent=%d, needed=%d", sent, sent-dups)
+		}
+		e.log.Info("last %s: reconnects=%d tun_refused=%d socket_refused=%d "+
+			"demux_dropped=%d aqm_dropped=%d bad_frames=%d rtt=%.1fms%s",
+			every, reconnects, tunErrs, sockErrs, demux, aqm, bad, cur.RTTMs, covered)
+	}
 }
 
 // logConnected emits the single, clear "connected" line when the first link of
@@ -582,6 +649,7 @@ func (e *Engine) linkToTun(ctx context.Context, q queue, lk link, ps *pumpState)
 	stop := context.AfterFunc(ctx, func() { _ = lk.SetReadDeadline(time.Now()) })
 	defer stop()
 
+	tunErrs := 0
 	for {
 		frame, err := lk.ReadFrame()
 		if err != nil {
@@ -607,8 +675,28 @@ func (e *Engine) linkToTun(ctx context.Context, q queue, lk link, ps *pumpState)
 				continue
 			}
 			if _, err := q.Write(payload); err != nil {
-				return
+				// A device write failing says nothing about the carrier. The
+				// kernel's queue can be momentarily full (ENOBUFS), or the peer
+				// can send one packet this device will not accept (EINVAL).
+				// Returning here tore the carrier down and re-dialed it —
+				// hundreds of milliseconds in which everything was lost, which
+				// on a datagram carrier shows up as a ping through the tunnel
+				// timing out for no reason anyone can see.
+				//
+				// One rejected packet is one packet. Only a device that keeps
+				// refusing is a real failure, and that is what the counter is
+				// for; it resets on the first success so a burst of ENOBUFS
+				// under load never accumulates into a teardown.
+				atomic.AddUint64(&e.stats.tunWriteErrs, 1)
+				tunErrs++
+				if tunErrs > maxTunWriteErrs {
+					e.log.Error("TUN device refused %d packets in a row (%v) — cycling the link",
+						tunErrs, err)
+					return
+				}
+				continue
 			}
+			tunErrs = 0
 			atomic.AddUint64(&e.stats.rxPackets, 1)
 			atomic.AddUint64(&e.stats.rxBytes, uint64(plen))
 		}
@@ -696,6 +784,28 @@ type Stats struct {
 	TxDropped      uint64 `json:"tx_dropped"`
 	QueueDepth     int64  `json:"queue_depth"`
 	BadFrames      uint64 `json:"bad_frames"`
+
+	// What follows is here because "the tunnel is unstable" is unanswerable
+	// without it. Each of these is a distinct cause with a distinct fix, and
+	// each used to be invisible.
+	//
+	// TunWriteErrors: packets the local TUN device refused. A few under load is
+	// an overfull device queue; a steady stream is a device or MTU problem, not
+	// the path.
+	TunWriteErrors uint64 `json:"tun_write_errors"`
+	// CarrierDropped: datagrams the carrier's demultiplexer could not hand to a
+	// link because that link was not draining fast enough. This is local
+	// backpressure, not path loss.
+	CarrierDropped uint64 `json:"carrier_dropped"`
+	// CarrierWriteErrors: frames the carrier socket refused to send (a full
+	// interface queue, a firewall rate-limiter). Lost locally, not on the path.
+	CarrierWriteErrors uint64 `json:"carrier_write_errors"`
+	// DupSent / DupDropped: small frames sent twice, and copies the replay
+	// window discarded. DupDropped rising towards DupSent means the path is
+	// clean and the second copy is pure insurance; a large gap means the path
+	// is losing frames and the duplication is doing its job.
+	DupSent    uint64 `json:"dup_sent"`
+	DupDropped uint64 `json:"dup_dropped"`
 }
 
 // Healthy reports whether at least one link of the tunnel is currently up. The
@@ -706,18 +816,23 @@ func (e *Engine) Healthy() bool { return atomic.LoadInt64(&e.stats.liveLinks) > 
 // interface used by the health endpoint).
 func (e *Engine) Snapshot() any {
 	return Stats{
-		LiveLinks:      atomic.LoadInt64(&e.stats.liveLinks),
-		TxPackets:      atomic.LoadUint64(&e.stats.txPackets),
-		RxPackets:      atomic.LoadUint64(&e.stats.rxPackets),
-		TxBytes:        atomic.LoadUint64(&e.stats.txBytes),
-		RxBytes:        atomic.LoadUint64(&e.stats.rxBytes),
-		Reconnects:     atomic.LoadUint64(&e.stats.reconnects),
-		RTTMs:          float64(atomic.LoadInt64(&e.stats.rttNs)) / float64(time.Millisecond),
-		ExpressPackets: e.qstats.expressPkts.Load(),
-		BulkPackets:    e.qstats.bulkPkts.Load(),
-		TxDropped:      e.qstats.dropped.Load(),
-		QueueDepth:     e.qstats.depth.Load(),
-		BadFrames:      atomic.LoadUint64(&e.stats.badFrames) + badDatagrams.Load(),
+		LiveLinks:          atomic.LoadInt64(&e.stats.liveLinks),
+		TxPackets:          atomic.LoadUint64(&e.stats.txPackets),
+		RxPackets:          atomic.LoadUint64(&e.stats.rxPackets),
+		TxBytes:            atomic.LoadUint64(&e.stats.txBytes),
+		RxBytes:            atomic.LoadUint64(&e.stats.rxBytes),
+		Reconnects:         atomic.LoadUint64(&e.stats.reconnects),
+		RTTMs:              float64(atomic.LoadInt64(&e.stats.rttNs)) / float64(time.Millisecond),
+		ExpressPackets:     e.qstats.expressPkts.Load(),
+		BulkPackets:        e.qstats.bulkPkts.Load(),
+		TxDropped:          e.qstats.dropped.Load(),
+		QueueDepth:         e.qstats.depth.Load(),
+		BadFrames:          atomic.LoadUint64(&e.stats.badFrames) + badDatagrams.Load(),
+		TunWriteErrors:     atomic.LoadUint64(&e.stats.tunWriteErrs),
+		CarrierDropped:     carrierDropped.Load(),
+		CarrierWriteErrors: carrierWriteErrs.Load(),
+		DupSent:            dupSent.Load(),
+		DupDropped:         dupDropped.Load(),
 	}
 }
 

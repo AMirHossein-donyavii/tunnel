@@ -15,6 +15,28 @@ import (
 // buffer briefly overflows under load, EINTR, EAGAIN) would strand every link
 // until a manual restart. Genuine closure (net.ErrClosed on Close) is not
 // transient, so shutdown still stops the loop promptly.
+// isTransientWriteErr reports whether a send failed for a reason that says
+// nothing about the link.
+//
+// A raw ICMP socket meets these routinely: ENOBUFS when the interface queue is
+// momentarily full, EPERM when a firewall rate-limiter refuses this packet,
+// EMSGSIZE for one frame the path will not take. Treating any of them as the
+// link being dead cycled the carrier — every packet in flight lost, a re-dial,
+// and a visible stall — for something that costs at most one frame.
+func isTransientWriteErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	return errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.EINTR) ||
+		errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EMSGSIZE) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ENETDOWN)
+}
+
 func isTransientReadErr(err error) bool {
 	if err == nil {
 		return false
