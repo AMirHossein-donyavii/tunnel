@@ -51,36 +51,40 @@ func (icmpCodec) proto() int      { return 1 }
 // its own ciphertext to the handshake, and the link never came up — this
 // profile carried no traffic at all unless echo replies were switched off
 // host-wide, which also stops the server answering ping.
-func (icmpCodec) encode(buf []byte, _, _ net.IP, key, _ int, seq int, data []byte, reply bool) []byte {
+//
+// The tunnel port follows the direction tag, for the reason in icmpframe.go: a
+// raw ICMP socket receives every ICMP packet on the host, so without it two SPF
+// icmp tunnels on one server read each other's frames.
+func (icmpCodec) encode(buf []byte, _, _ net.IP, key, tunnelPort int, seq int, data []byte, reply bool) []byte {
 	off := len(buf)
 	tag := byte(tagToListener)
 	if reply {
 		tag = tagToDialer
 	}
 	buf = appendEchoHeader(buf, false, reply, key, seq)
-	buf = append(buf, tag)
+	buf = appendTag(buf, tag, tunnelPort)
 	buf = append(buf, data...)
 	finishICMP(buf[off:], false)
 	return buf
 }
 
-func (icmpCodec) matchClient(p []byte, myKey, _ int) ([]byte, bool) {
+func (icmpCodec) matchClient(p []byte, myKey, tunnelPort int) ([]byte, bool) {
 	data, id, ok := parseEchoMsg(p, false, true)
 	if !ok || id != myKey {
 		return nil, false
 	}
 	// Tagged for the listener means it is our own request coming back.
-	return stripTag(data, tagToDialer)
+	return stripTag(data, tagToDialer, tunnelPort)
 }
 
-func (icmpCodec) parseServer(p []byte, _ int) ([]byte, int, bool) {
+func (icmpCodec) parseServer(p []byte, tunnelPort int) ([]byte, int, bool) {
 	data, id, ok := parseEchoMsg(p, false, false)
 	if !ok {
 		return nil, 0, false
 	}
 	// Also rejects ordinary ping traffic from strangers, which would otherwise
 	// open a flow per source and be offered to the handshake.
-	data, ok = stripTag(data, tagToListener)
+	data, ok = stripTag(data, tagToListener, tunnelPort)
 	if !ok {
 		return nil, 0, false
 	}

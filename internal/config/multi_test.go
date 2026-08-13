@@ -280,3 +280,49 @@ func TestConflictStringIsActionable(t *testing.T) {
 		}
 	}
 }
+
+// Two ICMP tunnels on one host that share a tunnel port cannot tell each other
+// apart: ICMP has no ports, so nothing binds it and the port exists only inside
+// the frame as the tunnel's identity. The old rule missed this whenever the two
+// were not both listeners — a dialer and a listener, or two dialers aimed at
+// different peers, passed as clean and then broke each other in production.
+func TestFindConflictsICMPTunnelsSharingATunnelPort(t *testing.T) {
+	icmpTun := func(name, role, peer string) *Config {
+		return &Config{Name: name, Engine: EngineTUN, TunMode: TunModeICMP,
+			Role: role, Mode: ModeReverse, TunnelPort: 1234, Peer: peer,
+			TunIface: "et-" + name, TunIP: "10.200.0.1/30"}
+	}
+	cases := []struct {
+		name string
+		a, b *Config
+	}{
+		{"two listeners", icmpTun("a", RoleIran, ""), icmpTun("b", RoleIran, "")},
+		{"listener and dialer", icmpTun("a", RoleIran, ""), icmpTun("b", RoleKharej, "9.9.9.9")},
+		{"dialers to different peers", icmpTun("a", RoleKharej, "9.9.9.9"), icmpTun("b", RoleKharej, "8.8.8.8")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FindConflicts(tc.a, []*Config{tc.b})
+			found := false
+			for _, c := range got {
+				if c.Resource == "tunnel_port" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no tunnel_port conflict reported; the two would read each other's traffic. got %v", got)
+			}
+		})
+	}
+
+	// Different tunnel ports is the fix, and must be reported as clean.
+	a := icmpTun("a", RoleIran, "")
+	b := icmpTun("b", RoleKharej, "9.9.9.9")
+	b.TunnelPort = 1235
+	b.TunIP = "10.200.0.5/30"
+	for _, c := range FindConflicts(a, []*Config{b}) {
+		if c.Resource == "tunnel_port" {
+			t.Fatalf("two ICMP tunnels on different tunnel ports were reported as clashing: %v", c)
+		}
+	}
+}

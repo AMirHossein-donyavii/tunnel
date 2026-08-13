@@ -18,9 +18,9 @@ import (
 // look exactly like path loss. This proves byte-for-byte equality against the
 // library for both directions and both protocols.
 //
-// The tag is the first payload byte in this carrier, so the library reference
-// is built with the tag prepended to the frame, matching what appendICMP lays
-// down when it writes the tag and then the payload.
+// The frame header — direction tag then tunnel port — leads the payload in this
+// carrier, so the library reference is built with that header prepended to the
+// frame, matching what appendTagged lays down.
 func TestFramingMatchesLibraryMarshal(t *testing.T) {
 	frame := []byte("an encrypted datagram of some length \x00\x01\xfe\xff")
 
@@ -39,6 +39,7 @@ func TestFramingMatchesLibraryMarshal(t *testing.T) {
 	}
 
 	const id, seq = 0x4242, 0x0abc
+	const tunnelPort = 0x04d2 // 1234
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Reference: the library builds the whole message. For ICMPv6 the
@@ -46,7 +47,8 @@ func TestFramingMatchesLibraryMarshal(t *testing.T) {
 			// called with a nil psh and the two checksum bytes are zeroed to
 			// match a raw-socket send (which is what appendICMP does).
 			ref := icmp.Message{Type: tc.typ, Code: 0,
-				Body: &icmp.Echo{ID: id, Seq: seq, Data: append([]byte{tc.tag}, frame...)}}
+				Body: &icmp.Echo{ID: id, Seq: seq,
+					Data: append([]byte{tc.tag, tunnelPort >> 8, tunnelPort & 0xff}, frame...)}}
 			want, err := ref.Marshal(nil)
 			if err != nil {
 				t.Fatal(err)
@@ -57,9 +59,9 @@ func TestFramingMatchesLibraryMarshal(t *testing.T) {
 
 			var got []byte
 			if tc.reply {
-				got = appendReply(nil, tc.proto, id, seq, tc.tag, frame)
+				got = appendReply(nil, tc.proto, id, seq, tc.tag, tunnelPort, frame)
 			} else {
-				got = appendEcho(nil, tc.proto, id, seq, tc.tag, frame)
+				got = appendEcho(nil, tc.proto, id, seq, tc.tag, tunnelPort, frame)
 			}
 
 			if !bytes.Equal(got, want) {
@@ -74,11 +76,11 @@ func TestFramingMatchesLibraryMarshal(t *testing.T) {
 // corrupting state.
 func TestFramingBufferReuseIsClean(t *testing.T) {
 	p := protoFor("icmp")
-	a := appendEcho(nil, p, 7, 1, tagToListener, []byte("first payload here"))
+	a := appendEcho(nil, p, 7, 1, tagToListener, 1194, []byte("first payload here"))
 
 	buf := make([]byte, 0, 512)
-	buf = appendEcho(buf[:0], p, 99, 42, tagToDialer, []byte("something else entirely, longer"))
-	buf = appendEcho(buf[:0], p, 7, 1, tagToListener, []byte("first payload here"))
+	buf = appendEcho(buf[:0], p, 99, 42, tagToDialer, 1194, []byte("something else entirely, longer"))
+	buf = appendEcho(buf[:0], p, 7, 1, tagToListener, 1194, []byte("first payload here"))
 
 	if !bytes.Equal(a, buf) {
 		t.Fatalf("reused buffer produced different bytes\n fresh: % x\nreused: % x", a, buf)

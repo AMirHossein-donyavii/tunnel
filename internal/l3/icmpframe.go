@@ -31,15 +31,46 @@ const (
 	tagToDialer   = 0xE2 // listener -> dialer, rides in Echo Replies
 )
 
-// stripTag accepts a payload only when it carries the expected direction tag,
-// and returns it with the tag removed. Traffic travelling the other way — our
-// own request mirrored back by a kernel echo reply, or a stray ping from a
-// stranger — fails here instead of reaching the AEAD as a peer frame.
-func stripTag(data []byte, want byte) ([]byte, bool) {
-	if len(data) < 1 || data[0] != want {
+// The tunnel tag, which follows the direction tag.
+//
+// ICMP has no ports, and a raw ICMP socket receives a copy of every ICMP packet
+// the host receives — not the subset addressed to one listener, because there is
+// no such thing. Two ICMP tunnels on one server therefore see all of each
+// other's traffic, and the echo id cannot separate them: it is chosen at random
+// per link by each dialer, so a listener has no way to know which ids are its
+// own. Each listener answered the other's peer, each dialer accepted those
+// replies as its own listener's, and both tunnels carried two interleaved
+// ciphertext streams. Both break, and nothing in either log says why.
+//
+// The configured tunnel port is the separator. It means nothing to ICMP, which
+// is exactly why it is free to use: both ends of a tunnel are configured with
+// the same one and two tunnels on a host are configured with different ones, so
+// it identifies the tunnel to both sides at no cost.
+//
+//	frame = [direction tag: 1][tunnel port: 2, big-endian][ciphertext …]
+const icmpFrameHdr = 3
+
+// appendTag writes the frame header: which way this is going, and which tunnel
+// it belongs to.
+func appendTag(dst []byte, tag byte, tunnel int) []byte {
+	return append(dst, tag, byte(tunnel>>8), byte(tunnel))
+}
+
+// stripTag accepts a payload only when it carries the expected direction tag and
+// belongs to this tunnel, and returns it with the header removed.
+//
+// Three things fail here rather than reaching the AEAD as a peer frame: traffic
+// travelling the other way (our own request mirrored back by a kernel echo
+// reply), a stray ping from a stranger, and — since ICMP delivers every packet
+// to every raw socket on the host — another tunnel's traffic.
+func stripTag(data []byte, want byte, tunnel int) ([]byte, bool) {
+	if len(data) < icmpFrameHdr || data[0] != want {
 		return nil, false
 	}
-	return data[1:], true
+	if int(data[1])<<8|int(data[2]) != tunnel&0xffff {
+		return nil, false
+	}
+	return data[icmpFrameHdr:], true
 }
 
 const (

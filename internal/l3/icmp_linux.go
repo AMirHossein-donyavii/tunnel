@@ -34,6 +34,7 @@ import (
 
 	"github.com/emergency-tunnel/et/internal/config"
 	"github.com/emergency-tunnel/et/internal/crypto"
+	"github.com/emergency-tunnel/et/internal/logx"
 	"github.com/emergency-tunnel/et/internal/nettune"
 	"golang.org/x/net/icmp"
 )
@@ -52,17 +53,19 @@ func protoFor(mode string) icmpProto {
 	return icmpProto{"ip4:icmp", false}
 }
 
-func newICMPCarrier(mode string, cfg *config.Config, isDialer bool, cipher string) (linkDialer, linkListener, error) {
+func newICMPCarrier(mode string, cfg *config.Config, isDialer bool, cipher string, log *logx.Logger) (linkDialer, linkListener, error) {
 	p := protoFor(mode)
 	if isDialer {
-		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher, cfg: cfg}, nil, nil
+		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher, cfg: cfg, tunnel: cfg.TunnelPort}, nil, nil
 	}
 	pc, err := icmp.ListenPacket(p.network, "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("icmp listen (%s): %w (needs CAP_NET_RAW)", p.network, err)
 	}
 	tuneICMPSocket(pc, cfg)
-	l := &icmpLinkListener{proto: p, pc: pc, cipher: cipher, flows: map[icmpKey]*icmpFlow{}, accept: make(chan *icmpFlow, 64), closed: make(chan struct{})}
+	l := &icmpLinkListener{proto: p, pc: pc, cipher: cipher, tunnel: cfg.TunnelPort, log: log,
+		mismatch: logx.NewSuppressor(2*time.Minute, 32),
+		flows:    map[icmpKey]*icmpFlow{}, accept: make(chan *icmpFlow, 64), closed: make(chan struct{})}
 	go l.route()
 	return nil, l, nil
 }
@@ -74,6 +77,10 @@ type icmpLinkDialer struct {
 	peer   string
 	cipher string
 	cfg    *config.Config
+	// tunnel is the configured tunnel port, which ICMP has no use for and this
+	// carrier therefore uses to tell its own traffic from another tunnel's on
+	// the same host. See icmpframe.go.
+	tunnel int
 }
 
 // tuneICMPSocket sizes the raw socket's buffers.
@@ -132,7 +139,7 @@ func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
 		}
 		return nil, fmt.Errorf("peer %q has no IPv4 address (%w)", d.peer, err)
 	}
-	conn := &icmpConn{proto: d.proto, pc: pc, peer: peer, id: rand.Intn(0xfffe) + 1}
+	conn := &icmpConn{proto: d.proto, pc: pc, peer: peer, id: rand.Intn(0xfffe) + 1, tunnel: d.tunnel}
 	dg, err := crypto.ClientHandshakePacket(conn, d.cipher)
 	if err != nil {
 		_ = pc.Close()
@@ -149,6 +156,9 @@ type icmpConn struct {
 	pc    *icmp.PacketConn
 	peer  net.Addr
 	id    int
+	// tunnel is the configured tunnel port, carried in every frame so this link
+	// can tell its own traffic from another ICMP tunnel's on the same host.
+	tunnel int
 
 	mu      sync.Mutex
 	seq     uint32
@@ -159,7 +169,7 @@ type icmpConn struct {
 func (c *icmpConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	c.seq++
-	c.scratch = appendEcho(c.scratch[:0], c.proto, c.id, int(c.seq&0xffff), tagToListener, b)
+	c.scratch = appendEcho(c.scratch[:0], c.proto, c.id, int(c.seq&0xffff), tagToListener, c.tunnel, b)
 	out := c.scratch
 	c.mu.Unlock()
 	if _, err := c.pc.WriteTo(out, c.peer); err != nil {
@@ -191,7 +201,7 @@ func (c *icmpConn) Read(b []byte) (int, error) {
 		}
 		// Drop anything tagged for the listener: that is our own request
 		// mirrored back by the peer's kernel, not a frame from the peer.
-		payload, ok := stripTag(data, tagToDialer)
+		payload, ok := stripTag(data, tagToDialer, c.tunnel)
 		if !ok {
 			continue
 		}
@@ -235,6 +245,11 @@ type icmpLinkListener struct {
 	proto  icmpProto
 	pc     *icmp.PacketConn
 	cipher string
+	tunnel int // see icmpLinkDialer.tunnel
+	log    *logx.Logger
+	// mismatch keeps the "wrong tunnel port" diagnosis to one line per source
+	// per window; the peer retries this several times a second.
+	mismatch *logx.Suppressor
 
 	mu sync.Mutex
 	// See icmpKey: the key is built for every packet the server receives, so it
@@ -269,10 +284,18 @@ func (l *icmpLinkListener) route() {
 		// Only frames a dialer addressed to us. This rejects ordinary ping
 		// traffic from anywhere on the internet, which would otherwise open a
 		// flow per source and be offered to the handshake.
-		data, ok = stripTag(data, tagToListener)
+		payload, ok := stripTag(data, tagToListener, l.tunnel)
 		if !ok {
+			// A frame addressed to a tunnel that is not this one is the normal
+			// case on a host running two of them, and is silent. But a peer
+			// whose tunnel_port does not match ours produces exactly the same
+			// silence, and the tunnel simply never comes up with nothing in the
+			// log — so name that one. Also covers a peer on an older core, whose
+			// frames have no tunnel port in them at all.
+			l.reportMismatch(src, data)
 			continue
 		}
+		data = payload
 		key, ok := makeICMPKey(src, id)
 		if !ok {
 			continue
@@ -301,6 +324,25 @@ func (l *icmpLinkListener) route() {
 		default:
 			putDgram(bp)
 		}
+	}
+}
+
+// reportMismatch explains a frame that is tagged as ours but belongs to another
+// tunnel port. Frames with no direction tag are ordinary ping traffic and say
+// nothing worth logging.
+func (l *icmpLinkListener) reportMismatch(src net.Addr, data []byte) {
+	if l.log == nil || len(data) < icmpFrameHdr || data[0] != tagToListener {
+		return
+	}
+	theirs := int(data[1])<<8 | int(data[2])
+	if ok, n := l.mismatch.Allow(src.String()); ok {
+		extra := ""
+		if n > 0 {
+			extra = fmt.Sprintf(" (and %d more since)", n)
+		}
+		l.log.Warn("icmp: frames from %s are for tunnel_port %d, this tunnel is %d — "+
+			"set the same tunnel_port on both servers, or the peer is on an older core%s",
+			src, theirs, l.tunnel, extra)
 	}
 }
 
@@ -374,7 +416,7 @@ func (f *icmpFlow) Read(b []byte) (int, error) {
 func (f *icmpFlow) Write(b []byte) (int, error) {
 	f.wmu.Lock()
 	f.seq++
-	f.scratch = appendReply(f.scratch[:0], f.l.proto, f.id, int(f.seq&0xffff), tagToDialer, b)
+	f.scratch = appendReply(f.scratch[:0], f.l.proto, f.id, int(f.seq&0xffff), tagToDialer, f.l.tunnel, b)
 	out := f.scratch
 	f.wmu.Unlock()
 	if _, err := f.l.pc.WriteTo(out, f.src); err != nil {
@@ -417,19 +459,19 @@ func parseEchoRequest(p icmpProto, raw []byte) ([]byte, int, bool) {
 
 // appendEcho appends a complete ICMP echo *request* — header, direction tag,
 // payload — to dst, which the caller reuses across packets.
-func appendEcho(dst []byte, p icmpProto, id, seq int, tag byte, payload []byte) []byte {
-	return appendTagged(dst, p, false, id, seq, tag, payload)
+func appendEcho(dst []byte, p icmpProto, id, seq int, tag byte, tunnel int, payload []byte) []byte {
+	return appendTagged(dst, p, false, id, seq, tag, tunnel, payload)
 }
 
 // appendReply appends a complete ICMP echo *reply* to dst.
-func appendReply(dst []byte, p icmpProto, id, seq int, tag byte, payload []byte) []byte {
-	return appendTagged(dst, p, true, id, seq, tag, payload)
+func appendReply(dst []byte, p icmpProto, id, seq int, tag byte, tunnel int, payload []byte) []byte {
+	return appendTagged(dst, p, true, id, seq, tag, tunnel, payload)
 }
 
-func appendTagged(dst []byte, p icmpProto, reply bool, id, seq int, tag byte, payload []byte) []byte {
+func appendTagged(dst []byte, p icmpProto, reply bool, id, seq int, tag byte, tunnel int, payload []byte) []byte {
 	off := len(dst)
 	dst = appendEchoHeader(dst, p.v6, reply, id, seq)
-	dst = append(dst, tag)
+	dst = appendTag(dst, tag, tunnel)
 	dst = append(dst, payload...)
 	finishICMP(dst[off:], p.v6)
 	return dst

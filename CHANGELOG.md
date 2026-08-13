@@ -4,6 +4,42 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.8.9] — 2026-08-13
+
+### Fixed
+
+- **Two ICMP tunnels on one server read each other's traffic and both broke.**
+  ICMP has no ports, and a raw ICMP socket receives a copy of every ICMP packet
+  the host receives — not the subset addressed to one listener, because there is
+  no such thing. The only field left to separate tunnels by was the echo id,
+  which each dialer picks at random per link, so a listener had no way to know
+  which ids were its own. On a server running two ICMP tunnels — two Foreign
+  servers dialing in, different tunnel ports, different subnets, exactly what the
+  console builds — each listener answered the other's peer, each dialer accepted
+  those replies as its own listener's, and both links carried two interleaved
+  ciphertext streams. Both tunnels degraded and neither log said why.
+
+  The configured tunnel port now travels in every frame as the tunnel's identity.
+  It means nothing to ICMP, which is what makes it free to use: both ends of a
+  tunnel are configured with the same one, and two tunnels on a host with
+  different ones. Each side drops what is not addressed to it. The same fix
+  applies to the SPF icmp profile, which had the identical problem.
+
+  Reproduced first — two listeners on one host, one frame, both accepted it —
+  and the same test now passes.
+
+- **Two ICMP tunnels sharing a tunnel port are now refused at creation.** That
+  was previously reported only when both sides were listeners, on the reasoning
+  that they would fail to bind; nothing binds an ICMP tunnel port, so a dialer
+  and a listener, or two dialers aimed at different peers, passed as clean and
+  then broke each other in production.
+
+- **A peer configured with a different `tunnel_port` no longer fails silently.**
+  It produces the same dropped frames as a neighbouring tunnel's traffic, but it
+  means the tunnel will never come up, so it is now named in the log — with the
+  port the peer is using and the one this tunnel expects — once per source per
+  two minutes, since a peer retries several times a second.
+
 ## [2.8.8] — 2026-08-13
 
 ### Added

@@ -225,6 +225,24 @@ func (c *Config) IsSPF() bool { return c.Engine == EngineSPF }
 // UsesL3 reports whether the engine is built on the L3/TUN data plane.
 func (c *Config) UsesL3() bool { return c.IsTUN() || c.IsSPF() }
 
+// UsesICMPCarrier reports whether the link between the two servers rides inside
+// ICMP echo messages — the TUN icmp and bip modes, and the SPF icmp profile.
+//
+// These share a property no other carrier has: ICMP has no ports, and a raw
+// ICMP socket receives a copy of every ICMP packet the host receives, so two
+// such tunnels on one server see all of each other's traffic. What separates
+// them is the tunnel port carried inside each frame, which makes two of them
+// sharing a tunnel port a real clash even though nothing binds it.
+func (c *Config) UsesICMPCarrier() bool {
+	if c.IsTUN() {
+		return c.TunMode == TunModeICMP || c.TunMode == TunModeBIP
+	}
+	if c.IsSPF() {
+		return c.SpfProfile != SpfProfileTCP
+	}
+	return false
+}
+
 // TUN carrier modes (how the encrypted link between the two servers is carried).
 const (
 	TunModeTCP  = "tcp"  // reliable TCP stream (default, production)
