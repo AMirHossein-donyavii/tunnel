@@ -874,14 +874,31 @@ func datagramCarrier(cfg *config.Config) bool {
 // channelDefault sizes the per-queue TX ring by profile. The ring only has to
 // absorb bursts: CoDel keeps the *occupied* depth near 5 ms of drain time
 // whatever the capacity is, so a deeper ring costs memory, not latency.
+// channelDefault sizes the transmit ring — how much of a burst the tunnel can
+// absorb before it starts dropping at the tail.
+//
+// This used to be 512 packets, about 676 KB at the datagram carriers' MTU. On a
+// long path that is too small to be a burst absorber: Iran to Europe runs
+// 100-150 ms, so a 100 Mbit path has one to two megabytes in flight, and inner
+// TCP fills that. A burst arriving faster than CoDel's interval overflowed the
+// ring and was tail-dropped — the crude drop that CoDel exists to replace, and
+// one that costs throughput rather than signalling congestion gently.
+//
+// The ring is now deep enough to hold a real burst. That is only safe because
+// there is an AQM in front of it: CoDel bounds how long a packet may *sit* in
+// the queue, whatever the queue's capacity, so extra capacity buys burst
+// absorption without buying standing delay. Without an AQM, a ring this size
+// would be a second of bufferbloat. The ring itself costs eight bytes an entry;
+// packet buffers are pooled and only exist while occupied, so the memory
+// follows actual load rather than capacity.
 func channelDefault(profile string) int {
 	switch profile {
 	case config.ProfileFast:
-		return 512
+		return 4096
 	case config.ProfileResource:
-		return 128
+		return 256 // a small VPS: cap what a sustained backlog can hold
 	default: // balance
-		return 256
+		return 2048
 	}
 }
 

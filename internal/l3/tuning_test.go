@@ -10,16 +10,29 @@ import (
 	"github.com/emergency-tunnel/et/internal/config"
 )
 
+// The ring has to be deep enough to hold what a long path keeps in flight, or a
+// burst is tail-dropped before CoDel can signal congestion gently. A 100 Mbit
+// path at 150 ms — Iran to Europe — carries about 1420 packets at the datagram
+// carriers' MTU, which the old 512-packet ring could not hold.
 func TestChannelDefaultByProfile(t *testing.T) {
 	cases := map[string]int{
-		config.ProfileFast:     512,
-		config.ProfileBalance:  256,
-		config.ProfileResource: 128,
-		"":                     256, // unknown -> balance
+		config.ProfileFast:     4096,
+		config.ProfileBalance:  2048,
+		config.ProfileResource: 256,  // a small VPS caps what a backlog may hold
+		"":                     2048, // unknown -> balance
 	}
 	for profile, want := range cases {
 		if got := channelDefault(profile); got != want {
 			t.Errorf("channelDefault(%q)=%d, want %d", profile, got, want)
+		}
+	}
+
+	// The two profiles meant for real servers must cover a long, fast path.
+	const inFlight100Mbit150ms = 1420
+	for _, p := range []string{config.ProfileFast, config.ProfileBalance} {
+		if got := channelDefault(p); got < inFlight100Mbit150ms {
+			t.Errorf("profile %q rings at %d packets, below the %d a 100 Mbit path at "+
+				"150 ms keeps in flight — bursts will be tail-dropped", p, got, inFlight100Mbit150ms)
 		}
 	}
 }

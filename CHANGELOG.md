@@ -4,6 +4,30 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.10.1] — 2026-08-14
+
+### Fixed
+
+- **The transmit ring was far too small to absorb a burst on a long path.** It
+  held 512 packets — about 676 KB at the datagram carriers' MTU — while a
+  100 Mbit path at 150 ms, which is Iran to Europe, keeps roughly 1420 packets
+  in flight and inner TCP fills that. A burst arriving faster than CoDel's
+  100 ms interval overflowed the ring and was tail-dropped: the crude drop CoDel
+  exists to replace, costing throughput instead of signalling congestion gently.
+
+  The ring is now 4096 packets on the fast profile and 2048 on balanced, which
+  covers that path with headroom; the resource profile stays small so a tiny VPS
+  caps what a sustained backlog can hold. This is only safe because there is an
+  AQM in front of it — CoDel bounds how long a packet may *sit* in the queue
+  whatever the capacity, so the extra depth buys burst absorption and not
+  standing delay. Backhaul's equivalent is 10,000 packets with no AQM at all,
+  which is 13 MB, or about a second of bufferbloat at 100 Mbit.
+
+  Three tests hold both halves of that: the ring absorbs a 1500-packet burst with
+  no drops, a drainer that keeps up never sees more than a few packets queued,
+  and a drainer that cannot keep up still gets CoDel drops rather than a deep
+  ring full of stale packets.
+
 ## [2.10.0] — 2026-08-14
 
 ### Added

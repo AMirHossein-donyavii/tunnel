@@ -339,3 +339,72 @@ func BenchmarkClassify(b *testing.B) {
 		_ = isExpress(pkt)
 	}
 }
+
+// The transmit ring is a burst absorber, and it was too small to be one: 512
+// packets is about 676 KB, while a 100 Mbit path at 150 ms — Iran to Europe —
+// has one to two megabytes in flight. A burst arriving faster than CoDel's
+// interval overflowed and was tail-dropped, which is the crude drop CoDel exists
+// to replace.
+//
+// A deeper ring is only safe with an AQM in front of it. These two assert both
+// halves of that: the capacity absorbs the burst, and the standing queue stays
+// short anyway.
+func TestDeepRingAbsorbsABurstWithoutTailDropping(t *testing.T) {
+	const burst = 1500 // packets, well past the old 512-packet ring
+	q, pool, _ := testQueue(t, channelDefault("fast"))
+
+	for i := 0; i < burst; i++ {
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+	}
+	if got := q.stats.dropped.Load(); got != 0 {
+		t.Fatalf("%d of %d packets were tail-dropped on arrival — the ring is still "+
+			"too small to absorb a burst this size", got, burst)
+	}
+	if got := q.bulk.len(); got != burst {
+		t.Fatalf("the ring holds %d of %d packets", got, burst)
+	}
+}
+
+// Capacity must not become standing delay. A drainer that keeps up leaves the
+// queue shallow no matter how deep the ring is allowed to get.
+func TestADeepRingDoesNotBecomeStandingDelay(t *testing.T) {
+	q, pool, now := testQueue(t, channelDefault("fast"))
+
+	// A steady arrival that the drainer keeps up with: one in, one out.
+	maxSeen := 0
+	for i := 0; i < 5000; i++ {
+		*now += int64(100 * time.Microsecond)
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+		if p := q.pop(); p != nil {
+			pool.put(p)
+		}
+		if n := q.bulk.len(); n > maxSeen {
+			maxSeen = n
+		}
+	}
+	if maxSeen > 4 {
+		t.Fatalf("the standing queue reached %d packets while the drainer was keeping "+
+			"up — capacity is being used as buffer instead of as headroom", maxSeen)
+	}
+}
+
+// And with a drainer that cannot keep up, CoDel still drops rather than letting
+// the deep ring fill with stale packets.
+func TestCodelStillBoundsSojournOnADeepRing(t *testing.T) {
+	q, pool, now := testQueue(t, channelDefault("fast"))
+
+	for i := 0; i < 2000; i++ {
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+	}
+	*now += int64(codelTarget) * 4
+	for i := 0; i < 2000 && q.bulk.len() > 0; i++ {
+		*now += int64(10 * time.Millisecond)
+		if p := q.pop(); p != nil {
+			pool.put(p)
+		}
+	}
+	if q.stats.dropped.Load() == 0 {
+		t.Fatal("a deep ring let a persistent standing queue build with no drops — " +
+			"that is the bufferbloat this capacity is only safe without")
+	}
+}
