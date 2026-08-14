@@ -4,6 +4,48 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.12.0] — 2026-08-14
+
+### Fixed
+
+- **One connection that opened and said nothing stopped every other peer
+  connecting to a WebSocket tunnel.** The HTTP upgrade ran on the accept path,
+  reading a request from a peer that had not sent one, bounded only by the
+  ten-second handshake deadline. So a single TCP connection that stayed silent
+  blocked the accept loop for ten seconds, and a handful of them in rotation
+  stopped the tunnel accepting at all — a denial of service available to anyone
+  who could reach the port, costing one goroutine per pending connection to
+  remove. Upgrades now run concurrently and only finished ones are offered.
+  The test for it went from failing after ten seconds to passing immediately.
+
+### Added
+
+- **The Basic section now offers the eight transports by name**: `tcp`,
+  `tcpmux`, `xtcpmux`, `ws`, `wss`, `wsmux`, `wssmux`, `xwsmux`. `wss` and
+  `wssmux` were previously reachable only through Backpack; each of the eight is
+  now driven to completion by the console's own checks and verified to write the
+  data plane it names.
+
+- **`xws` and `xwss`: a WebSocket whose payload carries no signature.** Every
+  connection this tunnel makes opens with the same five constant bytes,
+  `45 54 02 03 03`, at offset zero of the first message. Two very ordinary
+  deployments can see them: plain `ws`, where the payload is not encrypted at
+  all, and `wss` behind a CDN or company proxy that terminates TLS and forwards
+  the WebSocket onward. Either has a five-byte signature to match on.
+
+  These layer the stealth handshake inside the WebSocket, so what a CDN sees is
+  still an ordinary WebSocket carrying binary messages, and what is in those
+  messages is uniform random bytes with no header, version or constant. A peer
+  without the token gets silence rather than a reply.
+
+  The order is deliberate: the WebSocket is outside because that is what a CDN
+  has to understand and route, and the obfuscation is inside because that is
+  where the thing being hidden lives. Wrapping the other way round would hide
+  the WebSocket too, which defeats having one.
+
+  A test reads the bytes that actually go over the socket and fails if the
+  signature is in them, rather than trusting that a layer was added.
+
 ## [2.11.0] — 2026-08-14
 
 The TUN carriers now use the configuration shape the field has settled on, and

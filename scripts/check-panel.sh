@@ -132,6 +132,29 @@ STUB
     drive_tun 5 t-ipip
     drive_tun 6 t-gre
 
+    # Every Basic protocol is a different data plane; each is driven so a broken
+    # one cannot ship looking like a menu entry that does nothing.
+    drive_basic() { # drive_basic <choice> <name> <answers...>
+        local n="$1" nm="$2"; shift 2
+        rm -rf "$tmp/etc"; mkdir -p "$tmp/etc"
+        printf '%s\n' "$n" "$nm" "$@" | timeout 25 bash -c "source $harness; section_basic" >"$tmp/out.b$n" 2>&1
+        local f; f="$(ls "$tmp"/etc/*.toml 2>/dev/null | head -1)"
+        if [ -n "$f" ] && "$CORE_BIN" validate --config "$f" >/dev/null 2>&1; then
+            good "Basic $n ($nm) writes a config the core accepts"
+        else
+            bad "Basic $n ($nm) did not produce a valid config"
+        fi
+    }
+    #            role tunnel-port  [ws path] [host] [sni]  ports  proxy-proto
+    drive_basic 1 b-tcp      1 11260 8443 n
+    drive_basic 2 b-tcpmux   1 11261 8444 n
+    drive_basic 3 b-xtcpmux  y 1 11262 8445 n
+    drive_basic 4 b-ws       1 11263 "" 8446 n
+    drive_basic 5 b-wss      1 11264 "" 8447 n
+    drive_basic 6 b-wsmux    1 11265 "" 8448 n
+    drive_basic 7 b-wssmux   1 11266 "" 8449 n
+    drive_basic 8 b-xwsmux   y 1 11267 "" 8450 n
+
     # listen port here, Iran IP, users' port there, tunnel port, client count, name
     if command -v wg >/dev/null; then
         drive wg_vpn_exit  51999 203.0.113.9 51820 11239 1 t-wgvpn

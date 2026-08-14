@@ -84,7 +84,13 @@ func (*wsTransport) NewListener(cfg *config.Config, log *logx.Logger) (transport
 		return nil, fmt.Errorf("ws listen :%d: %w", cfg.TunnelPort, err)
 	}
 	log.Info("ws transport listening on :%d (path %s)", cfg.TunnelPort, pathOrDefault(cfg.WSPath))
-	return &listener{ln: ln, path: pathOrDefault(cfg.WSPath), log: log}, nil
+	l := &listener{ln: ln, path: pathOrDefault(cfg.WSPath), log: log,
+		ready: make(chan net.Conn, 8),
+		fatal: make(chan error, 1),
+		done:  make(chan struct{}),
+	}
+	go l.pump()
+	return l, nil
 }
 
 func pathOrDefault(p string) string {
@@ -185,27 +191,66 @@ type listener struct {
 	ln   net.Listener
 	path string
 	log  *logx.Logger
+
+	ready chan net.Conn
+	fatal chan error
+	done  chan struct{}
+	once  sync.Once
 }
 
-func (l *listener) Accept() (net.Conn, error) {
+// pump accepts connections and upgrades them concurrently.
+//
+// The upgrade used to run on the accept path. It reads an HTTP request from a
+// peer that has not sent one yet, bounded only by the ten-second handshake
+// deadline — so one TCP connection that opened and then said nothing stopped
+// every other peer connecting for ten seconds, and a handful of them in
+// rotation stopped the tunnel accepting at all. That is a denial of service
+// available to anyone who can reach the port, and it costs one goroutine per
+// pending connection to remove.
+func (l *listener) pump() {
 	for {
 		raw, err := l.ln.Accept()
 		if err != nil {
-			return nil, err
+			select {
+			case l.fatal <- err:
+			default:
+			}
+			return
 		}
-		if err := serverHandshake(raw, l.path); err != nil {
-			// A failed upgrade is an ordinary event on a public port (scanners,
-			// health checks, a browser). Drop it and keep serving rather than
-			// failing the accept loop.
-			_ = raw.Close()
-			continue
-		}
-		return newConn(raw, false), nil
+		go func() {
+			if err := serverHandshake(raw, l.path); err != nil {
+				// A failed upgrade is an ordinary event on a public port
+				// (scanners, health checks, a browser). Drop it and keep serving.
+				_ = raw.Close()
+				return
+			}
+			c := newConn(raw, false)
+			select {
+			case l.ready <- c:
+			case <-l.done:
+				_ = c.Close()
+			}
+		}()
+	}
+}
+
+func (l *listener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.ready:
+		return c, nil
+	case err := <-l.fatal:
+		return nil, err
+	case <-l.done:
+		return nil, net.ErrClosed
 	}
 }
 
 func (l *listener) Addr() net.Addr { return l.ln.Addr() }
-func (l *listener) Close() error   { return l.ln.Close() }
+
+func (l *listener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return l.ln.Close()
+}
 
 func serverHandshake(c net.Conn, path string) error {
 	_ = c.SetDeadline(time.Now().Add(handshakeTO))

@@ -32,6 +32,7 @@ import (
 	_ "github.com/emergency-tunnel/et/internal/transport/tcp"
 	_ "github.com/emergency-tunnel/et/internal/transport/ws"
 	_ "github.com/emergency-tunnel/et/internal/transport/wss"
+	_ "github.com/emergency-tunnel/et/internal/transport/xws"
 )
 
 func main() {

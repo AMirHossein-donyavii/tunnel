@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.11.0"
+SCRIPT_VERSION="2.12.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -513,31 +513,67 @@ section_basic() {
     note "Users connect to a port on the Iran server; traffic comes out on the"
     note "Foreign server. Choose the carrier that survives your path."
     echo
-    item 1 "TCPMUX" "TCP, multiplexed — fastest; one frame per new connection"
-    item 2 "TCP"    "TCP, one connection per user — plainest traffic shape"
-    item 3 "WSMUX"  "WebSocket, multiplexed — passes CDNs and reverse proxies"
-    item 4 "WS"     "WebSocket, one connection per user"
-    item 5 "UDP"    "reliable UDP (ARQ) — for paths that throttle or block TCP"
+    item 1 "tcp"      "one TCP connection per user — plainest traffic shape"
+    item 2 "tcpmux"   "TCP, multiplexed — fastest; one frame per new connection"
+    item 3 "xtcpmux"  "tcpmux with no fingerprint at all — random bytes on the wire"
+    item 4 "ws"       "WebSocket over HTTP — passes CDNs and reverse proxies"
+    item 5 "wss"      "WebSocket over TLS with a Chrome fingerprint"
+    item 6 "wsmux"    "WebSocket, multiplexed"
+    item 7 "wssmux"   "WebSocket over TLS, multiplexed"
+    item 8 "xwsmux"   "wssmux whose payload is obfuscated too — for a CDN that ends TLS"
     echo
     note "Multiplexed carriers reuse one authenticated connection for everything,"
     note "which removes a handshake per user connection — measurably faster on a"
     note "long path. The unmultiplexed variants trade that for a more ordinary"
     note "per-connection traffic shape."
-    local c; c="$(ask_choice "Protocol" "1" 1 2 3 4 5)"
+    echo
+    note "The x variants hide this tunnel's own signature. Every connection here"
+    note "opens with the same five constant bytes, which is enough to recognise"
+    note "on any path that can read the payload — plain ws, or wss behind a CDN"
+    note "or company proxy that terminates TLS. The x variants replace those"
+    note "bytes with random ones and answer a wrong token with silence."
+    local c; c="$(ask_choice "Protocol" "2" 1 2 3 4 5 6 7 8)"
     cfg_reset
     case "$c" in
-        1) optimise basic tcpmux; cfg_set engine mux;    cfg_set transport tcp ;;
-        2) optimise basic tcp;    cfg_set engine direct; cfg_set transport tcp ;;
-        3) optimise basic wsmux;  cfg_set engine mux;    cfg_set transport ws ;;
-        4) optimise basic ws;     cfg_set engine direct; cfg_set transport ws ;;
-        5) optimise basic udp;    cfg_set engine mux;    cfg_set transport udp ;;
+        1) optimise basic tcp;     cfg_set engine direct; cfg_set transport tcp ;;
+        2) optimise basic tcpmux;  cfg_set engine mux;    cfg_set transport tcp ;;
+        3) optimise basic tcpmux;  cfg_set engine mux;    cfg_set transport stealth ;;
+        4) optimise basic ws;      cfg_set engine direct; cfg_set transport ws ;;
+        5) optimise basic ws;      cfg_set engine direct; cfg_set transport wss ;;
+        6) optimise basic wsmux;   cfg_set engine mux;    cfg_set transport ws ;;
+        7) optimise basic wsmux;   cfg_set engine mux;    cfg_set transport wss ;;
+        8) optimise basic wsmux;   cfg_set engine mux;    cfg_set transport xws ;;
     esac
     cfg_set name "$(ask_name "Tunnel name" "basic$(tunnel_count)")"
+
+    # The obfuscated carriers authenticate with a shared token, and refuse to
+    # start without one rather than answering every scanner that finds the port.
+    case "${CFG[transport]}" in
+      stealth|xws)
+        echo
+        note "This carrier needs a token, the SAME on both servers."
+        if yesno "Is this the FIRST server of the pair?" "y"; then
+            cfg_set token "$(gen_token)"
+            ok "Token generated — copy it to the other server:"
+            printf "\n    ${B}%s${R}\n\n" "${CFG[token]}"
+        else
+            cfg_set token "$(ask_req "Paste the token from the first server")"
+        fi
+        ;;
+    esac
+
     common_endpoint
-    if [ "${CFG[transport]}" = "ws" ]; then
+    case "${CFG[transport]}" in
+      ws|wss|xws)
         cfg_set ws_path "$(ask "WebSocket path ${GRY}(must match on both ends)${R}" "/live/stream")"
         [ "${CFG[role]}" = "kharej" ] && cfg_set ws_host "$(ask "Host header ${GRY}(CDN hostname, or blank)${R}" "")"
-    fi
+        ;;
+    esac
+    case "${CFG[transport]}" in
+      wss|xws)
+        [ "${CFG[role]}" = "kharej" ] && cfg_set tls_sni "$(ask "TLS SNI ${GRY}(hostname to present, or blank)${R}" "")"
+        ;;
+    esac
     forwards_prompt
     finish_tunnel
 }
