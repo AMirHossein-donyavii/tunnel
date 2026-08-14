@@ -4,6 +4,54 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.11.0] — 2026-08-14
+
+The TUN carriers now use the configuration shape the field has settled on, and
+gained the three knobs that shape carries which this core lacked. What is
+deliberately not adopted is listed at the end.
+
+### Changed
+
+- **A carrier is now named the way the field names it**: an `encapsulation` of
+  `"tcp"` for a real TCP stream, or `"ipx"` plus an `ipx_profile` of `icmp`,
+  `ipip`, `udp`, `gre` or `bip` for the raw-IP family. `tun_mode` says the same
+  thing in one word and is still accepted — every existing config keeps working
+  untouched. Whichever is given is normalised into one field at validation, so
+  nothing downstream can read two names and disagree with itself, and a config
+  written back states both and reads the same next time. Six carriers round-trip
+  through a written file in the tests.
+
+### Added
+
+- **`icmp_type` / `icmp_code`** set the exact ICMP message the icmp carrier
+  emits and accepts, for a path that passes some type other than echo.
+
+  Left unset — which is the default, and zero is treated as unset rather than as
+  "type 0" — the carrier keeps choosing for itself, and that choice is better
+  than any fixed value: it sends Echo Replies, which no kernel answers with a
+  copy of the payload, and falls back to Echo Requests if the path drops
+  unsolicited replies. Setting an explicit type removes the probing, which is
+  meaningless once the messages are not echo.
+
+- **`interface`** binds a raw-IP carrier's socket to one network device. These
+  carriers have no ports, so the socket otherwise receives that IP protocol from
+  every interface the host has — on a server with a public and a private NIC, or
+  one that also terminates a real GRE tunnel, most of that is not ours and each
+  packet costs a wakeup and a parse before the framing rejects it. An interface
+  name that does not exist now fails at startup rather than binding nothing.
+
+- **`listen_ip`** (from 2.10.0) does the same for a single address.
+
+### Not adopted, and why
+
+The parts of that configuration that measure worse here were left alone: a
+10 s/25 s heartbeat where this core uses 2 s/8 s and detects a dead link three
+times sooner; a 10,000-packet FIFO where this one runs 4096 behind CoDel, which
+is burst absorption without the second of standing delay a queue that size has
+with no AQM; no encryption at all on the stream transports; and a static
+pre-shared key with no forward secrecy where this core does an ephemeral X25519
+exchange per connection.
+
 ## [2.10.1] — 2026-08-14
 
 ### Fixed

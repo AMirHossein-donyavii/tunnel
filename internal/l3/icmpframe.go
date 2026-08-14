@@ -82,6 +82,26 @@ const (
 	icmpTypeEchoReplyV6 = 129
 )
 
+// icmpShape is the ICMP message a carrier emits and accepts.
+//
+// Left at its zero value the carrier chooses for itself: Echo Replies, which no
+// kernel answers with a copy of the payload, falling back to Echo Requests when
+// the path drops unsolicited replies. That is better than any fixed setting,
+// which is why the override exists only for the case it cannot cover — a path
+// that passes some other ICMP type and not echo at all.
+type icmpShape struct {
+	typ  byte
+	code byte
+	set  bool
+}
+
+func shapeFrom(typ, code int) icmpShape {
+	if typ == 0 && code == 0 {
+		return icmpShape{} // not set: let the carrier choose
+	}
+	return icmpShape{typ: byte(typ), code: byte(code), set: true}
+}
+
 func echoType(v6, reply bool) byte {
 	switch {
 	case v6 && reply:
@@ -99,8 +119,18 @@ func echoType(v6, reply bool) byte {
 // checksum zero. Append the payload after it, then call finishICMP over the
 // whole message.
 func appendEchoHeader(dst []byte, v6, reply bool, id, seq int) []byte {
+	return appendEchoHeaderShaped(dst, icmpShape{}, v6, reply, id, seq)
+}
+
+// appendEchoHeaderShaped writes the header with an explicit message type when
+// one is configured, and the direction's echo type otherwise.
+func appendEchoHeaderShaped(dst []byte, sh icmpShape, v6, reply bool, id, seq int) []byte {
+	typ, code := echoType(v6, reply), byte(0)
+	if sh.set {
+		typ, code = sh.typ, sh.code
+	}
 	return append(dst,
-		echoType(v6, reply), 0,
+		typ, code,
 		0, 0, // checksum, filled by finishICMP
 		byte(id>>8), byte(id),
 		byte(seq>>8), byte(seq),
@@ -140,10 +170,20 @@ func parseEchoMsg(raw []byte, v6, wantReply bool) (payload []byte, id int, ok bo
 // where it used to send Echo Requests — see icmpConn.reply — and still has to
 // accept requests from a peer that had to fall back to them.
 func parseEchoAny(raw []byte, v6 bool) (payload []byte, id int, ok bool) {
+	return parseEchoAnyShaped(raw, icmpShape{}, v6)
+}
+
+// parseEchoAnyShaped accepts the configured message type when one is set, and
+// either echo direction otherwise.
+func parseEchoAnyShaped(raw []byte, sh icmpShape, v6 bool) (payload []byte, id int, ok bool) {
 	if len(raw) < icmpEchoHdr {
 		return nil, 0, false
 	}
-	if raw[0] != echoType(v6, true) && raw[0] != echoType(v6, false) {
+	if sh.set {
+		if raw[0] != sh.typ || raw[1] != sh.code {
+			return nil, 0, false
+		}
+	} else if raw[0] != echoType(v6, true) && raw[0] != echoType(v6, false) {
 		return nil, 0, false
 	}
 	return raw[icmpEchoHdr:], int(raw[4])<<8 | int(raw[5]), true

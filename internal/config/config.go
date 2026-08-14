@@ -48,17 +48,37 @@ type Config struct {
 	// several addresses otherwise receives that IP protocol on all of them.
 	ListenIP string `toml:"listen_ip"`
 	// SPF (TUN + IPX-style encapsulation with source-IP spoofing) settings.
-	SpfProfile    string `toml:"spf_profile"`   // SPF carrier: icmp | tcp
-	Encapsulation string `toml:"encapsulation"` // SPF: "ipx"
-	SpoofSrcIP    string `toml:"spoof_src_ip"`  // SPF: spoofed source IP for our packets
-	SpoofDstIP    string `toml:"spoof_dst_ip"`  // SPF: peer's spoofed source (inbound filter)
-	TunIP         string `toml:"tun_ip"`        // TUN engine: this host's tunnel address (CIDR)
-	TunIP6        string `toml:"tun_ip6"`       // TUN engine: optional IPv6 tunnel address (CIDR)
-	PeerTunIP     string `toml:"peer_tun_ip"`   // TUN engine: peer's tunnel address (for routing/logs)
-	TunIface      string `toml:"tun_iface"`
-	MTU           int    `toml:"mtu"`
-	Workers       int    `toml:"workers"` // 0 = auto
-	Pool          int    `toml:"pool"`
+	SpfProfile string `toml:"spf_profile"` // SPF carrier: icmp | tcp
+	// Encapsulation and IpxProfile are the carrier surface, in the shape the
+	// field has settled on: an encapsulation of "tcp" is a real TCP stream, and
+	// "ipx" is the raw-IP family, whose profile names the IP protocol the link
+	// rides in. tun_mode below says the same thing in one word and is still
+	// accepted; validate() normalises whichever was given into TunMode, so
+	// everything downstream reads one field.
+	Encapsulation string `toml:"encapsulation"` // tcp | ipx   (SPF: "ipx")
+	IpxProfile    string `toml:"ipx_profile"`   // icmp | ipip | udp | gre | bip
+
+	// IcmpType/IcmpCode override the ICMP message the icmp carrier emits.
+	// Left at zero the carrier chooses for itself, which is better than a fixed
+	// value: it sends Echo Replies, which no kernel answers with a copy of the
+	// payload, and falls back to Echo Requests if the path drops them. Set these
+	// only for a path that passes some other ICMP type.
+	IcmpType int `toml:"icmp_type"`
+	IcmpCode int `toml:"icmp_code"`
+
+	// Iface binds a raw-IP carrier's socket to one network device. On a server
+	// with several, the socket otherwise receives that IP protocol from all of
+	// them.
+	Iface      string `toml:"interface"`
+	SpoofSrcIP string `toml:"spoof_src_ip"` // SPF: spoofed source IP for our packets
+	SpoofDstIP string `toml:"spoof_dst_ip"` // SPF: peer's spoofed source (inbound filter)
+	TunIP      string `toml:"tun_ip"`       // TUN engine: this host's tunnel address (CIDR)
+	TunIP6     string `toml:"tun_ip6"`      // TUN engine: optional IPv6 tunnel address (CIDR)
+	PeerTunIP  string `toml:"peer_tun_ip"`  // TUN engine: peer's tunnel address (for routing/logs)
+	TunIface   string `toml:"tun_iface"`
+	MTU        int    `toml:"mtu"`
+	Workers    int    `toml:"workers"` // 0 = auto
+	Pool       int    `toml:"pool"`
 	// TunQueues sets the number of TUN queues / carrier links for the L3 engines
 	// (0 = use Pool). It MUST be identical on both servers: the kernel steers
 	// flows across all queues, so a queue without a peer link silently blackholes
@@ -263,6 +283,11 @@ const (
 	// and polices ICMP often leaves them alone. See internal/l3/ipx.go.
 	TunModeIPIP = "ipip" // inside IP-in-IP (protocol 4) — needs CAP_NET_RAW
 	TunModeGRE  = "gre"  // inside GRE (protocol 47) — needs CAP_NET_RAW
+
+	// Encapsulations. "tcp" is a real TCP stream; "ipx" is the raw-IP family
+	// above, whose profile names the IP protocol.
+	EncapTCP = "tcp"
+	EncapIPX = "ipx"
 )
 
 // SPF carrier profiles.
@@ -385,15 +410,58 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// normaliseTunCarrier folds the two ways of naming a carrier into TunMode, so
+// everything downstream reads one field and cannot disagree with itself.
+//
+//	encapsulation = "ipx"   + ipx_profile = "icmp"   -> tun_mode = "icmp"
+//	encapsulation = "tcp"                            -> tun_mode = "tcp"
+//	tun_mode      = "icmp"                           -> unchanged
+//
+// An explicit encapsulation wins, because it is the more specific statement.
+func (c *Config) normaliseTunCarrier() error {
+	// SPF shares this validator but names its carrier with spf_profile, and its
+	// encapsulation field means something else. Leave it alone.
+	if !c.IsTUN() {
+		return nil
+	}
+	switch c.Encapsulation {
+	case EncapTCP, EncapIPX, "":
+	default:
+		return fmt.Errorf(`encapsulation must be "tcp" or "ipx", got %q`, c.Encapsulation)
+	}
+
+	switch {
+	// The pair, stated in full: it is the more specific statement, so it wins.
+	case c.Encapsulation == EncapIPX && c.IpxProfile != "":
+		c.TunMode = c.IpxProfile
+	// One word. Derive the pair so a written-back config states both and reads
+	// the same either way.
+	case c.TunMode != "" && c.TunMode != TunModeTCP:
+		c.Encapsulation, c.IpxProfile = EncapIPX, c.TunMode
+	default:
+		c.TunMode = TunModeTCP
+		c.Encapsulation, c.IpxProfile = EncapTCP, ""
+	}
+
+	switch c.TunMode {
+	case TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP, TunModeIPIP, TunModeGRE:
+	default:
+		return fmt.Errorf("carrier must be tcp, udp, icmp, bip, ipip or gre, got %q", c.TunMode)
+	}
+	if c.IcmpType < 0 || c.IcmpType > 255 {
+		return fmt.Errorf("icmp_type out of range (0..255): %d", c.IcmpType)
+	}
+	if c.IcmpCode < 0 || c.IcmpCode > 255 {
+		return fmt.Errorf("icmp_code out of range (0..255): %d", c.IcmpCode)
+	}
+	return nil
+}
+
 // validateTUN validates the TUN-engine addressing (IPv4 required, IPv6 optional)
 // and the peer/heartbeat settings.
 func (c *Config) validateTUN() error {
-	switch c.TunMode {
-	case TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP, TunModeIPIP, TunModeGRE:
-	case "":
-		c.TunMode = TunModeTCP
-	default:
-		return fmt.Errorf("tun_mode must be tcp, udp, icmp, bip, ipip or gre, got %q", c.TunMode)
+	if err := c.normaliseTunCarrier(); err != nil {
+		return err
 	}
 	// A raw-IP carrier binds one local address at most; a bad one fails at
 	// socket-creation time with a message about the address, not the config.

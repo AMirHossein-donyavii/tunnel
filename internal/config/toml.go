@@ -52,6 +52,10 @@ func assign(c *Config, key, val string) error {
 		c.SpfProfile = unquote(val)
 	case "encapsulation":
 		c.Encapsulation = unquote(val)
+	case "ipx_profile":
+		c.IpxProfile = unquote(val)
+	case "interface":
+		c.Iface = unquote(val)
 	case "spoof_src_ip":
 		c.SpoofSrcIP = unquote(val)
 	case "spoof_dst_ip":
@@ -100,6 +104,10 @@ func assign(c *Config, key, val string) error {
 		return intField(val, &c.TunQueues)
 	case "health_port":
 		return intField(val, &c.HealthPort)
+	case "icmp_type":
+		return intField(val, &c.IcmpType)
+	case "icmp_code":
+		return intField(val, &c.IcmpCode)
 	case "proxy_protocol":
 		b, err := strconv.ParseBool(strings.TrimSpace(val))
 		if err != nil {
@@ -255,9 +263,23 @@ func (c *Config) Marshal() string {
 	}
 	ki("tunnel_port", c.TunnelPort)
 	if c.IsTUN() {
+		// Both namings are written: the pair states the carrier the way the
+		// field names it, tun_mode says the same in one word, and validate()
+		// normalises whichever a hand-edited file gives back into TunMode.
+		kv("encapsulation", c.Encapsulation)
+		if c.IpxProfile != "" {
+			kv("ipx_profile", c.IpxProfile)
+		}
 		kv("tun_mode", c.TunMode)
 		if c.ListenIP != "" {
 			kv("listen_ip", c.ListenIP)
+		}
+		if c.Iface != "" {
+			kv("interface", c.Iface)
+		}
+		if c.IcmpType != 0 || c.IcmpCode != 0 {
+			ki("icmp_type", c.IcmpType)
+			ki("icmp_code", c.IcmpCode)
 		}
 	}
 	if c.IsSPF() {

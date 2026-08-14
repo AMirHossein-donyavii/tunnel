@@ -62,14 +62,20 @@ func newICMPCarrier(mode string, cfg *config.Config, isDialer bool, cipher strin
 	p := protoFor(mode)
 	if isDialer {
 		return &icmpLinkDialer{proto: p, peer: cfg.Peer, cipher: cipher, cfg: cfg,
-			tunnel: cfg.TunnelPort, log: log}, nil, nil
+			tunnel: cfg.TunnelPort, log: log,
+			shape: shapeFrom(cfg.IcmpType, cfg.IcmpCode)}, nil, nil
 	}
 	pc, err := icmp.ListenPacket(p.network, "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("icmp listen (%s): %w (needs CAP_NET_RAW)", p.network, err)
 	}
 	tuneICMPSocket(pc, cfg)
+	if err := bindToDevice(pc, cfg.Iface); err != nil {
+		_ = pc.Close()
+		return nil, nil, err
+	}
 	l := &icmpLinkListener{proto: p, pc: pc, cipher: cipher, tunnel: cfg.TunnelPort, log: log,
+		shape:    shapeFrom(cfg.IcmpType, cfg.IcmpCode),
 		mismatch: logx.NewSuppressor(2*time.Minute, 32),
 		flows:    map[icmpKey]*icmpFlow{}, accept: make(chan *icmpFlow, 64), closed: make(chan struct{})}
 	go l.route()
@@ -88,6 +94,7 @@ type icmpLinkDialer struct {
 	// the same host. See icmpframe.go.
 	tunnel int
 	log    *logx.Logger
+	shape  icmpShape // an explicit ICMP message type, when one is configured
 
 	// One raw socket shared by every link of the pool; see socket().
 	mu       sync.Mutex
@@ -127,6 +134,11 @@ const (
 // it has no matching request for, so the old behaviour remains as a fallback and
 // is chosen automatically when the first attempt gets no answer.
 func (d *icmpLinkDialer) pick() []bool {
+	// An explicit message type says exactly what to send, so there is nothing to
+	// probe: reply-versus-request is a property of echo, and this is not echo.
+	if d.shape.set {
+		return []bool{true}
+	}
 	switch d.mode.Load() {
 	case icmpModeReply:
 		return []bool{true}
@@ -192,6 +204,10 @@ func (d *icmpLinkDialer) socket() (*icmp.PacketConn, net.Addr, error) {
 		return nil, nil, fmt.Errorf("icmp socket: %w (needs CAP_NET_RAW)", err)
 	}
 	tuneICMPSocket(pc, d.cfg)
+	if err := bindToDevice(pc, d.cfg.Iface); err != nil {
+		_ = pc.Close()
+		return nil, nil, err
+	}
 	ipnet := "ip4"
 	if d.proto.v6 {
 		ipnet = "ip6"
@@ -226,7 +242,7 @@ func (d *icmpLinkDialer) route() {
 			}
 			continue
 		}
-		data, id, ok := parseEchoMsg(buf[:n], d.proto.v6, true)
+		data, id, ok := parseEchoInbound(buf[:n], d.shape, d.proto.v6, true)
 		if !ok {
 			continue
 		}
@@ -276,7 +292,7 @@ func (d *icmpLinkDialer) DialLink(_ context.Context) (link, error) {
 	}
 	var lastErr error
 	for _, reply := range d.pick() {
-		conn := &icmpConn{d: d, proto: d.proto, pc: pc, peer: peer,
+		conn := &icmpConn{d: d, proto: d.proto, pc: pc, peer: peer, shape: d.shape,
 			id: d.freeID(), tunnel: d.tunnel, reply: reply,
 			in: make(chan *[]byte, flowDepth), closed: make(chan struct{})}
 		d.register(conn)
@@ -352,6 +368,7 @@ type icmpConn struct {
 	// tunnel is the configured tunnel port, carried in every frame so this link
 	// can tell its own traffic from another ICMP tunnel's on the same host.
 	tunnel int
+	shape  icmpShape
 	// reply sends frames as Echo Replies instead of Echo Requests. See
 	// icmpLinkDialer.pick: an Echo Request makes the listener's kernel send the
 	// whole payload straight back, which costs that server an upload copy of
@@ -371,7 +388,7 @@ type icmpConn struct {
 func (c *icmpConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	c.seq++
-	c.scratch = appendTagged(c.scratch[:0], c.proto, c.reply, c.id, int(c.seq&0xffff), tagToListener, c.tunnel, b)
+	c.scratch = appendShaped(c.scratch[:0], c.proto, c.shape, c.reply, c.id, int(c.seq&0xffff), tagToListener, c.tunnel, b)
 	out := c.scratch
 	c.mu.Unlock()
 	if _, err := c.pc.WriteTo(out, c.peer); err != nil {
@@ -442,6 +459,7 @@ type icmpLinkListener struct {
 	cipher string
 	tunnel int // see icmpLinkDialer.tunnel
 	log    *logx.Logger
+	shape  icmpShape
 	// mismatch keeps the "wrong tunnel port" diagnosis to one line per source
 	// per window; the peer retries this several times a second.
 	mismatch *logx.Suppressor
@@ -472,7 +490,7 @@ func (l *icmpLinkListener) route() {
 			}
 			continue
 		}
-		data, id, ok := parseEchoAny(buf[:n], l.proto.v6)
+		data, id, ok := parseEchoAnyShaped(buf[:n], l.shape, l.proto.v6)
 		if !ok {
 			continue
 		}
@@ -612,7 +630,7 @@ func (f *icmpFlow) Read(b []byte) (int, error) {
 func (f *icmpFlow) Write(b []byte) (int, error) {
 	f.wmu.Lock()
 	f.seq++
-	f.scratch = appendReply(f.scratch[:0], f.l.proto, f.id, int(f.seq&0xffff), tagToDialer, f.l.tunnel, b)
+	f.scratch = appendShaped(f.scratch[:0], f.l.proto, f.l.shape, true, f.id, int(f.seq&0xffff), tagToDialer, f.l.tunnel, b)
 	out := f.scratch
 	f.wmu.Unlock()
 	if _, err := f.l.pc.WriteTo(out, f.src); err != nil {
@@ -635,6 +653,15 @@ func (f *icmpFlow) LocalAddr() net.Addr                { return f.l.pc.LocalAddr
 func (f *icmpFlow) RemoteAddr() net.Addr               { return f.src }
 
 // ---- codec -----------------------------------------------------------------
+
+// parseEchoInbound reads a packet the dialer received: the configured message
+// type when one is set, and the reply direction otherwise.
+func parseEchoInbound(raw []byte, sh icmpShape, v6, wantReply bool) ([]byte, int, bool) {
+	if sh.set {
+		return parseEchoAnyShaped(raw, sh, v6)
+	}
+	return parseEchoMsg(raw, v6, wantReply)
+}
 
 // parseEcho returns the echo payload when raw is an echo of the wanted id and
 // the wanted direction (reply when wantReply, else request). See icmpframe.go
@@ -661,8 +688,15 @@ func appendReply(dst []byte, p icmpProto, id, seq int, tag byte, tunnel int, pay
 }
 
 func appendTagged(dst []byte, p icmpProto, reply bool, id, seq int, tag byte, tunnel int, payload []byte) []byte {
+	return appendShaped(dst, p, icmpShape{}, reply, id, seq, tag, tunnel, payload)
+}
+
+// appendShaped is appendTagged with an explicit ICMP message type. See
+// icmpShape: left unset the direction's echo type is used, which is what every
+// path but a deliberately configured one wants.
+func appendShaped(dst []byte, p icmpProto, sh icmpShape, reply bool, id, seq int, tag byte, tunnel int, payload []byte) []byte {
 	off := len(dst)
-	dst = appendEchoHeader(dst, p.v6, reply, id, seq)
+	dst = appendEchoHeaderShaped(dst, sh, p.v6, reply, id, seq)
 	dst = appendTag(dst, tag, tunnel)
 	dst = append(dst, payload...)
 	finishICMP(dst[off:], p.v6)

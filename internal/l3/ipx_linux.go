@@ -42,6 +42,10 @@ func newIPXCarrier(mode string, cfg *config.Config, isDialer bool, cipher string
 		return nil, nil, fmt.Errorf("%s listen (%s): %w (needs CAP_NET_RAW)", p.label, p.network, err)
 	}
 	tuneRawSocket(pc, cfg)
+	if err := bindToDevice(pc, cfg.Iface); err != nil {
+		_ = pc.Close()
+		return nil, nil, err
+	}
 	l := &ipxLinkListener{p: p, pc: pc, cipher: cipher, tunnel: cfg.TunnelPort, log: log,
 		mismatch: logx.NewSuppressor(2*time.Minute, 32),
 		flows:    map[ipxKey]*ipxFlow{}, accept: make(chan *ipxFlow, 64), closed: make(chan struct{})}
@@ -106,6 +110,10 @@ func (d *ipxLinkDialer) socket() (net.PacketConn, net.Addr, error) {
 		return nil, nil, fmt.Errorf("%s socket: %w (needs CAP_NET_RAW)", d.p.label, err)
 	}
 	tuneRawSocket(pc, d.cfg)
+	if err := bindToDevice(pc, d.cfg.Iface); err != nil {
+		_ = pc.Close()
+		return nil, nil, err
+	}
 	peer, err := net.ResolveIPAddr("ip4", d.peer)
 	if err != nil {
 		_ = pc.Close()
