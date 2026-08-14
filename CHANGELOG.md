@@ -4,6 +4,64 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.10.0] — 2026-08-14
+
+### Added
+
+- **Two new TUN carriers: IP-in-IP (protocol 4) and GRE (protocol 47).** These
+  are the remaining IP-level protocols a router forwards without looking inside,
+  and they are what site-to-site tunnels between routers are built from — so a
+  path that filters TCP and UDP, and polices ICMP, frequently leaves them alone,
+  because dropping them breaks ordinary infrastructure.
+
+  Neither has ports, so both inherit the raw-socket problem the ICMP carrier
+  already solved and the same answer: every frame says which direction it is
+  travelling and which tunnel it belongs to, and the tunnel port — meaningless to
+  these protocols, which is what makes it free to use — separates two tunnels on
+  one host. Unlike an echo message there is no id field to tell the links of a
+  pool apart, so the link id is carried explicitly:
+
+      frame = [direction: 1][tunnel port: 2][link id: 2][sealed frame …]
+
+  GRE prepends a well-formed four-byte GRE header (no extension flags, version 0,
+  carrying IPv4), so anything on the path that understands GRE sees a plain GRE
+  tunnel rather than something malformed to drop. IP-in-IP prepends nothing: a
+  real one's payload is an opaque inner packet that routers do not inspect, so
+  adding anything would only cost bytes and make it less like the real thing.
+
+  The pool shares one raw socket with a single read loop, as the ICMP carrier
+  does, because a raw socket has no port and one per link would make the kernel
+  copy every packet of that protocol into every one of them.
+
+  Verified end to end over real raw sockets, for both protocols: four links
+  dialed, each accepted, each receiving its own frames and only its own.
+
+- **`listen_ip`** binds a raw-IP carrier to one local address. A server with
+  several addresses otherwise receives that IP protocol on all of them, and on a
+  box running a real GRE or IP-in-IP tunnel, most of that traffic is not ours.
+
+### Changed
+
+- The "two tunnels sharing a tunnel port" conflict rule now covers every carrier
+  with no ports of its own — icmp, bip, ipip, gre and the SPF icmp profile —
+  rather than ICMP alone. The reasoning was never specific to ICMP: a raw socket
+  for any IP protocol receives every packet of it.
+
+- The console's own checks now validate with the core built from the same tree.
+  They were using whatever core happened to be installed, which reported a
+  builder writing a key that core predates as the console's fault.
+
+### Note
+
+These carriers came from reading the configuration surface of Backhaul's IPX
+mode, which its own install script writes in plain text. The wire format above is
+this project's, built to fit this project's engine; nothing was taken from the
+compiled binary. What is deliberately *not* copied is the parts that measure
+worse: a 10 s/25 s heartbeat where this core uses 2 s/8 s, a plain FIFO queue
+where this one runs CoDel with an express class, no encryption at all on the
+stream transports, and a static pre-shared key with no forward secrecy where this
+core does an ephemeral X25519 exchange per connection.
+
 ## [2.9.1] — 2026-08-13
 
 Stability work on the packet carriers (TUN udp/icmp/bip and SPF). All of it comes

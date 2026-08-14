@@ -46,6 +46,8 @@ func assign(c *Config, key, val string) error {
 		c.Peer = unquote(val)
 	case "tun_mode":
 		c.TunMode = unquote(val)
+	case "listen_ip":
+		c.ListenIP = unquote(val)
 	case "spf_profile":
 		c.SpfProfile = unquote(val)
 	case "encapsulation":
@@ -254,6 +256,9 @@ func (c *Config) Marshal() string {
 	ki("tunnel_port", c.TunnelPort)
 	if c.IsTUN() {
 		kv("tun_mode", c.TunMode)
+		if c.ListenIP != "" {
+			kv("listen_ip", c.ListenIP)
+		}
 	}
 	if c.IsSPF() {
 		kv("spf_profile", c.SpfProfile)

@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.9.1"
+SCRIPT_VERSION="2.10.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -550,16 +550,24 @@ section_tun() {
     echo
     item 1 "TCP"  "reliable carrier — most compatible, best throughput"
     item 2 "UDP"  "datagram carrier — lower overhead, no carrier retransmits"
-    item 3 "ICMP" "inside ping packets — beta, needs CAP_NET_RAW"
-    item 4 "BIP"  "inside ICMPv6 — beta, needs CAP_NET_RAW and IPv6 on BOTH servers"
+    item 3 "ICMP" "inside ping packets — needs CAP_NET_RAW"
+    item 4 "BIP"  "inside ICMPv6 — needs CAP_NET_RAW and IPv6 on BOTH servers"
+    item 5 "IPIP" "inside IP-in-IP (protocol 4) — needs CAP_NET_RAW"
+    item 6 "GRE"  "inside GRE (protocol 47) — needs CAP_NET_RAW"
+    echo
+    note "IPIP and GRE are what site-to-site tunnels between routers are built"
+    note "from. A path that filters TCP and UDP, and polices ICMP, often leaves"
+    note "them alone — dropping them breaks ordinary infrastructure."
+    warn "Neither has ports, so open IP protocol 4 (IPIP) or 47 (GRE) between the"
+    warn "two servers if your provider filters by protocol."
     if ! host_has_ipv6; then
         echo; warn "This server has no global IPv6 address, so BIP cannot connect."
         note "BIP carries the link inside ICMPv6. Use ICMP for the same idea over IPv4."
     fi
     local c m
     while :; do
-        c="$(ask_choice "Method" "1" 1 2 3 4)"
-        case "$c" in 1) m=tcp;; 2) m=udp;; 3) m=icmp;; 4) m=bip;; esac
+        c="$(ask_choice "Method" "1" 1 2 3 4 5 6)"
+        case "$c" in 1) m=tcp;; 2) m=udp;; 3) m=icmp;; 4) m=bip;; 5) m=ipip;; 6) m=gre;; esac
         [ "$m" = "bip" ] && ! host_has_ipv6 && {
             bad "No global IPv6 on this server — BIP would retry forever."
             yesno "Choose a different method?" "y" && continue

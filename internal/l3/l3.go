@@ -158,6 +158,12 @@ func (e *Engine) buildCarrier(cfg *config.Config, log *logx.Logger) error {
 			return err
 		}
 		e.ldialer, e.llistener = d, l
+	case config.TunModeIPIP, config.TunModeGRE:
+		d, l, err := newIPXCarrier(e.mode, cfg, e.isDialer, e.cipher, log)
+		if err != nil {
+			return err
+		}
+		e.ldialer, e.llistener = d, l
 	case "spf":
 		d, l, err := newSPFRawCarrier(cfg, e.isDialer, e.cipher)
 		if err != nil {

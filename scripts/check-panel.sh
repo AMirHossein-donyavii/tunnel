@@ -79,8 +79,12 @@ if [ -x "$CORE_BIN" ] && command -v timeout >/dev/null; then
     trap 'rm -rf "$tmp"' EXIT
     harness="$tmp/panel.sh"
     awk '/^# ---- non-interactive entry points/{exit} {print}' "$PANEL" > "$harness"
+    # The console validates with the core it finds installed; under test that
+    # must be the core built from THIS tree, or a builder writing a key the
+    # installed core predates is reported as the console's fault.
     sed -i -e "s|^CONF_DIR=.*|CONF_DIR=\"$tmp/etc\"|" \
-           -e "s|^WG_DIR=.*|WG_DIR=\"$tmp/wg\"|" "$harness"
+           -e "s|^WG_DIR=.*|WG_DIR=\"$tmp/wg\"|" \
+           -e "s|^CORE=.*|CORE=\"$(cd "$(dirname "$CORE_BIN")" \&\& pwd)/$(basename "$CORE_BIN")\"|" "$harness"
     cat >> "$harness" <<'STUB'
 systemctl() { return 0; }
 port_in_use() { return 1; }
@@ -110,6 +114,24 @@ STUB
     # existed, was reachable, and ran — it just left out half its job.
     # users' port, the Foreign server's WireGuard port, name, tunnel port
     drive wg_vpn_entry     51820 51999 t-wgvpn 11238
+    # The TUN section builds the raw-IP carriers; each method is a different
+    # data plane, so each is driven. method, name, role, tunnel port, peer,
+    # tun subnet defaults, forwards, proxy-protocol answer.
+    drive_tun() { # drive_tun <method-number> <name>
+        local n="$1" nm="$2"
+        rm -rf "$tmp/etc"; mkdir -p "$tmp/etc"
+        printf '%s\n' "$n" "$nm" 2 11250 203.0.113.9 "" "" "" \
+            | timeout 25 bash -c "source $harness; section_tun" >"$tmp/out.tun$n" 2>&1
+        local f; f="$(ls "$tmp"/etc/*.toml 2>/dev/null | head -1)"
+        if [ -n "$f" ] && "$CORE_BIN" validate --config "$f" >/dev/null 2>&1; then
+            good "TUN method $n ($nm) writes a config the core accepts"
+        else
+            bad "TUN method $n ($nm) did not produce a valid config"
+        fi
+    }
+    drive_tun 5 t-ipip
+    drive_tun 6 t-gre
+
     # listen port here, Iran IP, users' port there, tunnel port, client count, name
     if command -v wg >/dev/null; then
         drive wg_vpn_exit  51999 203.0.113.9 51820 11239 1 t-wgvpn

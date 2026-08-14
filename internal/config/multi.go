@@ -288,17 +288,18 @@ func FindConflicts(c *Config, others []*Config) []Conflict {
 		// the same remote tunnel.
 		if c.TunnelPort > 0 && c.TunnelPort == o.TunnelPort {
 			switch {
-			// ICMP has no ports, so nothing binds this and the usual reasoning
-			// does not apply. Every raw ICMP socket on the host receives every
-			// ICMP packet, and the tunnel port is what each frame carries so a
-			// tunnel can tell its own traffic from its neighbour's. Two ICMP
-			// tunnels sharing one are therefore indistinguishable to each other
-			// whichever way round their roles are — each answers the other's
-			// peer, and both carry two interleaved ciphertext streams.
-			case c.UsesICMPCarrier() && o.UsesICMPCarrier():
+			// A raw-IP carrier has no ports, so nothing binds this and the usual
+			// reasoning does not apply. Every raw socket for that protocol on the
+			// host receives every packet of it, and the tunnel port is what each
+			// frame carries so a tunnel can tell its own traffic from its
+			// neighbour's. Two such tunnels sharing one are indistinguishable to
+			// each other whichever way round their roles are — each answers the
+			// other's peer, and both carry two interleaved ciphertext streams.
+			case c.UsesRawIPCarrier() && o.UsesRawIPCarrier():
 				add("tunnel_port", fmt.Sprint(c.TunnelPort), o.Name,
-					"ICMP has no ports, so this is the only thing telling the two apart — "+
-						"sharing it makes each tunnel read the other's traffic; give them different tunnel ports")
+					"this carrier has no ports, so the tunnel port is the only thing telling "+
+						"the two apart — sharing it makes each tunnel read the other's traffic; "+
+						"give them different tunnel ports")
 			case !c.IsDialer() && !o.IsDialer():
 				add("tunnel_port", fmt.Sprint(c.TunnelPort), o.Name,
 					"both tunnels listen on this port — the second will fail to bind")

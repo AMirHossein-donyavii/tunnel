@@ -43,7 +43,10 @@ type Config struct {
 	Mode       string `toml:"mode"`
 	Peer       string `toml:"peer"`        // remote host the dialer connects to
 	TunnelPort int    `toml:"tunnel_port"` // server<->server link port (same on both sides)
-	TunMode    string `toml:"tun_mode"`    // TUN carrier: tcp | udp | icmp | bip
+	TunMode    string `toml:"tun_mode"`    // TUN carrier: tcp | udp | icmp | bip | ipip | gre
+	// ListenIP binds a raw-IP carrier to one local address. A server with
+	// several addresses otherwise receives that IP protocol on all of them.
+	ListenIP string `toml:"listen_ip"`
 	// SPF (TUN + IPX-style encapsulation with source-IP spoofing) settings.
 	SpfProfile    string `toml:"spf_profile"`   // SPF carrier: icmp | tcp
 	Encapsulation string `toml:"encapsulation"` // SPF: "ipx"
@@ -225,17 +228,23 @@ func (c *Config) IsSPF() bool { return c.Engine == EngineSPF }
 // UsesL3 reports whether the engine is built on the L3/TUN data plane.
 func (c *Config) UsesL3() bool { return c.IsTUN() || c.IsSPF() }
 
-// UsesICMPCarrier reports whether the link between the two servers rides inside
-// ICMP echo messages — the TUN icmp and bip modes, and the SPF icmp profile.
+// UsesRawIPCarrier reports whether the link between the two servers rides
+// directly on an IP protocol with no ports of its own — the TUN icmp, bip, ipip
+// and gre modes, and the SPF icmp profile.
 //
-// These share a property no other carrier has: ICMP has no ports, and a raw
-// ICMP socket receives a copy of every ICMP packet the host receives, so two
-// such tunnels on one server see all of each other's traffic. What separates
-// them is the tunnel port carried inside each frame, which makes two of them
-// sharing a tunnel port a real clash even though nothing binds it.
-func (c *Config) UsesICMPCarrier() bool {
+// These share a property no other carrier has: a raw socket for an IP protocol
+// receives a copy of every packet of that protocol the host receives, because
+// there is no port to select on. Two such tunnels on one server therefore see
+// all of each other's traffic, and what separates them is the tunnel port
+// carried inside each frame — which makes two of them sharing a tunnel port a
+// real clash even though nothing binds it.
+func (c *Config) UsesRawIPCarrier() bool {
 	if c.IsTUN() {
-		return c.TunMode == TunModeICMP || c.TunMode == TunModeBIP
+		switch c.TunMode {
+		case TunModeICMP, TunModeBIP, TunModeIPIP, TunModeGRE:
+			return true
+		}
+		return false
 	}
 	if c.IsSPF() {
 		return c.SpfProfile != SpfProfileTCP
@@ -249,6 +258,11 @@ const (
 	TunModeUDP  = "udp"  // UDP datagrams (low overhead)
 	TunModeICMP = "icmp" // inside ICMP echo (IPv4) — beta, needs CAP_NET_RAW
 	TunModeBIP  = "bip"  // inside ICMPv6 echo — beta, needs CAP_NET_RAW
+	// The raw-IP carriers. Neither has ports, and both are what site-to-site
+	// tunnels between routers are built from, so a path that filters TCP and UDP
+	// and polices ICMP often leaves them alone. See internal/l3/ipx.go.
+	TunModeIPIP = "ipip" // inside IP-in-IP (protocol 4) — needs CAP_NET_RAW
+	TunModeGRE  = "gre"  // inside GRE (protocol 47) — needs CAP_NET_RAW
 )
 
 // SPF carrier profiles.
@@ -266,6 +280,10 @@ func TunModeName(m string) string {
 		return "ICMP"
 	case TunModeBIP:
 		return "BIP (ICMPv6)"
+	case TunModeIPIP:
+		return "IP-in-IP"
+	case TunModeGRE:
+		return "GRE"
 	default:
 		return "TCP"
 	}
@@ -371,11 +389,18 @@ func (c *Config) Validate() error {
 // and the peer/heartbeat settings.
 func (c *Config) validateTUN() error {
 	switch c.TunMode {
-	case TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP:
+	case TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP, TunModeIPIP, TunModeGRE:
 	case "":
 		c.TunMode = TunModeTCP
 	default:
-		return fmt.Errorf("tun_mode must be tcp, udp, icmp or bip, got %q", c.TunMode)
+		return fmt.Errorf("tun_mode must be tcp, udp, icmp, bip, ipip or gre, got %q", c.TunMode)
+	}
+	// A raw-IP carrier binds one local address at most; a bad one fails at
+	// socket-creation time with a message about the address, not the config.
+	if c.ListenIP != "" {
+		if net.ParseIP(strings.TrimSpace(c.ListenIP)) == nil {
+			return fmt.Errorf("listen_ip %q is not an IP address", c.ListenIP)
+		}
 	}
 	// bip carries the link inside ICMPv6, so the peer address it dials must be
 	// IPv6. Catching an IPv4 literal here turns a permanent reconnect loop —
