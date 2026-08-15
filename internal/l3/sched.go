@@ -60,24 +60,20 @@ const (
 	// first, so this is only a guard against a flood of tiny packets.
 	expressCap = 512
 
-	// maxQueueDelay is a hard ceiling on how long a bulk packet may sit before it
-	// is thrown away, whatever CoDel is doing.
+	// There is deliberately no hard ceiling on bulk queueing delay here.
 	//
-	// CoDel controls the queue by *rate* of dropping, and its control law ramps
-	// up: the first drop happens an interval after the queue goes over target,
-	// and the drop rate climbs as the square root of the count. That is the right
-	// behaviour for a transient, and it converges — but while it converges the
-	// queue can be far deeper than target, and how deep depends on how much room
-	// the ring gives it. Raising the ring to hold a long path's burst therefore
-	// raised the worst case too: 4096 packets is five megabytes, which at
-	// 120 Mbit is a third of a second of standing delay before CoDel catches up.
+	// One was added and removed again. It dropped any bulk packet older than a
+	// fixed age at dequeue, which sounds like a bound on latency and is in fact a
+	// way to destroy the whole queue: the check ran in a loop, so the first pop
+	// after the queue had ever been backed up past the ceiling discarded every
+	// packet in it, and then did the same on the next pop. Inner TCP retransmits
+	// what was lost, the queue refills, and it is purged again — measured on a
+	// real path at 3 Mbit/s where the same tunnel without it did 121.
 	//
-	// This bounds that in time rather than in bytes, which is what actually
-	// matters: a byte cap is a different amount of delay at every rate, while a
-	// delay cap is the same promise at all of them. Past this a packet is stale —
-	// the sender has already decided it was lost — so delivering it costs
-	// bandwidth and helps nobody.
-	maxQueueDelay = 150 * time.Millisecond
+	// CoDel already bounds the *standing* queue, and it does it by dropping at a
+	// rate rather than in bulk, which is the difference between a congestion
+	// signal and a wipe. If the standing queue is still too deep, the answer is
+	// in how CoDel is driven — not a second dropper competing with it.
 )
 
 // classifier thresholds.
@@ -277,13 +273,6 @@ func (q *txQueue) pop() *pbuf {
 	}
 
 	p := q.codelDequeue(now)
-	// The ceiling, applied after CoDel rather than instead of it: CoDel is what
-	// signals congestion gently, and this is only the backstop for the window
-	// while its control law is still ramping.
-	for p != nil && now-p.enq > int64(maxQueueDelay) {
-		q.dropLocked(p)
-		p = q.codelDequeue(now)
-	}
 	q.stats.depth.Store(int64(q.express.len() + q.bulk.len()))
 	return p
 }

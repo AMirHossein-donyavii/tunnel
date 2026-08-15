@@ -64,7 +64,7 @@ ET_LOCAL="${ET_LOCAL:-}"
 # after a fix can be handed the previous copy and hit a bug that is already
 # fixed — with no way to tell from the output that this is what happened.
 # Compared against the sources at startup; see check_installer_age.
-INSTALLER_VERSION="2.13.0"
+INSTALLER_VERSION="2.13.1"
 ET_GO_VERSION="${ET_GO_VERSION:-1.22.5}"
 
 PREFIX="/usr/local/bin"

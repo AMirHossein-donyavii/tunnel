@@ -4,6 +4,32 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.13.1] — 2026-08-14
+
+### Fixed
+
+- **Reverted the queueing-delay ceiling added in 2.13.0. It cut throughput from
+  121 Mbit/s to 3.** The ceiling dropped any bulk packet older than 150 ms at
+  dequeue, in a loop. Each drop looks reasonable alone; the loop meant the first
+  dequeue after the queue had ever been backed up past the ceiling discarded
+  every packet in it — and the next dequeue did the same to whatever inner TCP
+  had just retransmitted. Purge, retransmit, refill, purge.
+
+  The tests shipped with it asserted that stale packets were dropped, which is
+  what the code did, so they passed. Two tests now assert the property that was
+  actually violated: one dequeue returns one packet and removes at most a
+  bounded few however far behind the queue is, and a stalled carrier coming back
+  drains its backlog rather than throwing it away. Both fail on 2.13.0's code
+  ("one dequeue removed 2000 of 2000 queued packets") and pass on this one.
+
+  CoDel already bounds the standing queue, and it does so by dropping at a *rate*
+  — which is the difference between a congestion signal and a wipe. If the
+  standing queue is still too deep, the fix is in how CoDel is driven, not a
+  second dropper competing with it.
+
+The automatic restart of tunnels on upgrade, also from 2.13.0, is unaffected and
+stays.
+
 ## [2.13.0] — 2026-08-14
 
 ### Fixed
