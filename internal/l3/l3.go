@@ -51,6 +51,7 @@ type Engine struct {
 	sndbuf, rcvbuf int
 	batchSize      int
 	channelSize    int
+	stripe         bool // spread one queue's packets over every link
 	pktLen         int // max bytes read from a TUN queue
 	hbInterval     time.Duration
 	hbTimeout      time.Duration
@@ -109,6 +110,7 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 		// regardless of the configured depth.
 		batchSize:   orDefault(cfg.BatchSize, 64),
 		channelSize: orDefault(cfg.ChannelSize, channelDefault(cfg.Profile)),
+		stripe:      cfg.Stripe != config.StripeFlow,
 		pktLen:      cfg.MTU + 4,
 		hbInterval:  time.Duration(orDefault(cfg.HeartbeatInterval, config.DefaultHeartbeatSec)) * time.Second,
 		hbTimeout:   time.Duration(orDefault(cfg.HeartbeatTimeout, config.DefaultHeartbeatTimeoutSec)) * time.Second,
@@ -218,8 +220,12 @@ func (e *Engine) Run(ctx context.Context) error {
 	if e.cfg.IsSPF() {
 		label, carrier = "SPF", e.cfg.SpfProfile+"+spoof"
 	}
-	e.log.Info("%s tunnel starting: iface=%s addr=%s mtu=%d queues=%d carrier=%s cipher=%s role=%s dialer=%v",
-		label, dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, carrier, e.cfg.Cipher, e.cfg.Role, e.isDialer)
+	stripe := "flow (one link per queue)"
+	if e.stripe {
+		stripe = "packet (every link carries every queue)"
+	}
+	e.log.Info("%s tunnel starting: iface=%s addr=%s mtu=%d queues=%d carrier=%s cipher=%s role=%s dialer=%v stripe=%s",
+		label, dev.Name(), e.cfg.TunIP, dev.MTU(), e.queues, carrier, e.cfg.Cipher, e.cfg.Role, e.isDialer, stripe)
 	e.log.Debug("tuning: batch=%d channel=%d hb=%s/%s sndbuf=%d rcvbuf=%d",
 		e.batchSize, e.channelSize, e.hbInterval, e.hbTimeout, e.sndbuf, e.rcvbuf)
 
@@ -239,11 +245,16 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	// One persistent reader per queue feeds a priority + AQM scheduler. This
 	// survives link reconnects without leaking a blocked TUN read.
-	txQueues := make([]*txQueue, e.queues)
+	//
+	// Whether those readers feed one scheduler or one each is the whole of link
+	// striping. With one shared queue every link drains every TUN queue, so a
+	// single TCP stream is carried by all the links at once instead of the one
+	// its flow hashed onto; with a queue each, the pairing is fixed. The shared
+	// queue is sized to the same total depth as the separate ones would have
+	// been, so striping changes where packets can go, not how many may wait.
+	txQueues := e.buildTxQueues()
 	var readers sync.WaitGroup
 	for i := 0; i < e.queues; i++ {
-		txQueues[i] = newTxQueueAQM(e.channelSize, e.cfg.MTU, e.pool, &e.qstats,
-			e.cfg.AQM != config.AQMOff)
 		readers.Add(1)
 		go func(i int) { defer readers.Done(); e.queueReader(ctx, dev.Queues()[i], txQueues[i]) }(i)
 	}
@@ -411,6 +422,25 @@ func ipOnly(cidr string) string {
 // It lives for the whole run and hands each packet to the scheduler in the
 // pooled buffer it was read into — no per-packet allocation and no copy.
 // Admission control, classification and drops are the scheduler's job.
+// buildTxQueues returns one scheduler per TUN queue, or — when striping — the
+// same scheduler for all of them, sized to the depth the separate ones would
+// have had between them.
+func (e *Engine) buildTxQueues() []*txQueue {
+	qs := make([]*txQueue, e.queues)
+	aqmOn := e.cfg.AQM != config.AQMOff
+	if e.stripe {
+		shared := newTxQueueAQM(e.channelSize*e.queues, e.cfg.MTU, e.pool, &e.qstats, aqmOn)
+		for i := range qs {
+			qs[i] = shared
+		}
+		return qs
+	}
+	for i := range qs {
+		qs[i] = newTxQueueAQM(e.channelSize, e.cfg.MTU, e.pool, &e.qstats, aqmOn)
+	}
+	return qs
+}
+
 func (e *Engine) queueReader(ctx context.Context, q queue, tq *txQueue) {
 	for {
 		p := e.pool.get()

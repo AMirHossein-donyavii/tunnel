@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.13.4"
+SCRIPT_VERSION="2.14.0"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"
@@ -418,6 +418,12 @@ optimise() {
       tun)
         cfg_set engine tun
         cfg_set tun_queues "${CFG[pool]}"     # queues must equal links, both ends
+        # Spread every stream over all the links. Transit on this route polices
+        # each connection separately, so one link has a fixed ceiling however
+        # fast the path is; pinning a stream to one link hands it that ceiling
+        # and leaves the rest idle. Set stripe = "flow" by hand on a path that
+        # is not policed, where reordering costs more than the ceiling does.
+        cfg_set stripe packet
         case "$proto" in
           tcp)  cfg_set mtu 1400 ;;           # stream carrier re-segments
           *)    cfg_set mtu 1320 ;;           # datagram carrier: leave header room
@@ -459,6 +465,7 @@ show_tuning() {
     kv "Parallel links" "${CFG[pool]}"
     [ -n "${CFG[mtu]:-}" ]          && kv "MTU"          "${CFG[mtu]}"
     [ -n "${CFG[channel_size]:-}" ] && kv "Queue depth"  "${CFG[channel_size]} packets (latency-first)"
+    [ "${CFG[stripe]:-}" = "packet" ] && kv "Link striping" "every stream uses all ${CFG[pool]} links"
     note "Heartbeats, socket buffers and frame sizing are left to the core so"
     note "future tuning improvements reach this tunnel without an edit."
 }

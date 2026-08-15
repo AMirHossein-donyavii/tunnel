@@ -58,6 +58,8 @@ func assign(c *Config, key, val string) error {
 		c.Iface = unquote(val)
 	case "aqm":
 		c.AQM = unquote(val)
+	case "stripe":
+		c.Stripe = unquote(val)
 	case "spoof_src_ip":
 		c.SpoofSrcIP = unquote(val)
 	case "spoof_dst_ip":

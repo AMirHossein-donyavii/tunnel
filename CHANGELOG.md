@@ -4,6 +4,64 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.14.0] — 2026-08-15
+
+This one is measured, not reasoned about. A whole Iran↔Europe path now exists as
+a script — `scripts/et-lab.sh` — that builds both halves of a tunnel in network
+namespaces with a userspace relay in between adding delay, loss and policing.
+Every number below comes out of it and can be re-run by anyone.
+
+The first thing it settled is what the tunnel was *not* doing wrong. On a 140 ms
+path with nothing in the way it carries 500–590 Mbit/s; on a directly connected
+link every carrier — udp, icmp, ipip, gre — runs at 1.07–1.19 Gbit/s, and 890
+Mbit/s of that survives pinning each half to a single CPU core. Neither the data
+plane, the encapsulation, nor the cipher was the ceiling anyone was hitting.
+
+### Added
+
+- **Link striping: one stream now uses every carrier link, not one of them.**
+
+  The engine paired each TUN queue with one carrier link. A single TCP
+  connection hashes onto one queue, so it rode one link and the other three sat
+  idle. That is invisible on a path with spare capacity, and decisive on this
+  route, where transit commonly polices each connection separately: one link
+  gets a fixed ceiling however fast the path is, and a download gets that
+  ceiling instead of the path's.
+
+  Reproduced in the lab, with each carrier link policed at 100 Mbit/s on a
+  140 ms path, one TCP stream through the tunnel:
+
+  | | one stream | four streams |
+  |---|---|---|
+  | one link per queue (`stripe = "flow"`) | 87 Mbit/s | 266 Mbit/s |
+  | every link per stream (`stripe = "packet"`, new default) | **299 Mbit/s** | — |
+
+  The 87 Mbit/s figure is not a coincidence: it is the ~90 Mbit/s a single
+  iperf3 stream was measuring on the real path while four streams together went
+  much faster, which is the signature of exactly this and of nothing else.
+
+  Striping is the default (`stripe = "packet"`). It costs something and the cost
+  is honest: packets take links that drain at slightly different rates, so some
+  arrive out of order and inner TCP retransmits a few it did not need to. On an
+  *unpoliced* 140 ms path that is worth about 20% — 590 → 472 Mbit/s — and on a
+  directly connected link 2.5%, which is what says the cost is reordering rather
+  than contention. Set `stripe = "flow"` to restore the old pairing on a path
+  where nothing is policing you. Round-trip time is unchanged either way
+  (141.7 ms vs 141.8 ms in the lab), so this buys throughput without adding
+  queueing delay.
+
+  Internally this is one shared scheduler instead of one per queue, sized to the
+  same total depth so striping changes where packets may go and not how many may
+  wait, plus a wakeup that is passed on while work remains — without that, a
+  burst wakes one link and the rest sleep beside a full queue, which is the
+  failure this feature exists to avoid, so there is a test that fails on it.
+
+- **`scripts/et-lab.sh`, and `cmd/et-lab-wan` / `cmd/et-lab-tp` behind it.**
+  Delay, one-way loss, a bandwidth ceiling applied either in total or per
+  carrier link, any encapsulation, any number of concurrent streams. It needs
+  root and `/dev/net/tun` and nothing else — not even netem, which is missing
+  from most containers and cannot express per-connection policing anyway.
+
 ## [2.13.4] — 2026-08-15
 
 ### Fixed

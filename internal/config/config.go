@@ -79,6 +79,26 @@ type Config struct {
 	// than argued about.
 	AQM string `toml:"aqm"`
 
+	// Stripe decides how a packet chooses which carrier link carries it:
+	// "packet" (default) spreads every queue's packets across all of them,
+	// "flow" pins one TUN queue to one link the way this engine always did.
+	//
+	// This is the setting that decides single-stream speed on a policed path,
+	// and it is worth being precise about why. Transit on this route commonly
+	// polices each connection separately, so one carrier link gets a fixed
+	// ceiling no matter how much capacity the path has. Pinning a TUN queue to
+	// one link hands a single download that one link's ceiling and leaves the
+	// other links idle — measured in the lab at 88 Mbit/s for one stream while
+	// four streams together carried 266 Mbit/s over the same tunnel, because
+	// only the four could reach the other three links.
+	//
+	// Striping per packet gives one stream all of them. The cost is reordering:
+	// links drain at slightly different rates, so packets can arrive out of
+	// order and inner TCP retransmits some it did not need to. That is a real
+	// cost and it is why "flow" stays available for a path where reordering
+	// hurts more than the ceiling does.
+	Stripe string `toml:"stripe"`
+
 	// Iface binds a raw-IP carrier's socket to one network device. On a server
 	// with several, the socket otherwise receives that IP protocol from all of
 	// them.
@@ -305,6 +325,10 @@ const (
 	// Queue-management disciplines. See Config.AQM.
 	AQMCodel = "codel"
 	AQMOff   = "off"
+
+	// Link-striping disciplines. See Config.Stripe.
+	StripePacket = "packet"
+	StripeFlow   = "flow"
 )
 
 // SPF carrier profiles.
@@ -471,6 +495,13 @@ func (c *Config) normaliseTunCarrier() error {
 	case AQMOff:
 	default:
 		return fmt.Errorf(`aqm must be "codel" or "off", got %q`, c.AQM)
+	}
+	switch c.Stripe {
+	case "", StripePacket:
+		c.Stripe = StripePacket
+	case StripeFlow:
+	default:
+		return fmt.Errorf(`stripe must be "packet" or "flow", got %q`, c.Stripe)
 	}
 	if c.IcmpType < 0 || c.IcmpType > 255 {
 		return fmt.Errorf("icmp_type out of range (0..255): %d", c.IcmpType)

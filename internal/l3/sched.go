@@ -289,6 +289,7 @@ func (q *txQueue) pop() *pbuf {
 		}
 		if now-p.enq <= int64(expressStale) || q.express.len() == 0 {
 			q.stats.depth.Store(int64(q.express.len() + q.bulk.len()))
+			q.wakeIfWork()
 			return p
 		}
 		q.dropStale(p)
@@ -303,7 +304,24 @@ func (q *txQueue) pop() *pbuf {
 		p = q.codelDequeue(now)
 	}
 	q.stats.depth.Store(int64(q.express.len() + q.bulk.len()))
+	q.wakeIfWork()
 	return p
+}
+
+// wakeIfWork hands the wakeup on to another consumer when packets remain.
+//
+// push() signals through a channel of capacity one, which is all a single
+// consumer needs: it drains until the queue is empty and only then waits again.
+// Striping puts one consumer per link on the same queue, and there the single
+// token is not enough — a burst of pushes collapses into one wakeup, one link
+// wakes, and the rest keep sleeping next to a full queue, which is the opposite
+// of what striping is for. Re-arming after a successful pop passes the wakeup
+// along, so every idle link joins in. It is called with q.mu held; wake() never
+// blocks.
+func (q *txQueue) wakeIfWork() {
+	if q.express.len()+q.bulk.len() > 0 {
+		q.wake()
+	}
 }
 
 func (q *txQueue) dropLocked(p *pbuf) {
