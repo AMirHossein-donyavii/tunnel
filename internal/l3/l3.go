@@ -289,8 +289,9 @@ func (e *Engine) healthReport(ctx context.Context) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 
-	var prev Stats
+	var prev, prev0 Stats
 	prev = e.Snapshot().(Stats)
+	prev0 = prev
 	for {
 		select {
 		case <-ctx.Done():
@@ -314,11 +315,24 @@ func (e *Engine) healthReport(ctx context.Context) {
 		bad := d(cur.BadFrames, prev.BadFrames)
 		dupIn := d(cur.DupDropped, prev.DupDropped)
 		dupOut := d(cur.DupSent, prev.DupSent)
-		prev = cur
+		prev, prev0 = cur, prev
 
-		if reconnects == 0 && tunErrs == 0 && sockErrs == 0 && demux == 0 &&
-			aqm == 0 && full == 0 && stale == 0 && bad == 0 {
-			continue // nothing worth a line
+		txB := d(cur.TxBytes, prev0.TxBytes)
+		rxB := d(cur.RxBytes, prev0.RxBytes)
+
+		// A minute in which the tunnel carried nothing used to print nothing,
+		// because every counter was zero — which is the same silence as a minute
+		// in which nobody used it. Those are opposite situations and the second
+		// one is the failure that matters most: links up, heartbeats flowing,
+		// and not a byte of traffic getting through.
+		//
+		// So the line always appears while there is a live link, and it always
+		// carries the throughput. Nothing to report now reads as
+		// "tx=0 rx=0 links=4", which is unmistakable.
+		quiet := reconnects == 0 && tunErrs == 0 && sockErrs == 0 && demux == 0 &&
+			aqm == 0 && full == 0 && stale == 0 && bad == 0
+		if quiet && cur.LiveLinks == 0 {
+			continue // nothing is connected; the pump logs that itself
 		}
 		// Both duplicate counters are reported as they are. They used to be
 		// subtracted from each other to guess how many copies the path had
@@ -331,12 +345,31 @@ func (e *Engine) healthReport(ctx context.Context) {
 		if dupOut > 0 || dupIn > 0 {
 			dup = fmt.Sprintf(" dup_sent=%d dup_recv=%d", dupOut, dupIn)
 		}
-		e.log.Info("last %s: reconnects=%d tun_refused=%d socket_refused=%d "+
-			"demux_dropped=%d aqm_dropped=%d queue_full=%d stale=%d bad_frames=%d "+
-			"rtt=%.1fms%s",
-			every, reconnects, tunErrs, sockErrs, demux, aqm, full, stale, bad,
-			cur.RTTMs, dup)
+		e.log.Info("last %s: tx=%s rx=%s links=%d rtt=%.1fms | reconnects=%d "+
+			"tun_refused=%d socket_refused=%d demux_dropped=%d aqm_dropped=%d "+
+			"queue_full=%d stale=%d bad_frames=%d queued=%d%s",
+			every, rate(txB, every), rate(rxB, every), cur.LiveLinks, cur.RTTMs,
+			reconnects, tunErrs, sockErrs, demux, aqm, full, stale, bad,
+			cur.QueueDepth, dup)
 	}
+}
+
+// rate renders bytes over a window as a human-readable bit rate. Zero is
+// rendered as a plain "0" so a dead minute is impossible to misread.
+func rate(bytes uint64, over time.Duration) string {
+	if bytes == 0 {
+		return "0"
+	}
+	bits := float64(bytes) * 8 / over.Seconds()
+	switch {
+	case bits >= 1e9:
+		return fmt.Sprintf("%.2fGbit/s", bits/1e9)
+	case bits >= 1e6:
+		return fmt.Sprintf("%.1fMbit/s", bits/1e6)
+	case bits >= 1e3:
+		return fmt.Sprintf("%.1fkbit/s", bits/1e3)
+	}
+	return fmt.Sprintf("%.0fbit/s", bits)
 }
 
 // logConnected emits the single, clear "connected" line when the first link of

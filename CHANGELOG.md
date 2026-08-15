@@ -4,6 +4,27 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.13.4] — 2026-08-15
+
+### Fixed
+
+- **A minute in which the tunnel carried nothing printed no health line at all.**
+  The line only appeared when some counter was non-zero, so a minute where every
+  counter was zero looked identical to a minute nobody used the tunnel. Those are
+  opposite situations, and the second is the failure that matters most: links up,
+  heartbeats flowing, and not a byte of traffic getting through — which is what a
+  transfer that collapses mid-run looks like from the server, and the log said
+  nothing about it at all.
+
+  The line now appears once a minute whenever a link is live, and always carries
+  the throughput and the live link count:
+
+      last 1m0s: tx=120.0Mbit/s rx=3.1Mbit/s links=4 rtt=140.2ms | reconnects=0 …
+
+  A dead minute reads `tx=0 rx=0 links=4`, which cannot be mistaken for an idle
+  one. The queue depth is reported too, so a tunnel that is up and not draining
+  is visible as it happens.
+
 ## [2.13.3] — 2026-08-15
 
 Both of these are fixes to the diagnostic itself. It was being used to find a

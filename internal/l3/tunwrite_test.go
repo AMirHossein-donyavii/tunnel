@@ -129,3 +129,27 @@ func TestAPermanentlyFailingDeviceStillEndsTheLink(t *testing.T) {
 		t.Fatal("the reader never gave up on a device that fails every write")
 	}
 }
+
+// A minute in which the tunnel carried nothing used to print no health line at
+// all, because every counter was zero — the same silence as a minute nobody
+// used it. Those are opposite situations, and the second is the failure that
+// matters most: links up, heartbeats flowing, not a byte getting through. That
+// is what a collapsed transfer looks like from the server, and the log said
+// nothing about it.
+func TestTheHealthLineRendersADeadMinuteUnmistakably(t *testing.T) {
+	if got := rate(0, time.Minute); got != "0" {
+		t.Fatalf("a minute carrying nothing renders as %q, want a plain \"0\"", got)
+	}
+	for _, tc := range []struct {
+		bytes uint64
+		want  string
+	}{
+		{15e6 * 60, "120.0Mbit/s"}, // 15 MB/s, the rate measured on the real path
+		{1250000 * 60, "10.0Mbit/s"},
+		{125e6 * 60, "1.00Gbit/s"},
+	} {
+		if got := rate(tc.bytes, time.Minute); got != tc.want {
+			t.Errorf("rate(%d) = %q, want %q", tc.bytes, got, tc.want)
+		}
+	}
+}
