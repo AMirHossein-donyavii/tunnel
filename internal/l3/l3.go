@@ -308,25 +308,34 @@ func (e *Engine) healthReport(ctx context.Context) {
 		tunErrs := d(cur.TunWriteErrors, prev.TunWriteErrors)
 		sockErrs := d(cur.CarrierWriteErrors, prev.CarrierWriteErrors)
 		demux := d(cur.CarrierDropped, prev.CarrierDropped)
-		aqm := d(cur.TxDropped, prev.TxDropped)
+		aqm := d(cur.AQMDropped, prev.AQMDropped)
+		full := d(cur.QueueFull, prev.QueueFull)
+		stale := d(cur.StaleDropped, prev.StaleDropped)
 		bad := d(cur.BadFrames, prev.BadFrames)
-		dups := d(cur.DupDropped, prev.DupDropped)
-		sent := d(cur.DupSent, prev.DupSent)
+		dupIn := d(cur.DupDropped, prev.DupDropped)
+		dupOut := d(cur.DupSent, prev.DupSent)
 		prev = cur
 
-		if reconnects == 0 && tunErrs == 0 && sockErrs == 0 && demux == 0 && aqm == 0 && bad == 0 {
+		if reconnects == 0 && tunErrs == 0 && sockErrs == 0 && demux == 0 &&
+			aqm == 0 && full == 0 && stale == 0 && bad == 0 {
 			continue // nothing worth a line
 		}
-		// A duplicate that did NOT arrive is a frame the path lost and the second
-		// copy covered, which is the most useful loss estimate available without
-		// instrumenting the peer.
-		covered := ""
-		if sent > 0 {
-			covered = fmt.Sprintf(" small-frame copies sent=%d, needed=%d", sent, sent-dups)
+		// Both duplicate counters are reported as they are. They used to be
+		// subtracted from each other to guess how many copies the path had
+		// needed, which is not a subtraction that means anything: one counts
+		// copies this side SENT and the other counts copies this side RECEIVED
+		// and discarded. Those are different directions at different rates, and
+		// on an unsigned counter the subtraction wrapped — which is how a health
+		// line came to report 18446744073709549315.
+		dup := ""
+		if dupOut > 0 || dupIn > 0 {
+			dup = fmt.Sprintf(" dup_sent=%d dup_recv=%d", dupOut, dupIn)
 		}
 		e.log.Info("last %s: reconnects=%d tun_refused=%d socket_refused=%d "+
-			"demux_dropped=%d aqm_dropped=%d bad_frames=%d rtt=%.1fms%s",
-			every, reconnects, tunErrs, sockErrs, demux, aqm, bad, cur.RTTMs, covered)
+			"demux_dropped=%d aqm_dropped=%d queue_full=%d stale=%d bad_frames=%d "+
+			"rtt=%.1fms%s",
+			every, reconnects, tunErrs, sockErrs, demux, aqm, full, stale, bad,
+			cur.RTTMs, dup)
 	}
 }
 
@@ -789,8 +798,14 @@ type Stats struct {
 	ExpressPackets uint64 `json:"express_packets"`
 	BulkPackets    uint64 `json:"bulk_packets"`
 	TxDropped      uint64 `json:"tx_dropped"`
-	QueueDepth     int64  `json:"queue_depth"`
-	BadFrames      uint64 `json:"bad_frames"`
+	// The three reasons a transmit-queue drop happens, apart. AQM dropping is
+	// the system signalling congestion and is healthy; a full ring is the system
+	// out of room; a stale express packet was overtaken by a fresher one.
+	AQMDropped   uint64 `json:"aqm_dropped"`
+	QueueFull    uint64 `json:"queue_full_dropped"`
+	StaleDropped uint64 `json:"stale_dropped"`
+	QueueDepth   int64  `json:"queue_depth"`
+	BadFrames    uint64 `json:"bad_frames"`
 
 	// What follows is here because "the tunnel is unstable" is unanswerable
 	// without it. Each of these is a distinct cause with a distinct fix, and

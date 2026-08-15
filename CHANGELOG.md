@@ -4,6 +4,30 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.13.3] — 2026-08-15
+
+Both of these are fixes to the diagnostic itself. It was being used to find a
+throughput problem and it was giving wrong answers.
+
+### Fixed
+
+- **The health line reported `needed=18446744073709549315`.** It subtracted two
+  duplicate counters from each other to guess how many second copies the path
+  had needed. That subtraction means nothing: one counts copies this side
+  *sent*, the other counts copies this side *received and discarded*, which are
+  different directions at different rates — and on an unsigned counter it
+  wrapped. Both are now reported as they are, `dup_sent` and `dup_recv`.
+
+- **`aqm_dropped` was three different things added together.** AQM dropping to
+  signal congestion, a ring with no room left, and an express packet overtaken
+  by a fresher one were one counter. Those have three different causes and three
+  different fixes, and telling them apart is the only reason the line exists. The
+  health line now reads `aqm_dropped=… queue_full=… stale=…`, and the stats
+  endpoint gains `aqm_dropped`, `queue_full_dropped` and `stale_dropped`.
+
+  This mattered immediately: a run with the AQM switched off still reported
+  thousands of "aqm_dropped", because those were the ring overflowing.
+
 ## [2.13.2] — 2026-08-14
 
 ### Added

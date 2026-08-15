@@ -536,3 +536,62 @@ func TestCodelIsTheDefault(t *testing.T) {
 		t.Fatal("a queue built the ordinary way has AQM disabled")
 	}
 }
+
+// The three drop reasons must be counted apart. They were one counter, which
+// made the health line unable to answer the only question it existed for: is
+// the AQM signalling congestion, is the ring out of room, or was an express
+// packet overtaken? Those have three different fixes.
+func TestDropReasonsAreCountedApart(t *testing.T) {
+	t.Run("a full ring is not an AQM drop", func(t *testing.T) {
+		pool := newBufPool(1500)
+		var stats qstats
+		q := newTxQueue(16, 1380, pool, &stats) // deliberately tiny
+		q.now = func() int64 { return 0 }
+		for i := 0; i < 200; i++ {
+			q.pushBytes(pool, tcpSeg(0x10, 1300))
+		}
+		if stats.fullDrop.Load() == 0 {
+			t.Fatal("overflowing a 16-packet ring recorded no queue-full drops")
+		}
+		if got := stats.aqmDrop.Load(); got != 0 {
+			t.Fatalf("%d overflow drops were reported as AQM drops — the health line "+
+				"would say congestion control is working when the queue is simply full", got)
+		}
+	})
+
+	t.Run("an overtaken express packet is its own reason", func(t *testing.T) {
+		q, pool, now := testQueue(t, 256)
+		q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 56)))
+		*now = int64(expressStale) + 1
+		q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 20)))
+		if p := q.pop(); p != nil {
+			pool.put(p)
+		}
+		if q.stats.staleDrop.Load() != 1 {
+			t.Fatalf("stale express drops = %d, want 1", q.stats.staleDrop.Load())
+		}
+		if got := q.stats.fullDrop.Load(); got != 0 {
+			t.Fatalf("%d stale drops were reported as the ring being full", got)
+		}
+	})
+
+	t.Run("CoDel drops are AQM drops", func(t *testing.T) {
+		q, pool, now := testQueue(t, 4096)
+		for i := 0; i < 500; i++ {
+			q.pushBytes(pool, tcpSeg(0x10, 1300))
+		}
+		*now += int64(codelTarget) * 4
+		for i := 0; i < 500 && q.bulk.len() > 0; i++ {
+			*now += int64(10 * time.Millisecond)
+			if p := q.pop(); p != nil {
+				pool.put(p)
+			}
+		}
+		if q.stats.aqmDrop.Load() == 0 {
+			t.Fatal("CoDel dropped but nothing was recorded as an AQM drop")
+		}
+		if got := q.stats.fullDrop.Load(); got != 0 {
+			t.Fatalf("%d CoDel drops were reported as the ring being full", got)
+		}
+	})
+}

@@ -161,8 +161,17 @@ func (r *ring) pop() *pbuf {
 type qstats struct {
 	expressPkts atomic.Uint64
 	bulkPkts    atomic.Uint64
-	dropped     atomic.Uint64 // CoDel + overflow + stale
-	depth       atomic.Int64  // current bulk+express packets
+	// Three different drops with three different meanings, counted apart
+	// because a diagnosis needs to tell them from each other: AQM dropping to
+	// signal congestion is the system working, a full ring is the system out of
+	// room, and a stale express packet is one that was overtaken. They were one
+	// counter, which made a health line that could not answer the only question
+	// it was there to answer.
+	dropped   atomic.Uint64 // total, for compatibility
+	aqmDrop   atomic.Uint64 // CoDel, deliberately spaced congestion signal
+	fullDrop  atomic.Uint64 // ring had no room: a burst lost at once
+	staleDrop atomic.Uint64 // express packet overtaken by a fresher one
+	depth     atomic.Int64  // current bulk+express packets
 }
 
 // codel holds the RFC 8289 controller state for one bulk ring.
@@ -249,7 +258,9 @@ func (q *txQueue) push(p *pbuf) {
 	q.mu.Unlock()
 
 	if !ok {
+		// No room: this is the queue being full, not the AQM choosing to signal.
 		q.stats.dropped.Add(1)
+		q.stats.fullDrop.Add(1)
 		q.pool.put(p)
 		return
 	}
@@ -280,7 +291,7 @@ func (q *txQueue) pop() *pbuf {
 			q.stats.depth.Store(int64(q.express.len() + q.bulk.len()))
 			return p
 		}
-		q.dropLocked(p)
+		q.dropStale(p)
 	}
 
 	var p *pbuf
@@ -297,6 +308,14 @@ func (q *txQueue) pop() *pbuf {
 
 func (q *txQueue) dropLocked(p *pbuf) {
 	q.stats.dropped.Add(1)
+	q.stats.aqmDrop.Add(1)
+	q.pool.put(p)
+}
+
+// dropStale records an express packet that a fresher one overtook.
+func (q *txQueue) dropStale(p *pbuf) {
+	q.stats.dropped.Add(1)
+	q.stats.staleDrop.Add(1)
 	q.pool.put(p)
 }
 
