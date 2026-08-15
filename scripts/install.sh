@@ -64,7 +64,7 @@ ET_LOCAL="${ET_LOCAL:-}"
 # after a fix can be handed the previous copy and hit a bug that is already
 # fixed — with no way to tell from the output that this is what happened.
 # Compared against the sources at startup; see check_installer_age.
-INSTALLER_VERSION="2.12.0"
+INSTALLER_VERSION="2.13.0"
 ET_GO_VERSION="${ET_GO_VERSION:-1.22.5}"
 
 PREFIX="/usr/local/bin"
@@ -567,18 +567,63 @@ tune_host() {
     info "congestion control: ${cc}"
 }
 
+# tunnel_units lists every tunnel this host has a config for.
+#
+# The configs are the source of truth. Parsing `systemctl list-units` is not: it
+# prefixes a unit in a failed state with a bullet, which lands in the first
+# column and turns the unit name into "●" — so the very tunnels an upgrade most
+# needs to bring back were the ones the restart missed, and it tried to restart
+# a bullet instead. It also omits a tunnel that is enabled but currently
+# stopped, which is the other case that matters.
+tunnel_units() {
+    local f name
+    for f in "$CONF_DIR"/*.toml; do
+        [ -e "$f" ] || continue
+        name="$(basename "$f" .toml)"
+        printf '%s\n' "emergency-tunnel@${name}.service"
+    done
+}
+
+# restart_tunnels puts every tunnel that is meant to be running onto the new
+# core, and says which ones it did.
+#
+# "Meant to be running" is enabled OR active: a tunnel the operator deliberately
+# stopped and disabled stays down, and everything else comes back. Without this,
+# an upgrade left the old binary running until someone restarted each tunnel by
+# hand — the new core was installed and none of its fixes were in effect, which
+# reads as an update that did nothing.
+restart_tunnels() {
+    have systemctl || return 0
+    local units u restarted=0 failed=0 skipped=0
+    units="$(tunnel_units)"
+    [ -z "$units" ] && return 0
+
+    for u in $units; do
+        if ! systemctl is-enabled --quiet "$u" 2>/dev/null &&
+           ! systemctl is-active  --quiet "$u" 2>/dev/null; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if systemctl restart "$u" 2>/dev/null; then
+            restarted=$((restarted + 1))
+        else
+            failed=$((failed + 1))
+            warn "could not restart ${u%.service}"
+        fi
+    done
+
+    [ "$restarted" -gt 0 ] && ok "restarted ${restarted} tunnel(s) onto v${VERSION}"
+    [ "$skipped"   -gt 0 ] && info "${skipped} tunnel(s) left alone (stopped and disabled)"
+    [ "$failed"    -gt 0 ] && warn "${failed} tunnel(s) did not come back — check 'et' → Manage → logs"
+    return 0
+}
+
 migrate_and_restart() {
     [ -z "${PREV_VERSION:-}" ] && return 0
     step "Upgrade"
     info "${PREV_VERSION} -> ${VERSION}"
     "${PREFIX}/et" --migrate 2>/dev/null | sed 's/^/  /' || true
-    :
-    have systemctl || return 0
-    local units; units="$(systemctl list-units 'emergency-tunnel@*.service' --no-legend 2>/dev/null | awk '{print $1}')" || units=""
-    [ -z "$units" ] && return 0
-    # shellcheck disable=SC2086
-    systemctl restart $units && ok "restarted running tunnels onto the new core" \
-        || warn "some tunnels did not restart — check 'et' → Manage → logs"
+    restart_tunnels
 }
 
 verify_install() {

@@ -408,3 +408,71 @@ func TestCodelStillBoundsSojournOnADeepRing(t *testing.T) {
 			"that is the bufferbloat this capacity is only safe without")
 	}
 }
+
+// CoDel's control law ramps: the first drop comes an interval after the queue
+// goes over target, and the rate climbs as the square root of the count. While
+// it converges the queue can be far deeper than target, and how deep depends on
+// how much room the ring gives it — so raising the ring to absorb a long path's
+// burst also raised the worst case. A 4096-packet ring is five megabytes, which
+// at 120 Mbit is a third of a second of standing delay.
+//
+// The ceiling bounds that in time, which is the same promise at every rate.
+func TestNoBulkPacketIsDeliveredPastTheDelayCeiling(t *testing.T) {
+	q, pool, now := testQueue(t, channelDefault("fast"))
+
+	// Fill the ring, then let far more than the ceiling elapse without draining.
+	for i := 0; i < 2000; i++ {
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+	}
+	*now += int64(maxQueueDelay) * 3
+
+	// Everything now in the queue is stale. Draining must not hand any of it on.
+	for i := 0; i < 3000; i++ {
+		p := q.pop()
+		if p == nil {
+			break
+		}
+		if age := *now - p.enq; age > int64(maxQueueDelay) {
+			t.Fatalf("a packet %v old was delivered; the ceiling is %v",
+				time.Duration(age), maxQueueDelay)
+		}
+		pool.put(p)
+	}
+	if q.stats.dropped.Load() == 0 {
+		t.Fatal("nothing was dropped, so the stale packets were delivered late instead")
+	}
+}
+
+// The ceiling must not touch a queue that is draining normally: it is a backstop
+// for CoDel's ramp, not a second dropper competing with it.
+func TestTheDelayCeilingDoesNotDropAHealthyQueue(t *testing.T) {
+	q, pool, now := testQueue(t, channelDefault("fast"))
+
+	for i := 0; i < 3000; i++ {
+		*now += int64(50 * time.Microsecond)
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+		if p := q.pop(); p != nil {
+			pool.put(p)
+		}
+	}
+	if got := q.stats.dropped.Load(); got != 0 {
+		t.Fatalf("%d packets were dropped from a queue that was keeping up", got)
+	}
+}
+
+// And express traffic is not subject to it: express has its own, longer bound
+// and its own rule about being overtaken (see expressStale).
+func TestTheDelayCeilingIsBulkOnly(t *testing.T) {
+	q, pool, now := testQueue(t, channelDefault("fast"))
+	q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 56)))
+	*now += int64(maxQueueDelay) * 2
+
+	p := q.pop()
+	if p == nil {
+		t.Fatal("the express packet was dropped by the bulk ceiling")
+	}
+	if !isExpress(p.bytes()) {
+		t.Fatal("got a bulk packet")
+	}
+	pool.put(p)
+}

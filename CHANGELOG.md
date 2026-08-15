@@ -4,6 +4,42 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.13.0] — 2026-08-14
+
+### Fixed
+
+- **An upgrade left the old core running.** The restart after an install parsed
+  `systemctl list-units`, which prefixes a unit in a failed state with a bullet —
+  that bullet lands in the first column, so the unit name became "●" and the
+  restart was attempted on it instead. It also missed any tunnel that was enabled
+  but currently stopped, which is the case an upgrade most needs to bring back.
+  So the new binary was installed and none of its fixes took effect until
+  someone restarted each tunnel by hand, which reads as an update that did
+  nothing.
+
+  The tunnel list now comes from the configs, which are the source of truth, and
+  every tunnel that is enabled *or* active is restarted onto the new version. One
+  that was deliberately stopped and disabled stays down. The install now says
+  which: `restarted 3 tunnel(s) onto v2.13.0`, and names any that did not come
+  back.
+
+- **A hard ceiling on how long a bulk packet may sit in the queue.** CoDel
+  controls the queue by the *rate* it drops at, and its control law ramps: the
+  first drop comes an interval after the queue goes over target, and the rate
+  climbs as the square root of the count. That converges, but while it is
+  converging the queue can be far deeper than target — and how deep depends on
+  how much room the ring gives it. Raising the ring in 2.10.1 to absorb a long
+  path's burst therefore also raised the worst case: 4096 packets is five
+  megabytes, which at 120 Mbit is a third of a second of standing delay.
+
+  Bulk packets are now dropped past 150 ms regardless of what CoDel is doing.
+  The bound is in time rather than bytes because that is what matters — a byte
+  cap is a different amount of delay at every rate, a delay cap is the same
+  promise at all of them. Past it a packet is stale: the sender has already
+  decided it was lost, so delivering it costs bandwidth and helps nobody. A queue
+  that is keeping up is untouched, and the express class keeps its own longer
+  rule.
+
 ## [2.12.0] — 2026-08-14
 
 ### Fixed
