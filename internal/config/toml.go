@@ -56,6 +56,8 @@ func assign(c *Config, key, val string) error {
 		c.IpxProfile = unquote(val)
 	case "interface":
 		c.Iface = unquote(val)
+	case "aqm":
+		c.AQM = unquote(val)
 	case "spoof_src_ip":
 		c.SpoofSrcIP = unquote(val)
 	case "spoof_dst_ip":
@@ -276,6 +278,9 @@ func (c *Config) Marshal() string {
 		}
 		if c.Iface != "" {
 			kv("interface", c.Iface)
+		}
+		if c.AQM != "" && c.AQM != AQMCodel {
+			kv("aqm", c.AQM)
 		}
 		if c.IcmpType != 0 || c.IcmpCode != 0 {
 			ki("icmp_type", c.IcmpType)

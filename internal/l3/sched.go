@@ -176,7 +176,13 @@ type codel struct {
 
 // txQueue is one TUN queue's transmit scheduler: express + CoDel-managed bulk.
 // It has one producer (the TUN reader) and one consumer (the link writer).
+// aqmOff turns the bulk ring into a plain tail-drop FIFO. See Config.AQM: CoDel
+// spaces its drops, and a single bulk flow reads each spaced drop as its own
+// congestion event, so on a long path with one heavy flow it can cost
+// throughput that a queue losing a burst at once does not.
 type txQueue struct {
+	aqmOff bool
+
 	mu       sync.Mutex
 	express  ring
 	bulk     ring
@@ -192,10 +198,15 @@ type txQueue struct {
 }
 
 func newTxQueue(depth, mtu int, pool *bufPool, stats *qstats) *txQueue {
+	return newTxQueueAQM(depth, mtu, pool, stats, true)
+}
+
+func newTxQueueAQM(depth, mtu int, pool *bufPool, stats *qstats, codel bool) *txQueue {
 	if depth < 16 {
 		depth = 16
 	}
 	return &txQueue{
+		aqmOff:   !codel,
 		express:  newRing(expressCap),
 		bulk:     newRing(depth),
 		maxBytes: depth * mtu,
@@ -272,7 +283,14 @@ func (q *txQueue) pop() *pbuf {
 		q.dropLocked(p)
 	}
 
-	p := q.codelDequeue(now)
+	var p *pbuf
+	if q.aqmOff {
+		// Plain FIFO: the only drops are the ones push() already made when the
+		// ring was full, which is a burst lost at once.
+		p = q.bulkPop()
+	} else {
+		p = q.codelDequeue(now)
+	}
 	q.stats.depth.Store(int64(q.express.len() + q.bulk.len()))
 	return p
 }

@@ -4,6 +4,32 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.13.2] — 2026-08-14
+
+### Added
+
+- **`aqm = "off"`** turns the TUN transmit queue into a plain tail-drop FIFO.
+  CoDel stays the default.
+
+  This exists because of a measurement, not a theory. On one real route this
+  tunnel sustained 120 Mbit/s with about 4,000 retransmissions while another
+  implementation sustained 297 Mbit/s with 27,450 — seven times the loss and two
+  and a half times the throughput. Loss is therefore not what holds this tunnel
+  where it is, and neither is the code: benchmarked on loopback, the ICMP carrier
+  moves 2.1 Gbit/s and the scheduler ahead of it 53 Gbit/s.
+
+  What is left is how the drops are *shaped*. A tail-drop queue loses a burst all
+  at once, which a bulk TCP flow reads as one congestion event and answers with
+  one window reduction. CoDel deliberately spaces its drops out in time, and each
+  spaced drop is a separate event and a separate reduction. That is the right
+  trade when a queue carries interactive traffic alongside a download, and it may
+  be the wrong one for a single heavy flow on a long path.
+
+  Which of those is happening can only be answered on the path itself, so this is
+  the control for that experiment: set `aqm = "off"` on both servers, run the same
+  test, and compare. The priority split is unaffected — express traffic still
+  jumps the bulk backlog either way, because that is not the AQM.
+
 ## [2.13.1] — 2026-08-14
 
 ### Fixed

@@ -242,7 +242,8 @@ func (e *Engine) Run(ctx context.Context) error {
 	txQueues := make([]*txQueue, e.queues)
 	var readers sync.WaitGroup
 	for i := 0; i < e.queues; i++ {
-		txQueues[i] = newTxQueue(e.channelSize, e.cfg.MTU, e.pool, &e.qstats)
+		txQueues[i] = newTxQueueAQM(e.channelSize, e.cfg.MTU, e.pool, &e.qstats,
+			e.cfg.AQM != config.AQMOff)
 		readers.Add(1)
 		go func(i int) { defer readers.Done(); e.queueReader(ctx, dev.Queues()[i], txQueues[i]) }(i)
 	}

@@ -66,6 +66,19 @@ type Config struct {
 	IcmpType int `toml:"icmp_type"`
 	IcmpCode int `toml:"icmp_code"`
 
+	// AQM selects the queue-management discipline on the TUN transmit path:
+	// "codel" (default) or "off" for a plain tail-drop FIFO.
+	//
+	// CoDel keeps queueing delay short, which is what a tunnel carrying
+	// interactive traffic alongside a download wants. But it does it by spacing
+	// its drops out in time, and a single bulk TCP flow reads each spaced drop as
+	// a separate congestion event and reduces its window again — where a
+	// tail-drop queue loses a burst at once, which is one event and one
+	// reduction. On a long path with one heavy flow that difference can cost
+	// throughput, and how much depends on the path, so it is settable rather
+	// than argued about.
+	AQM string `toml:"aqm"`
+
 	// Iface binds a raw-IP carrier's socket to one network device. On a server
 	// with several, the socket otherwise receives that IP protocol from all of
 	// them.
@@ -288,6 +301,10 @@ const (
 	// above, whose profile names the IP protocol.
 	EncapTCP = "tcp"
 	EncapIPX = "ipx"
+
+	// Queue-management disciplines. See Config.AQM.
+	AQMCodel = "codel"
+	AQMOff   = "off"
 )
 
 // SPF carrier profiles.
@@ -447,6 +464,13 @@ func (c *Config) normaliseTunCarrier() error {
 	case TunModeTCP, TunModeUDP, TunModeICMP, TunModeBIP, TunModeIPIP, TunModeGRE:
 	default:
 		return fmt.Errorf("carrier must be tcp, udp, icmp, bip, ipip or gre, got %q", c.TunMode)
+	}
+	switch c.AQM {
+	case "", AQMCodel:
+		c.AQM = AQMCodel
+	case AQMOff:
+	default:
+		return fmt.Errorf(`aqm must be "codel" or "off", got %q`, c.AQM)
 	}
 	if c.IcmpType < 0 || c.IcmpType > 255 {
 		return fmt.Errorf("icmp_type out of range (0..255): %d", c.IcmpType)

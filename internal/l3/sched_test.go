@@ -479,3 +479,60 @@ func TestALongStandingBacklogIsDeliveredNotDiscarded(t *testing.T) {
 			"coming back should drain its backlog, not throw it away", delivered, queued)
 	}
 }
+
+// With AQM off the bulk ring is a plain FIFO: nothing is dropped while there is
+// room, and a burst is lost at once when there is not. That is the behaviour a
+// single heavy flow reads as one congestion event rather than many.
+func TestAQMOffDoesNotDropWhileThereIsRoom(t *testing.T) {
+	pool := newBufPool(1500)
+	var stats qstats
+	q := newTxQueueAQM(256, 1380, pool, &stats, false)
+	now := int64(0)
+	q.now = func() int64 { return now }
+
+	for i := 0; i < 200; i++ {
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+	}
+	// Long past anything CoDel would tolerate.
+	now += int64(5 * time.Second)
+	for i := 0; i < 200; i++ {
+		p := q.pop()
+		if p == nil {
+			t.Fatalf("queue ran dry after %d of 200 packets", i)
+		}
+		pool.put(p)
+	}
+	if got := stats.dropped.Load(); got != 0 {
+		t.Fatalf("%d packets were dropped with AQM off and room to spare", got)
+	}
+}
+
+// And the express class still works with AQM off: the priority split is not the
+// AQM, and turning one off must not turn the other off.
+func TestAQMOffKeepsTheExpressClass(t *testing.T) {
+	pool := newBufPool(1500)
+	var stats qstats
+	q := newTxQueueAQM(256, 1380, pool, &stats, false)
+	q.now = func() int64 { return 0 }
+
+	for i := 0; i < 50; i++ {
+		q.pushBytes(pool, tcpSeg(0x10, 1300))
+	}
+	q.pushBytes(pool, mkIPv4(protoICMP, make([]byte, 56))) // arrives last
+
+	p := q.pop()
+	if p == nil || !isExpress(p.bytes()) {
+		t.Fatal("the express packet did not jump the bulk backlog with AQM off")
+	}
+	pool.put(p)
+}
+
+// CoDel is still the default: turning it off has to be a deliberate choice.
+func TestCodelIsTheDefault(t *testing.T) {
+	pool := newBufPool(1500)
+	var stats qstats
+	q := newTxQueue(256, 1380, pool, &stats)
+	if q.aqmOff {
+		t.Fatal("a queue built the ordinary way has AQM disabled")
+	}
+}
