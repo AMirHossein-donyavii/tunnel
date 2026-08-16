@@ -29,6 +29,29 @@ say "checking $PANEL"
 # 1. Syntax.
 if bash -n "$PANEL" 2>/dev/null; then good "syntax"; else bad "syntax errors"; fi
 
+# 1b. The three places a version is written must agree.
+#
+#   VERSION                        what the installer resolves and builds
+#   scripts/install.sh             what the installer says it is
+#   scripts/et-panel.sh            what the console says it is
+#
+# Only the first decides which core gets built. Bumping the other two and
+# forgetting it ships a console from the new release beside a core from the old
+# one, which the console notices and reports as an installation fault the user
+# cannot fix by reinstalling — the installer keeps resolving the old version and
+# keeps being right to.
+here="$(cd "$(dirname "$PANEL")/.." && pwd)"
+repo_ver="$(tr -d '[:space:]' < "$here/VERSION" 2>/dev/null)"
+panel_ver="$(grep -m1 '^SCRIPT_VERSION=' "$PANEL" | cut -d'"' -f2)"
+inst_ver="$(grep -m1 '^INSTALLER_VERSION=' "$here/scripts/install.sh" 2>/dev/null | cut -d'"' -f2)"
+if [ -n "$repo_ver" ] && [ -n "$panel_ver" ] && [ -n "$inst_ver" ]; then
+    if [ "$repo_ver" = "$panel_ver" ] && [ "$repo_ver" = "$inst_ver" ]; then
+        good "VERSION, installer and console all say v${repo_ver}"
+    else
+        bad "version skew: VERSION=${repo_ver} installer=${inst_ver} console=${panel_ver} — the installer builds the core named by VERSION, so the console and the core will not match"
+    fi
+fi
+
 # Every function the file defines.
 defined="$(grep -oE '^[a-z_][a-z0-9_]*\(\)' "$PANEL" | tr -d '()' | sort -u)"
 
