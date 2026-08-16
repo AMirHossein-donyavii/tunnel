@@ -453,9 +453,12 @@ ensure_go() {
 # is still tried, but the build then says what it really is.
 fetch_source() {
     local dest="$1" tb="${TMP}/src.tar.gz" u host
+    # A release point is published as a tag where tags can be pushed and as a
+    # branch of the same name where they cannot, so both are tried before
+    # falling back to the tip.
     local refs="refs/heads/main"
     if [ -n "$ET_VERSION" ]; then
-        refs="refs/tags/v${ET_VERSION} refs/heads/main"
+        refs="refs/tags/v${ET_VERSION} refs/heads/v${ET_VERSION} refs/heads/main"
     fi
     local r
     for r in $refs; do
