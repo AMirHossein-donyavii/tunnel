@@ -292,7 +292,16 @@ verify_against_sums() {
 download_release() {
     step "Download"
     TMP="$(mktemp -d)"
-    dl "${REL_URL}/SHA256SUMS" "${TMP}/SHA256SUMS" || die "cannot fetch SHA256SUMS from ${REL_URL}"
+    # A release host that answers the channel probe but has no such release is a
+    # real state, not a hypothetical: the channel file said 2.13.4 while
+    # releases/v2.13.4/ returned 404, and because a version had been resolved
+    # this died right here instead of trying GitHub or a source build. Resolving
+    # a version is not the same as being able to fetch it, so a missing release
+    # falls through to the next source rather than ending the install.
+    if ! dl "${REL_URL}/SHA256SUMS" "${TMP}/SHA256SUMS"; then
+        warn "no release at ${REL_URL} (the channel names v${VERSION}, but its files are not there)"
+        return 1
+    fi
 
     if [ "$SOURCE_USED" = "host" ] && [ -n "$ET_PUBKEY" ] && [ "$ET_ALLOW_INSECURE" != "1" ]; then
         have minisign || pkg_install minisign || true
@@ -304,9 +313,15 @@ download_release() {
         else warn "minisign unavailable — relying on TLS + SHA-256"; fi
     fi
 
+    # An incomplete release falls through too. A checksum that does NOT match is
+    # a different matter and still stops everything: a missing file is a release
+    # that was never published, a wrong one is a file that must not be run.
     local asset="et-core-linux-${ARCH}"
     for f in "$asset" et-panel.sh emergency-tunnel@.service uninstall.sh; do
-        dl "${REL_URL}/${f}" "${TMP}/${f}" || die "cannot fetch ${f}"
+        if ! dl "${REL_URL}/${f}" "${TMP}/${f}"; then
+            warn "release v${VERSION} is missing ${f}"
+            return 1
+        fi
         verify_against_sums "$f"
     done
     ok "4 files downloaded and verified"
@@ -430,20 +445,33 @@ ensure_go() {
 # tenth of the size of a clone, and codeload is a different host from github.com
 # — so it can answer where the clone hangs. The clone stays as the last try,
 # with a hard limit on how long it may take.
+#
+# An explicit --version fetches that tag, not the branch. Building the tip and
+# stamping it with the version someone asked for produces a core that reports a
+# version it is not — and the one time that matters most is a rollback, where
+# the whole point is to run the older code. If the tag is not there the branch
+# is still tried, but the build then says what it really is.
 fetch_source() {
     local dest="$1" tb="${TMP}/src.tar.gz" u host
-    for u in "https://codeload.github.com/${ET_REPO_SLUG}/tar.gz/refs/heads/main" \
-             "https://github.com/${ET_REPO_SLUG}/archive/refs/heads/main.tar.gz"; do
+    local refs="refs/heads/main"
+    if [ -n "$ET_VERSION" ]; then
+        refs="refs/tags/v${ET_VERSION} refs/heads/main"
+    fi
+    local r
+    for r in $refs; do
+    for u in "https://codeload.github.com/${ET_REPO_SLUG}/tar.gz/${r}" \
+             "https://github.com/${ET_REPO_SLUG}/archive/${r}.tar.gz"; do
         host="${u#https://}"; host="${host%%/*}"
-        info "fetching sources from ${host}"
+        info "fetching sources (${r##*/}) from ${host}"
         if dl "$u" "$tb"; then
             mkdir -p "$dest"
-            # The archive wraps everything in one directory named for the branch.
+            # The archive wraps everything in one directory named for the ref.
             if tar -xzf "$tb" -C "$dest" --strip-components=1 2>/dev/null && [ -f "${dest}/go.mod" ]; then
                 return 0
             fi
             rm -rf "$dest"
         fi
+    done
     done
     if have git || pkg_install git; then
         info "fetching sources with git"
@@ -472,8 +500,13 @@ build_from_source() {
     # The tree being compiled is the authority on its own version — trust it over
     # anything guessed earlier, so the stamped core and the recorded VERSION can
     # never disagree. An explicit --version still wins.
-    if [ -z "$ET_VERSION" ] && [ -r "${src}/VERSION" ]; then
-        VERSION="$(tr -d '[:space:]' < "${src}/VERSION")"
+    if [ -r "${src}/VERSION" ]; then
+        local tv; tv="$(tr -d '[:space:]' < "${src}/VERSION")"
+        if [ -n "$ET_VERSION" ] && [ "$tv" != "$ET_VERSION" ]; then
+            warn "asked for v${ET_VERSION}, but the sources obtained are v${tv} — installing v${tv}"
+            warn "(that tag is not published; the branch was used instead)"
+        fi
+        VERSION="$tv"
     fi
     is_semver "${VERSION:-}" || VERSION="dev"
     # Module downloads go through Google's proxy by default, which is one more
@@ -680,7 +713,20 @@ main() {
         VERSION="${ET_VERSION:-}"; SOURCE_USED="source"; build_from_source
     else
         resolve_version
-        if [ "$SOURCE_USED" = "source" ]; then build_from_source; else download_release; fi
+        # Each way of getting a release can fail on its own, so each failure
+        # moves on to the next rather than ending the run. The order is the same
+        # one resolve_version tried: the configured host, then GitHub Releases,
+        # then building the sources.
+        if [ "$SOURCE_USED" = "source" ]; then
+            build_from_source
+        elif ! download_release; then
+            if [ "$SOURCE_USED" = "host" ] && resolve_from github && download_release; then
+                :
+            else
+                warn "no published release could be downloaded — building from source"
+                SOURCE_USED="source"; build_from_source
+            fi
+        fi
     fi
     install_files
     tune_host
