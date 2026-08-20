@@ -223,7 +223,7 @@ check_installer_age() {
 # was measured at 29 s of compiling alone on four cores, so minutes on the one
 # core these servers usually have, on top of well over a hundred megabytes of
 # downloads. The prebuilt core is 4.2 MB compressed and needs none of it.
-ET_DIST_URL="${ET_DIST_URL:-https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/dist}"
+ET_DIST_URL="${ET_DIST_URL:-https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/prebuilt}"
 
 # resolve_from <host|github|repo> — sets VERSION and REL_URL, or fails.
 resolve_from() {
