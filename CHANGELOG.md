@@ -4,6 +4,46 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.14.1] — 2026-08-16
+
+### Changed
+
+- **The raw-IP carriers collect received packets in batches.**
+
+  Profiling first, as it should have been all along. The carrier costs about
+  7.0 µs per packet end to end, while the scheduler above it — classification,
+  CoDel, framing, the cipher — runs at the equivalent of 35 Gbit/s. Almost the
+  entire cost is the send and receive syscalls, which is what puts a per-core
+  ceiling of roughly 1.6 Gbit/s on the ICMP carrier. Nothing else in the data
+  path is close to being the limit.
+
+  `recvmmsg` collects up to 64 datagrams per syscall. Measured on this machine
+  at 1320-byte payloads, one syscall per packet costs 3523 ns against 2367 ns
+  in batches of 64.
+
+  Receive is batched first because it is the half the caller cannot batch for
+  itself: a reader loop cannot know a second packet is waiting until it asks.
+  The result, with the UDP carrier as a control since it does not use this path:
+
+  | | before | after |
+  |---|---|---|
+  | ICMP carrier | 7029 ns/pkt · 199 MB/s | **6075 ns/pkt · 229 MB/s** |
+  | UDP carrier (control) | 4438 ns/pkt · 315 MB/s | 4210–4498 ns · 311–333 MB/s |
+
+  +15% on the per-core ceiling, 1.6 → 1.83 Gbit/s. The control moving not at
+  all is what says this is the change and not the machine. It is less than the
+  1.3–1.4× projected for batching both directions; batching the send side is a
+  separate change and will carry its own measurement rather than being claimed
+  in advance.
+
+  Nothing about the wire format changes — the same packets through the same
+  socket, in fewer trips into the kernel. Two things did have to be got right:
+  Go's `ReadFrom` strips the IPv4 header a raw socket delivers and `recvmmsg`
+  does not, which the carrier tests caught immediately; and a datagram that is
+  not a well-formed IPv4 packet is now skipped and counted rather than returned
+  as a read error, since anyone can send a raw socket anything and one
+  stranger's malformed packet must not end the read loop for every link on it.
+
 ## [2.14.0] — 2026-08-15
 
 This one is measured, not reasoned about. A whole Iran↔Europe path now exists as

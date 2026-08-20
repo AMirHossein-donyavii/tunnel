@@ -127,16 +127,16 @@ func (d *ipxLinkDialer) socket() (net.PacketConn, net.Addr, error) {
 }
 
 func (d *ipxLinkDialer) route() {
-	buf := make([]byte, 64*1024)
+	rd := newMmsgReader(d.pc, true)
 	for {
-		n, _, err := d.pc.ReadFrom(buf)
+		buf, _, err := rd.next()
 		if err != nil {
 			if isClosed(d.dead) || !isTransientReadErr(err) {
 				return
 			}
 			continue
 		}
-		payload, link, ok := parseIPX(d.p, buf[:n], dirToDialer, d.tunnel)
+		payload, link, ok := parseIPX(d.p, buf, dirToDialer, d.tunnel)
 		if !ok {
 			continue
 		}
@@ -326,9 +326,9 @@ type ipxLinkListener struct {
 }
 
 func (l *ipxLinkListener) route() {
-	buf := make([]byte, 64*1024)
+	rd := newMmsgReader(l.pc, true)
 	for {
-		n, src, err := l.pc.ReadFrom(buf)
+		buf, src, err := rd.next()
 		if err != nil {
 			if isClosed(l.closed) || !isTransientReadErr(err) {
 				l.Close()
@@ -336,9 +336,9 @@ func (l *ipxLinkListener) route() {
 			}
 			continue
 		}
-		payload, linkID, ok := parseIPX(l.p, buf[:n], dirToListener, l.tunnel)
+		payload, linkID, ok := parseIPX(l.p, buf, dirToListener, l.tunnel)
 		if !ok {
-			l.reportMismatch(src, buf[:n])
+			l.reportMismatch(src, buf)
 			continue
 		}
 		key, ok := makeIPXKey(src, linkID)

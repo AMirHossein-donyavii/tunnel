@@ -233,16 +233,16 @@ func (d *icmpLinkDialer) socket() (*icmp.PacketConn, net.Addr, error) {
 // route is the dialer's single read loop: one copy of each packet, delivered to
 // the link whose echo id it carries.
 func (d *icmpLinkDialer) route() {
-	buf := make([]byte, 64*1024)
+	rd := newMmsgReader(d.pc, !d.proto.v6)
 	for {
-		n, _, err := d.pc.ReadFrom(buf)
+		buf, _, err := rd.next()
 		if err != nil {
 			if isClosed(d.dead) || !isTransientReadErr(err) {
 				return
 			}
 			continue
 		}
-		data, id, ok := parseEchoInbound(buf[:n], d.shape, d.proto.v6, true)
+		data, id, ok := parseEchoInbound(buf, d.shape, d.proto.v6, true)
 		if !ok {
 			continue
 		}
@@ -478,9 +478,9 @@ type icmpLinkListener struct {
 }
 
 func (l *icmpLinkListener) route() {
-	buf := make([]byte, 64*1024)
+	rd := newMmsgReader(l.pc, !l.proto.v6)
 	for {
-		n, src, err := l.pc.ReadFrom(buf)
+		buf, src, err := rd.next()
 		if err != nil {
 			// Shared listener socket: survive a transient error rather than
 			// stranding every link until a manual restart (see udp/spf route).
@@ -490,7 +490,7 @@ func (l *icmpLinkListener) route() {
 			}
 			continue
 		}
-		data, id, ok := parseEchoAnyShaped(buf[:n], l.shape, l.proto.v6)
+		data, id, ok := parseEchoAnyShaped(buf, l.shape, l.proto.v6)
 		if !ok {
 			continue
 		}
