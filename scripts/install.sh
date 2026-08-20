@@ -10,7 +10,7 @@
 #   --version <v>    install an exact version instead of the channel head
 #   --channel <c>    stable | beta                     (default: stable)
 #   --base-url <u>   release host root                 (default below)
-#   --source <s>     host | github | source | auto     (default: auto)
+#   --source <s>     host | github | repo | source | auto  (default: auto)
 #   --from-source    build from Go source instead of downloading
 #   --local <path>   install a release directory or tarball already on this
 #                    machine — no network at all
@@ -217,7 +217,15 @@ check_installer_age() {
     info "    bash <(curl -fsSL 'https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/scripts/install.sh?cb='\$(date +%s))"
 }
 
-# resolve_from <host|github> — sets VERSION and REL_URL, or fails.
+# ET_DIST_URL is where the prebuilt binaries committed to the repository live.
+# They exist because the alternative on a small VPS is a source build: install a
+# Go toolchain over the package mirror, fetch the modules, then compile — which
+# was measured at 29 s of compiling alone on four cores, so minutes on the one
+# core these servers usually have, on top of well over a hundred megabytes of
+# downloads. The prebuilt core is 4.2 MB compressed and needs none of it.
+ET_DIST_URL="${ET_DIST_URL:-https://raw.githubusercontent.com/${ET_REPO_SLUG}/main/dist}"
+
+# resolve_from <host|github|repo> — sets VERSION and REL_URL, or fails.
 resolve_from() {
     case "$1" in
       host)
@@ -229,6 +237,13 @@ resolve_from() {
         else VERSION="$(probe_str "https://api.github.com/repos/${ET_REPO_SLUG}/releases/latest" 2>/dev/null \
               | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/')" || return 1; fi
         REL_URL="https://github.com/${ET_REPO_SLUG}/releases/download/v${VERSION}" ;;
+      repo)
+        # The prebuilt build that ships with the sources. Its version is the
+        # branch's, so this is only offered when it is the version wanted.
+        local dv; dv="$(probe_str "${ET_DIST_URL}/VERSION?cb=$(date +%s)" 2>/dev/null | tr -d '[:space:]')" || return 1
+        [ -n "$dv" ] && is_semver "$dv" || return 1
+        [ -z "$ET_VERSION" ] || [ "$ET_VERSION" = "$dv" ] || return 1
+        VERSION="$dv"; REL_URL="$ET_DIST_URL" ;;
     esac
     [ -n "${VERSION:-}" ] || return 1
     is_semver "$VERSION" || return 1
@@ -252,12 +267,23 @@ prefer_branch_source() {
         fi
         VERSION="$bv"; RESOLVED_FROM="$SOURCE_USED"; SOURCE_USED="source"
     fi
+    # Before compiling anything, see whether the branch ships a build of exactly
+    # this version. It nearly always does, and it turns a multi-minute install
+    # into a 4 MB download.
+    if [ "$SOURCE_USED" = "source" ]; then
+        local want="$VERSION"
+        if resolve_from repo && [ "$VERSION" = "$want" ]; then
+            info "using the prebuilt v${VERSION} from the repository (no compiler needed)"
+        else
+            VERSION="$want"; SOURCE_USED="source"
+        fi
+    fi
 }
 
 resolve_version() {
     step "Release"
     case "$ET_SOURCE" in
-        host|github) resolve_from "$ET_SOURCE" || die "cannot resolve a version from '${ET_SOURCE}'" ;;
+        host|github|repo) resolve_from "$ET_SOURCE" || die "cannot resolve a version from '${ET_SOURCE}'" ;;
         source)      VERSION="${ET_VERSION:-}"; SOURCE_USED="source" ;;
         auto)
             # Say which source is being tried before trying it. A blocked host
@@ -316,14 +342,26 @@ download_release() {
     # An incomplete release falls through too. A checksum that does NOT match is
     # a different matter and still stops everything: a missing file is a release
     # that was never published, a wrong one is a file that must not be run.
-    local asset="et-core-linux-${ARCH}"
-    for f in "$asset" et-panel.sh emergency-tunnel@.service uninstall.sh; do
+    # The repository's prebuilt assets are stored compressed: the core is 11 MB
+    # and 4.2 MB gzipped, and on these links that difference is most of the
+    # download. Anything else is fetched as-is.
+    local suffix=""
+    [ "$SOURCE_USED" = "repo" ] && suffix=".gz"
+    local asset="et-core-linux-${ARCH}${suffix}"
+    for f in "$asset" "et-panel.sh${suffix}" emergency-tunnel@.service uninstall.sh; do
         if ! dl "${REL_URL}/${f}" "${TMP}/${f}"; then
             warn "release v${VERSION} is missing ${f}"
             return 1
         fi
         verify_against_sums "$f"
     done
+    if [ -n "$suffix" ]; then
+        have gzip || pkg_install gzip || die "gzip is required to unpack the prebuilt release"
+        gzip -df "${TMP}/${asset}" || die "could not unpack ${asset}"
+        gzip -df "${TMP}/et-panel.sh${suffix}" || die "could not unpack the console"
+        asset="${asset%.gz}"
+        chmod +x "${TMP}/${asset}" "${TMP}/et-panel.sh"
+    fi
     ok "4 files downloaded and verified"
     CORE_BIN="${TMP}/${asset}"
 }
