@@ -25,11 +25,25 @@ import (
 //	batch of 32              2569 ns   514 MB/s
 //	batch of 64              2367 ns   558 MB/s
 //
-// The receive side is batched first because it is the half the caller cannot
-// batch for itself: a reader loop has no way to know a second packet is waiting
-// until it asks. The send side is different — the writer above it already knows
-// how many packets it has to send — so it is a separate change with its own
-// measurement, not folded in here.
+// Only the receive side is batched, and the send side deliberately is not.
+//
+// Batching sends was built and then removed, because it was measured and it was
+// slower. sendmmsg was wired into the carrier with a flush at the one point the
+// pump knows it has nothing left to send — so no packet ever waited for another
+// packet — and the result was worse both ways: the carrier benchmark went from
+// 6075 to 6836-7563 ns per packet, and four concurrent streams through a real
+// tunnel went from 949 to 901 and 739 Mbit/s.
+//
+// The reason is the shape of this data plane rather than anything wrong with
+// sendmmsg. With link striping there are several writers draining one transmit
+// queue, so each of them pops a packet, sends it, finds the queue empty and
+// flushes: the batch is nearly always a single frame, and all that is left is
+// the cost of packing it into an arena and building a header for it. A batch of
+// one is a syscall with paperwork.
+//
+// So the receive side is the half worth batching, and it is the half a caller
+// cannot batch for itself: a reader loop has no way to know a second packet is
+// waiting until it asks.
 //
 // Nothing about the wire format or the protocol changes. This is the same
 // packets through the same socket, collected in fewer trips into the kernel.
