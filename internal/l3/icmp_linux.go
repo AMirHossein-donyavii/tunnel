@@ -244,16 +244,19 @@ func (d *icmpLinkDialer) route() {
 		}
 		data, id, ok := parseEchoInbound(buf, d.shape, d.proto.v6, true)
 		if !ok {
+			notOurs.Add(1) // not an ICMP message this carrier speaks
 			continue
 		}
 		payload, ok := stripTag(data, tagToDialer, d.tunnel)
 		if !ok {
+			notOurs.Add(1)
 			continue // another tunnel's, our own output, or ordinary ping traffic
 		}
 		d.mu.Lock()
 		c := d.conns[uint16(id)]
 		d.mu.Unlock()
 		if c == nil {
+			notOurs.Add(1) // tagged for this tunnel but no link by that id
 			continue
 		}
 		bp := getDgram(payload)

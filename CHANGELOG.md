@@ -4,6 +4,43 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.14.2] — 2026-08-16
+
+### Fixed
+
+- **`bad_frames` was three unrelated events added together, and the sum could
+  not be acted on.**
+
+  A production tunnel sat at `bad_frames=118, rx=0` for days and the number
+  decided nothing, because it merged:
+
+  - a datagram from the peer, addressed to this link, that would not decrypt;
+  - a frame that decrypted and then did not parse as a control message;
+  - traffic on the socket that was never this tunnel's in the first place.
+
+  The first and the last are opposites. A datagram only reaches a link's
+  decryptor after the carrier has matched the peer's address, this tunnel's tag
+  and this link's id — so it came from the peer, addressed to this link, and
+  still would not open, which is two ends that completed a handshake and cannot
+  read each other. There is nothing else it can be. The last is ordinary
+  internet noise arriving at a raw socket on a public address, and means
+  nothing whatsoever. Added together they produced a figure that looked
+  alarming when it was harmless and harmless when it was fatal.
+
+  The health line now reports them apart:
+
+      … stale=0 auth_failed=118 bad_control=0 not_ours=1503 queued=0
+
+  and when datagrams from the peer fail to decrypt in a minute that received
+  nothing at all, the tunnel says so in words rather than leaving it to be
+  inferred from a counter:
+
+      118 datagrams from the peer failed to decrypt and NOTHING was received:
+      the two ends completed a handshake and cannot read each other. Check that
+      both servers run the same core version (et-core version) and the same token.
+
+  `bad_frames` is still carried on the stats endpoint for anything parsing it.
+
 ## [2.14.1] — 2026-08-16
 
 ### Changed

@@ -93,6 +93,31 @@ var carrierWriteErrs atomic.Uint64
 // engine state through every carrier constructor.
 var badDatagrams atomic.Uint64
 
+// authFailed counts datagrams that reached an established link and that the
+// AEAD refused.
+//
+// This is deliberately separate from every other kind of bad frame, because it
+// is the only one that means what "bad_frames" was always read as meaning. A
+// datagram only reaches a link's decryptor after the carrier has matched the
+// peer's address, this tunnel's tag and this link's id — so it did come from
+// the peer, addressed to this link, and still would not open. That is two ends
+// that completed a handshake and cannot read each other afterwards, which is
+// what a version or key mismatch looks like and nothing else does.
+//
+// Merged into one counter with control-frame parse failures, it was
+// unreadable: a tunnel showing bad_frames=110 and rx=0 could have been picking
+// up stray pings from the internet or could have been failing to decrypt every
+// packet its peer sent, and the log could not tell the difference. Those have
+// completely different causes and completely different fixes.
+var authFailed atomic.Uint64
+
+// notOurs counts datagrams the carrier received and did not route: another
+// tunnel's, our own echo coming back, or ordinary ping traffic from anywhere on
+// the internet. On a public address this is background noise and its being
+// non-zero means nothing at all — which is precisely why it must not be added
+// to a counter that is read as a fault.
+var notOurs atomic.Uint64
+
 // dupSent / dupDropped count the small-frame duplication below.
 var (
 	dupSent    atomic.Uint64
@@ -209,6 +234,7 @@ func (l *datagramLink) ReadFrame() ([]byte, error) {
 			}
 			l.bad++
 			badDatagrams.Add(1)
+			authFailed.Add(1)
 			if l.bad > maxBadDatagrams {
 				return nil, errBadDatagramFlood
 			}

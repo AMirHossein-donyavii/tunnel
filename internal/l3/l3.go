@@ -324,6 +324,9 @@ func (e *Engine) healthReport(ctx context.Context) {
 		full := d(cur.QueueFull, prev.QueueFull)
 		stale := d(cur.StaleDropped, prev.StaleDropped)
 		bad := d(cur.BadFrames, prev.BadFrames)
+		authBad := d(cur.AuthFailed, prev.AuthFailed)
+		ctlBad := d(cur.BadControl, prev.BadControl)
+		strangers := d(cur.NotOurs, prev.NotOurs)
 		dupIn := d(cur.DupDropped, prev.DupDropped)
 		dupOut := d(cur.DupSent, prev.DupSent)
 		prev, prev0 = cur, prev
@@ -356,12 +359,25 @@ func (e *Engine) healthReport(ctx context.Context) {
 		if dupOut > 0 || dupIn > 0 {
 			dup = fmt.Sprintf(" dup_sent=%d dup_recv=%d", dupOut, dupIn)
 		}
+		// auth_failed is the one number here that names a cause rather than a
+		// symptom, so when it is non-zero it is spelled out in words. A frame
+		// only reaches the AEAD after the carrier has matched the peer's
+		// address, this tunnel's tag and this link's id: it did come from the
+		// peer, addressed to this link, and would not open. Two ends that
+		// handshake and then cannot read each other is a version or key
+		// mismatch, and there is nothing else it can be — but it spent a week
+		// looking like a generic "bad_frames" count next to a rate of zero.
+		if authBad > 0 && rxB == 0 {
+			e.log.Error("%d datagrams from the peer failed to decrypt and NOTHING was received: "+
+				"the two ends completed a handshake and cannot read each other. Check that both "+
+				"servers run the same core version (et-core version) and the same token.", authBad)
+		}
 		e.log.Info("last %s: tx=%s rx=%s links=%d rtt=%.1fms | reconnects=%d "+
 			"tun_refused=%d socket_refused=%d demux_dropped=%d aqm_dropped=%d "+
-			"queue_full=%d stale=%d bad_frames=%d queued=%d%s",
+			"queue_full=%d stale=%d auth_failed=%d bad_control=%d not_ours=%d queued=%d%s",
 			every, rate(txB, every), rate(rxB, every), cur.LiveLinks, cur.RTTMs,
-			reconnects, tunErrs, sockErrs, demux, aqm, full, stale, bad,
-			cur.QueueDepth, dup)
+			reconnects, tunErrs, sockErrs, demux, aqm, full, stale,
+			authBad, ctlBad, strangers, cur.QueueDepth, dup)
 	}
 }
 
@@ -869,6 +885,11 @@ type Stats struct {
 	StaleDropped uint64 `json:"stale_dropped"`
 	QueueDepth   int64  `json:"queue_depth"`
 	BadFrames    uint64 `json:"bad_frames"`
+	// The three things bad_frames used to be, kept apart because they have
+	// nothing in common but the symptom. See authFailed and notOurs in link.go.
+	AuthFailed uint64 `json:"auth_failed"`
+	BadControl uint64 `json:"bad_control"`
+	NotOurs    uint64 `json:"not_ours"`
 
 	// What follows is here because "the tunnel is unstable" is unanswerable
 	// without it. Each of these is a distinct cause with a distinct fix, and
@@ -913,6 +934,9 @@ func (e *Engine) Snapshot() any {
 		TxDropped:          e.qstats.dropped.Load(),
 		QueueDepth:         e.qstats.depth.Load(),
 		BadFrames:          atomic.LoadUint64(&e.stats.badFrames) + badDatagrams.Load(),
+		AuthFailed:         authFailed.Load(),
+		BadControl:         atomic.LoadUint64(&e.stats.badFrames),
+		NotOurs:            notOurs.Load(),
 		TunWriteErrors:     atomic.LoadUint64(&e.stats.tunWriteErrs),
 		CarrierDropped:     carrierDropped.Load(),
 		CarrierWriteErrors: carrierWriteErrs.Load(),
