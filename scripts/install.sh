@@ -260,22 +260,22 @@ prefer_branch_source() {
     local bv; bv="$(branch_version)" || return 0
     [ -n "$bv" ] && is_semver "$bv" || return 0
     if [ -z "${VERSION:-}" ] || ver_gt "$bv" "$VERSION"; then
-        if [ -n "${VERSION:-}" ]; then
-            warn "newest release is v${VERSION}, but the sources are at v${bv} — building from source"
-        else
-            warn "no published release reachable — building v${bv} from source"
-        fi
+        local newer="$VERSION"
         VERSION="$bv"; RESOLVED_FROM="$SOURCE_USED"; SOURCE_USED="source"
-    fi
-    # Before compiling anything, see whether the branch ships a build of exactly
-    # this version. It nearly always does, and it turns a multi-minute install
-    # into a 4 MB download.
-    if [ "$SOURCE_USED" = "source" ]; then
-        local want="$VERSION"
-        if resolve_from repo && [ "$VERSION" = "$want" ]; then
-            info "using the prebuilt v${VERSION} from the repository (no compiler needed)"
+        # Which of these is true is not known until the prebuilt has been asked
+        # for, so nothing is announced before then. Saying "building from
+        # source" and then not building from source is worse than saying
+        # nothing: it is the line a user reads when an install takes minutes,
+        # and it should only appear when it is going to.
+        if resolve_from repo && [ "$VERSION" = "$bv" ]; then
+            info "using the prebuilt v${VERSION} that ships with the sources (no compiler needed)"
         else
-            VERSION="$want"; SOURCE_USED="source"
+            VERSION="$bv"; SOURCE_USED="source"
+            if [ -n "$newer" ]; then
+                warn "newest release is v${newer}, but the sources are at v${bv} — building from source"
+            else
+                warn "no published release reachable and no prebuilt for v${bv} — building from source"
+            fi
         fi
     fi
 }

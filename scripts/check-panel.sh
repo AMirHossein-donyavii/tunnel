@@ -55,6 +55,26 @@ fi
 # Every function the file defines.
 defined="$(grep -oE '^[a-z_][a-z0-9_]*\(\)' "$PANEL" | tr -d '()' | sort -u)"
 
+# 1c. The prebuilt that ships with the sources must be the version the sources
+#     are. A stale one is worse than none: the installer prefers it over
+#     compiling, so every install would silently get the previous release while
+#     every version string said otherwise.
+pre_ver="$(tr -d '[:space:]' < "$here/prebuilt/VERSION" 2>/dev/null)"
+if [ -n "$pre_ver" ] && [ -n "$repo_ver" ]; then
+    if [ "$pre_ver" = "$repo_ver" ]; then
+        good "the prebuilt in prebuilt/ is v${pre_ver}, matching the sources"
+    else
+        bad "prebuilt/ holds v${pre_ver} but the sources are v${repo_ver} — rebuild it with scripts/et-prebuild.sh, or installs will silently get the old core"
+    fi
+    if command -v sha256sum >/dev/null && [ -f "$here/prebuilt/SHA256SUMS" ]; then
+        if ( cd "$here/prebuilt" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
+            good "prebuilt checksums match their files"
+        else
+            bad "prebuilt/SHA256SUMS does not match the files beside it"
+        fi
+    fi
+fi
+
 # 2. Every case-arm target of the form `N) name ;;` must be defined.
 #    This is the check that would have caught the deleted builders.
 missing=0

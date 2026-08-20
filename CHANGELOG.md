@@ -41,6 +41,48 @@ project uses [Semantic Versioning](https://semver.org/).
 
   `bad_frames` is still carried on the stats endpoint for anything parsing it.
 
+## [2.14.2] — 2026-08-20
+
+### Changed
+
+- **Installing no longer means compiling.** It took minutes, and almost none of
+  that was necessary.
+
+  With no release host reachable — which is the normal case on this route — the
+  installer fell through to building from source. On the single-core VPS these
+  tunnels run on, that means installing a Go toolchain over the package mirror,
+  fetching the modules, and then compiling. Compiling alone measured 29 s on
+  four cores here, so minutes there, after well over a hundred megabytes of
+  downloads, on exactly the paths where downloads are slowest.
+
+  The core is 11 MB, and 4.2 MB gzipped. `prebuilt/` now carries a built core
+  for amd64 and arm64 beside the sources, and the installer takes that whenever
+  its version matches the sources — which is nearly always. Measured end to end
+  on this machine, including checksum verification and service setup:
+
+      before   install a toolchain, fetch modules, compile      minutes
+      after    4.2 MB download, verify, install                 3-5 s
+
+  Assets are stored compressed and unpacked after the checksum is verified,
+  because on these links the difference between 11 MB and 4.2 MB is most of the
+  install. Compiling stays as the fallback for an architecture with no prebuilt,
+  for an older version, and for `--from-source`.
+
+- **The installer stopped claiming it was about to compile when it was not.**
+  It printed "building from source" and then used the prebuilt a line later.
+  That is the message a user reads when an install is about to take minutes, so
+  it now appears only when that is actually going to happen.
+
+### Fixed
+
+- **A stale prebuilt would have been worse than none.** The installer prefers it
+  over compiling, so shipping one built from older sources would have meant
+  every install silently receiving the previous core while every version string
+  in the tree said otherwise — the same shape as the version skew fixed in
+  2.14.1, with a longer fuse. `check-panel.sh` now fails when `prebuilt/VERSION`
+  disagrees with `VERSION`, and when the checksums there do not match the files
+  beside them. `scripts/et-prebuild.sh` regenerates the lot.
+
 ## [2.14.1] — 2026-08-16
 
 ### Changed
