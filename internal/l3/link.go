@@ -148,6 +148,8 @@ var carrierDropped atomic.Uint64
 // discard the copy: the AEAD's replay window already rejects a counter it has
 // seen, which is what makes this safe rather than a source of duplicated
 // packets injected into the TUN device.
+// dupThreshold is the default; config.DupThreshold overrides it per tunnel, and
+// 0 turns duplication off entirely for anyone paying by the terabyte.
 const dupThreshold = 256
 
 type datagramLink struct {
@@ -165,6 +167,22 @@ type datagramLink struct {
 
 // dupWriter is implemented by carriers that lose frames silently, so the pump
 // can ask for a frame it considers critical to be sent more than once.
+
+// dupUnderBytes is the frame size below which datagram carriers send a second
+// copy, for every link this process makes. One core process runs one tunnel, so
+// this is that tunnel's setting rather than a global preference; it is atomic
+// only because links are built from several goroutines.
+var dupUnderBytes atomic.Int64
+
+func init() { dupUnderBytes.Store(dupThreshold) }
+
+// SetDupThreshold applies the configured duplication threshold. 0 disables it.
+func SetDupThreshold(n int) {
+	if n < 0 {
+		n = 0
+	}
+	dupUnderBytes.Store(int64(n))
+}
 
 func newDatagramLink(conn net.Conn, dg *crypto.Datagram) *datagramLink {
 	return &datagramLink{
@@ -202,7 +220,12 @@ func (l *datagramLink) WriteFrame(p []byte) error {
 	// peer's replay window drop the copy for free. A second seal would produce a
 	// second valid frame and inject every small packet into the TUN device twice,
 	// which inner TCP reads as duplicate ACKs and reacts to by retransmitting.
-	if len(p) <= dupThreshold {
+	// Read from the one place that holds it rather than a copy taken when the
+	// link was built. A per-link copy meant a datagramLink made as a struct
+	// literal — which is how the tests make them, and how anything new would —
+	// silently got no duplication at all, and nothing said so. One atomic load
+	// against a 6 µs syscall is not a cost worth that.
+	if w := int(dupUnderBytes.Load()); w > 0 && len(p) <= w {
 		if _, err := l.conn.Write(l.wbuf); err != nil {
 			return err // the first copy is already away; the link is going anyway
 		}

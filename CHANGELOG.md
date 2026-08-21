@@ -4,6 +4,56 @@ All notable changes to Emergency Tunnel are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [2.14.3] — 2026-08-20
+
+### Added
+
+- **`dup_threshold`: the one deliberate source of extra traffic is now
+  switchable.** Asked where a tunnel's bandwidth goes — a foreign server showing
+  20 TB against 23.24 TB on the Iran side — the answer has two parts, and both
+  are now written down rather than folded into a constant.
+
+  Fixed encapsulation, per inner packet on the ICMP carrier:
+
+      IPv4 header      20   (the kernel's, on a raw socket)
+      ICMP echo header  8   type, code, checksum, id, seq
+      tunnel tag        3   direction + tunnel port
+      AEAD             24   8-byte counter + 16-byte tag
+      record length     2   uint16 before each packet in a frame
+                      ───
+                       57 bytes
+
+  That is ~4.3% on a full-size packet and unavoidable — it is what an
+  encapsulated packet costs.
+
+  The second part is not unavoidable. Every carrier frame under 256 bytes is
+  sent **twice**, so a 40-byte pure TCP ACK is 97 bytes on the wire and 194
+  delivered. It buys something real on a path that drops small packets — a ping
+  that would have timed out, an ACK that would have cost a round trip, a
+  heartbeat whose loss walks a healthy link towards being cycled — turning a
+  loss rate of p into p² for exactly the traffic whose loss is felt. On a
+  download-heavy mix of two full packets per ACK it is worth about 3.6 points of
+  a ~10% total overhead, and more on interactive traffic where small packets are
+  most of the count.
+
+  Whether that trade is worth it depends on the path and on who pays for the
+  terabytes, so `dup_threshold` now decides: 0 keeps the default 256, a negative
+  value turns duplication off, and an explicit width sets it. The counters were
+  already there — `dup_sent` in the health line says exactly how many second
+  copies went out.
+
+### Fixed
+
+- **Two zero-value traps, caught while adding the above.** A `bool` defaulting
+  to true would have meant every `Config{}` literal in the codebase silently
+  disabling duplication, since Go's zero value is false — so this follows the
+  schema's existing `0 = auto` convention instead, where the zero value is the
+  behaviour every tunnel already has. And the threshold is read from one place
+  rather than copied into each link at construction: a `datagramLink` built as a
+  struct literal was getting no duplication at all and nothing said so, which
+  the existing tests caught immediately because that is exactly how they build
+  one.
+
 ## [2.14.2] — 2026-08-16
 
 ### Fixed

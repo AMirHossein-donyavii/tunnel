@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="2.14.2"
+SCRIPT_VERSION="2.14.3"
 CORE="/usr/local/bin/et-core"
 PANEL="/usr/local/bin/et"
 CONF_DIR="/etc/emergency-tunnel"

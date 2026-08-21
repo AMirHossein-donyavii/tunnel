@@ -99,6 +99,35 @@ type Config struct {
 	// hurts more than the ceiling does.
 	Stripe string `toml:"stripe"`
 
+	// DupThreshold is the frame size, in bytes, under which a datagram carrier
+	// sends every frame twice. 0 uses the default (256); a negative value turns
+	// duplication off entirely.
+	//
+	// The "0 = auto, negative = off" shape is this schema's existing convention
+	// (batch_size, channel_size, workers) and it is chosen here for a specific
+	// reason: a bool defaulting to true would mean every Config{} literal in the
+	// codebase silently disabled duplication, because Go's zero value is false.
+	// This way the zero value is the behaviour every tunnel already has.
+	//
+	// It exists because a datagram carrier does not retransmit: what the path
+	// drops is gone. Three small things are felt when they are lost — a ping
+	// through the tunnel shows up as a timeout, a pure ACK costs the sender a
+	// round trip, and a lost heartbeat is a step towards the liveness monitor
+	// cycling a link that was never dead. Sending a small frame twice turns a
+	// loss rate of p into p² for exactly that traffic.
+	//
+	// The cost is bandwidth, and on a metered link it is worth knowing exactly
+	// what it is. Every packet already carries 57 bytes of encapsulation — 20 IP,
+	// 8 ICMP, 3 tunnel tag, 24 AEAD, 2 length — so a 40-byte pure ACK is 97 bytes
+	// on the wire and 194 when duplicated. On a download-heavy mix of two
+	// full-size packets per ACK that works out at about 10% total overhead, of
+	// which roughly 3.6 points is the duplication; on interactive traffic, where
+	// small packets are most of the count, its share is higher.
+	//
+	// Set it to 0 on a path that is not dropping small packets and where traffic
+	// is paid for by the terabyte. Leave it alone on a path that polices ICMP.
+	DupThreshold int `toml:"dup_threshold"`
+
 	// Iface binds a raw-IP carrier's socket to one network device. On a server
 	// with several, the socket otherwise receives that IP protocol from all of
 	// them.
@@ -329,6 +358,10 @@ const (
 	// Link-striping disciplines. See Config.Stripe.
 	StripePacket = "packet"
 	StripeFlow   = "flow"
+
+	// DefaultDupThreshold is the frame size below which datagram carriers send
+	// a second copy. See Config.DupThreshold for what it costs.
+	DefaultDupThreshold = 256
 )
 
 // SPF carrier profiles.
@@ -630,6 +663,19 @@ func (c *Config) validateSPF() error {
 // Reverse-only: the Kharej (Foreign) server always dials.
 func (c *Config) dialerSide() bool {
 	return c.Role == RoleKharej
+}
+
+// DupBytes is the frame size below which a datagram carrier sends a second
+// copy, after applying the default. See Config.DupThreshold.
+func (c *Config) DupBytes() int {
+	switch {
+	case c.DupThreshold == 0:
+		return DefaultDupThreshold
+	case c.DupThreshold < 0:
+		return 0
+	default:
+		return c.DupThreshold
+	}
 }
 
 // IsDialer is the exported form of dialerSide.

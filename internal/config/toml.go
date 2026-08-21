@@ -60,6 +60,8 @@ func assign(c *Config, key, val string) error {
 		c.AQM = unquote(val)
 	case "stripe":
 		c.Stripe = unquote(val)
+	case "dup_threshold":
+		return intField(val, &c.DupThreshold)
 	case "spoof_src_ip":
 		c.SpoofSrcIP = unquote(val)
 	case "spoof_dst_ip":

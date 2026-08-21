@@ -131,6 +131,10 @@ func New(cfg *config.Config, log *logx.Logger) (*Engine, error) {
 	if e.queues < 1 {
 		e.queues = 1
 	}
+	// Duplication of small frames is this tunnel's choice, not a build-time
+	// constant: it buys resilience on a path that drops small packets and costs
+	// bandwidth on a path that does not. See config.DupThreshold.
+	SetDupThreshold(cfg.DupBytes())
 	e.pool = newBufPool(e.pktLen)
 	e.sndbuf, e.rcvbuf = nettune.BufSizes(cfg.Profile, cfg.SoSndbuf, cfg.SoRcvbuf)
 
